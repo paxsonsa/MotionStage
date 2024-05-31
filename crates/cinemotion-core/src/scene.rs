@@ -236,7 +236,7 @@ pub mod system {
         world: &mut World,
         link: &'a AttributeLink,
     ) -> Result<Arc<AttributeValue>> {
-        let Some(device) = crate::devices::system::get_by_id(world, link.device()) else {
+        let Some(device) = crate::devices::system::get(world, link.device()) else {
             return Err(Error::NotFound(format!(
                 "no device by id '{:?}'",
                 link.device()

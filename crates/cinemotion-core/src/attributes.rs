@@ -72,12 +72,6 @@ impl From<HashMap<Name, AttributeLink>> for AttributeLinkMap {
         Self(value)
     }
 }
-#[derive(Debug, Clone)]
-pub struct Attribute {
-    name: Name,
-    value: Arc<AttributeValue>,
-    default_value: Arc<AttributeValue>,
-}
 
 #[derive(Clone, Debug)]
 pub struct AttributeLink {
@@ -115,6 +109,28 @@ impl AttributeLink {
     pub fn attribute(&self) -> Name {
         self.attribute.clone()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeSample {
+    pub name: Name,
+    pub value: AttributeValue,
+}
+
+impl AttributeSample {
+    pub fn new<N: Into<Name>>(name: N, value: AttributeValue) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    name: Name,
+    value: Arc<AttributeValue>,
+    default_value: Arc<AttributeValue>,
 }
 
 impl Attribute {
@@ -155,6 +171,11 @@ impl Attribute {
         new_value.update(&value)?;
         self.value = Arc::new(new_value);
         Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.update_value(self.default_value.clone())
+            .expect("should never fail");
     }
 }
 

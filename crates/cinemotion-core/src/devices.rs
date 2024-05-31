@@ -2,9 +2,8 @@ use std::ops::Deref;
 
 use bevy_ecs::prelude::Component;
 
-use crate::attributes::Attribute;
 use crate::name::*;
-use crate::prelude::AttributeMap;
+use crate::prelude::{Attribute, AttributeMap, AttributeSample, Error, Result};
 #[cfg(test)]
 #[path = "device_test.rs"]
 mod device_test;
@@ -51,6 +50,8 @@ pub enum Command {
     Register(Device),
     Update((DeviceId, Device)),
     Remove(DeviceId),
+    Sample((DeviceId, Vec<AttributeSample>)),
+    Reset(DeviceId),
 }
 
 pub mod commands {
@@ -81,11 +82,28 @@ pub mod commands {
                 Some(id) => Ok(Some(CommandReply::EntityId(*id))),
                 None => Err(CommandError::NotFound),
             },
+
+            Command::Sample((id, samples)) => match system::apply_samples(world, id, samples) {
+                Ok(_) => Ok(None),
+                Err(err) => Err(CommandError::Failed {
+                    reason: err.to_string(),
+                }),
+            },
+
+            Command::Reset(id) => match system::get(world, &id) {
+                Some(mut device) => {
+                    device.reset(world);
+                    Ok(None)
+                }
+                None => Err(CommandError::NotFound),
+            },
         }
     }
 }
 
 pub mod system {
+
+    use bevy_ecs::world::Mut;
 
     use super::*;
     use crate::{
@@ -111,6 +129,22 @@ pub mod system {
             self._set(world, name)
         }
 
+        pub fn apply_sample(&mut self, world: &mut World, sample: AttributeSample) -> Result<()> {
+            let mut attribute_map = world
+                .get_mut::<AttributeMap>(self.entity)
+                .expect("device entity should have attribute map");
+
+            let Some(attr) = attribute_map.get_mut(&sample.name) else {
+                return Err(Error::NotFound(format!(
+                    "no attribute named {} no device {}",
+                    sample.name,
+                    self.entity.index()
+                )));
+            };
+            attr.update_value(sample.value.into())?;
+            Ok(())
+        }
+
         pub fn attribute<'w>(&self, world: &'w World, name: &Name) -> Option<&'w Attribute> {
             self.attributes(&world).get(name)
         }
@@ -118,9 +152,16 @@ pub mod system {
         pub fn set_attributes(&mut self, world: &mut World, attrs: AttributeMap) {
             self._set(world, attrs)
         }
+
         pub fn attributes<'w>(&self, world: &'w World) -> &'w AttributeMap {
             world
                 .get::<AttributeMap>(self.entity)
+                .expect("device entity should have attribute map")
+        }
+
+        pub fn attributes_mut<'w>(&mut self, world: &'w mut World) -> Mut<'w, AttributeMap> {
+            world
+                .get_mut::<AttributeMap>(self.entity)
                 .expect("device entity should have attribute map")
         }
 
@@ -131,12 +172,18 @@ pub mod system {
                 .insert(attribute)
         }
 
+        pub fn reset(&mut self, world: &mut World) {
+            for (_, attr) in self.attributes_mut(world).iter_mut() {
+                attr.reset();
+            }
+        }
+
         fn _set<'w, T: Component>(&mut self, world: &'w mut World, value: T) {
             world.get_entity_mut(self.entity).unwrap().insert(value);
         }
     }
 
-    pub(crate) fn get_by_id<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
+    pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
         let entity = Entity::from_raw(**id);
         let Some(entity_ref) = world.get_entity_mut(entity) else {
             return None;
@@ -166,16 +213,17 @@ pub mod system {
         device_id: DeviceId,
         device: Device,
     ) -> Option<DeviceId> {
-        let motion_enabled = globals::system::is_motion_enabled(world);
-        println!("motion_enable: {:?}", motion_enabled);
-        let Some(mut device_ref) = get_by_id(world, &device_id) else {
+        // We cannot update device instances while in motion
+        if globals::system::is_motion_enabled(world) {
+            return None;
+        }
+
+        let Some(mut device_ref) = get(world, &device_id) else {
             return None;
         };
 
         device_ref.set_name(world, device.name);
-        if motion_enabled {
-            device_ref.set_attributes(world, device.attributes);
-        }
+        device_ref.set_attributes(world, device.attributes);
 
         Some(device_id)
     }
@@ -186,5 +234,33 @@ pub mod system {
             true => Some(device_id),
             false => None,
         }
+    }
+
+    pub(crate) fn apply_samples(
+        world: &mut World,
+        device_id: DeviceId,
+        samples: Vec<AttributeSample>,
+    ) -> Result<()> {
+        if !globals::system::is_motion_enabled(world) {
+            return Ok(());
+        }
+
+        let Some(mut device) = get(world, &device_id) else {
+            return Err(Error::NotFound(
+                "no device with matching id found for samples".into(),
+            ));
+        };
+
+        for sample in samples {
+            if let Err(err) = device.apply_sample(world, sample) {
+                println!(
+                    "failed to apply samples to device {}: {}",
+                    device_id.as_u32(),
+                    err
+                );
+            }
+        }
+
+        return Ok(());
     }
 }

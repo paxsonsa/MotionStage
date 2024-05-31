@@ -29,7 +29,6 @@ struct Engine {
 impl Engine {
     fn new() -> Self {
         let mut world = world::new();
-
         scene::system::init(&mut world);
 
         Engine {

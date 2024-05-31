@@ -83,7 +83,6 @@ async fn test_scene_command_remove_object() {
 #[tokio::test]
 async fn test_scene_system_attribute_links() {
     let mut world = world::new();
-    globals::system::enable_motion(&mut world);
 
     let mut device = Device::new("root");
     device
@@ -101,8 +100,7 @@ async fn test_scene_system_attribute_links() {
 
     system::update(&mut world).expect("should not fail on first iteration");
     let object_ref = system::get_by_id(&mut world, &id).expect("object should exist");
-    let device_ref =
-        devices::system::get_by_id(&mut world, &device_id).expect("device should exist");
+    let device_ref = devices::system::get(&mut world, &device_id).expect("device should exist");
 
     // The object's linked attribute should be updated to match the device's attribute.
     assert_eq!(
@@ -121,8 +119,7 @@ async fn test_scene_system_attribute_links() {
     crate::devices::system::set_device(&mut world, device_id.clone(), device);
 
     let object_ref = system::get_by_id(&mut world, &id).expect("object should exist");
-    let device_ref =
-        devices::system::get_by_id(&mut world, &device_id).expect("device should exist");
+    let device_ref = devices::system::get(&mut world, &device_id).expect("device should exist");
 
     // The object's linked attribute should NOT be updated to match the device's attribute.
     assert_ne!(
@@ -138,8 +135,7 @@ async fn test_scene_system_attribute_links() {
 
     // The object's linked attribute should be updated to match the device's attribute.
     let object_ref = system::get_by_id(&mut world, &id).expect("object should exist");
-    let device_ref =
-        devices::system::get_by_id(&mut world, &device_id).expect("device should exist");
+    let device_ref = devices::system::get(&mut world, &device_id).expect("device should exist");
     assert_eq!(
         object_ref.attribute(&world, "transform").unwrap().value(),
         device_ref

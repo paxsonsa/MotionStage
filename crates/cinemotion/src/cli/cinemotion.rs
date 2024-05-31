@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 
-mod start;
+mod server;
 
 /// A server for receiving and processing streamed motion data.
 #[derive(Parser)]
@@ -27,7 +27,7 @@ enum Command {
     /// Print the version information.
     Version,
     // Start the cinemotion broker service
-    Start(start::StartCmd),
+    Server(server::ServerCmd),
 }
 
 impl Command {
@@ -45,7 +45,7 @@ impl Command {
                 println!("cinemotion: {}", cinemotion::VERSION);
                 Ok(0)
             }
-            Self::Start(cmd) => cmd.run().await,
+            Self::Server(cmd) => cmd.run().await,
         }
     }
 }

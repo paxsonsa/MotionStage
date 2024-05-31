@@ -33,7 +33,6 @@ async fn test_device_system_command_registration() {
 #[tokio::test]
 async fn test_device_system_command_update() {
     let mut world = crate::world::new();
-    globals::system::enable_motion(&mut world);
 
     let mut device = Device::new("deviceA");
     device
@@ -88,7 +87,7 @@ async fn test_device_system_command_remove() {
 }
 
 #[tokio::test]
-async fn test_device_system_motion_updates() {
+async fn test_device_system_motion_samples() {
     let mut world = crate::world::new();
     let mut device = Device::new("deviceA");
     device
@@ -100,17 +99,9 @@ async fn test_device_system_motion_updates() {
     assert!(!crate::globals::system::is_motion_enabled(&world));
     let mut value = AttributeValue::matrix44();
     value.as_matrix44_mut().unwrap().set(3, 0, 100.0);
-    device
-        .attributes
-        .get_mut(&name!("transform"))
-        .unwrap()
-        .update_value(value.into())
-        .expect("updating value should be ok");
-
-    let command = Command::Update((id.clone(), device.clone()));
-    let _ = commands::process(&mut world, command)
-        .unwrap()
-        .expect("no device id returned");
+    let sample = AttributeSample::new("transform", value.clone());
+    let command = Command::Sample((id.clone(), vec![sample.clone()]));
+    let _ = commands::process(&mut world, command).expect("should not fail");
 
     let devices = system::get_all(&mut world);
 
@@ -131,19 +122,8 @@ async fn test_device_system_motion_updates() {
     // Enable Motion and Try again
     globals::system::enable_motion(&mut world);
 
-    let mut value = AttributeValue::matrix44();
-    value.as_matrix44_mut().unwrap().set(3, 0, 100.0);
-    device
-        .attributes
-        .get_mut(&name!("transform"))
-        .unwrap()
-        .update_value(value.clone().into())
-        .expect("updating value should be ok");
-
-    let command = Command::Update((id, device));
-    let _ = commands::process(&mut world, command)
-        .unwrap()
-        .expect("no device id returned");
+    let command = Command::Sample((id.clone(), vec![sample.clone()]));
+    let _ = commands::process(&mut world, command).expect("should not failed");
 
     let devices = system::get_all(&mut world);
 
