@@ -26,7 +26,7 @@ struct Opt {
 enum Command {
     /// Print the version information.
     Version,
-    // Start the cinemotion broker service
+    // Start the standalone cinemotion broker server.
     Server(server::ServerCmd),
 }
 

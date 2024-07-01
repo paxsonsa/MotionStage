@@ -13,59 +13,95 @@ pub struct ServerCmd {
 
 impl ServerCmd {
     pub async fn run(&self) -> Result<i32> {
-        // TODO: Setup PeerSevice - Every connnect is a spawned tokio stored in the service.
-        // - connection spawns with a channel for the engine to send and receive messages
-        // - engine service should receive a fan in channel and the connects get broadcast channel
-        // - How do we id a the connect so it can filter non-relevant messages? The client needs to
-        // filter out based on its own id which is wont have? Unless we init with one when we
-        // establish.
-        // -
-        // TODO: Setup Protobuf JSON Layer
-        // TODO: Setup Engine Server
-        tracing::info!("starting cinemotion service");
-        let listener = TcpListener::bind(self.server_bind_address.unwrap()).await?;
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(net::handle_connection(stream));
-        }
+        let address = self
+            .server_bind_address
+            .unwrap_or("0.0.0.0:7878".parse().unwrap());
 
-        tracing::info!("configure runtime services");
+        let (c_sender, mut c_receiver) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let listener = TcpListener::bind(address).await?;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
+                value = c_receiver.recv() => {
+                    tracing::info!("received value: {:?}", value);
+                }
+                res = net::accept_connection(&listener, c_sender.clone()) => {
+                    if let Err(e) = res {
+                        tracing::error!("error accepting connections: {}", e);
+                    }
+                }
+            }
+        }
         Ok(0)
     }
 }
-
 mod net {
     use crate::Result;
     use futures::{Future, SinkExt, StreamExt};
-    use tokio::net::TcpStream;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::mpsc::UnboundedSender,
+    };
     use tokio_tungstenite::{accept_async, tungstenite};
 
-    pub fn handle_connection(stream: TcpStream) -> impl Future<Output = Result<()>> {
+    struct ConnectionAgent {
+        uid: usize,
+    }
+
+    struct NetAgent {}
+
+    struct NetConnectionGrp {}
+
+    pub async fn accept_connection(listener: &TcpListener, net_agent: &NetAgent) -> Result<()> {
+        let (stream, _) = listener.accept().await?;
+        let connection = net_agent.register().await?;
+        tokio::spawn(handle_connection(stream, connection));
+        net_agent.send(42).unwrap();
+        Ok(())
+    }
+
+    pub fn handle_connection(
+        stream: TcpStream,
+        connection: NetConnectionGroup,
+    ) -> impl Future<Output = Result<()>> {
         async move {
             let ws_stream = accept_async(stream).await?;
             let (mut write, mut read) = ws_stream.split();
+            let mut counter = 0;
             loop {
                 tokio::select! {
                     msg = read.next() => {
                         match msg {
                             Some(Ok(tungstenite::Message::Text(msg))) => {
                                 tracing::info!("received message: {}", msg);
+                                connection.receive(msg, false).await;
                             }
                             Some(Ok(tungstenite::Message::Close(_))) => {
                                 tracing::info!("closing connection");
+                                connection.close().await;
                                 break;
                             }
-                            Some(Ok(_)) => {
+                            Some(Ok(msg)) => {
                                 tracing::info!("received binary message");
+                                connection.receive(msg, true);
                             }
-                            Some(Err(e)) => {
+                            Some(Err(e)) => {s
                                 tracing::error!("error reading message: {}", e);
+                                connection.error();
                                 break;
                             }
                             None => break,
-                        }
+                        };
+                        counter += 1;
                     }
-                    msg = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    msg = connection.outbound_message() => {
+                        if let Some(msg) = msg {
+                            write.send(tungstenite::Message::Text(msg)).await?;
+                        }
+                    },
+                    _msg = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                         write.send(tungstenite::Message::Text("ping".into())).await?;
                     }
                 }
