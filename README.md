@@ -53,6 +53,10 @@ TODO: Networking Layer (QUIC?)
 TODO: Service Discovery
 TODO: Prototype Blender Integration
 
+### Server Actors
+- ConnectionActor
+- EngineActor
+- ServerActor
 
 ### Controller/Device Commands
 - RegisterDevice(device) -> id

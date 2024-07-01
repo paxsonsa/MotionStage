@@ -10,6 +10,7 @@ pub mod scene;
 pub mod services;
 pub mod state;
 pub mod webrtc;
+pub mod websocket;
 
 // TODO: Add support for animation capture and saving
 // 1) Add a new type for storing object and controller animation as takes.
