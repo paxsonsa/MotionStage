@@ -38,6 +38,8 @@ rustls.workspace = true
 rcgen.workspace = true
 hostname.workspace = true
 get_if_addrs.workspace = true
+trait-variant = "0.1.2"
+futures-util = "0.3.30"
 
 [dev-dependencies]
 paste = "1.0"

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use tokio::net::TcpListener;
 
-use cinemotion::websocket;
+use cinemotion::{actor::Handle, client, engine, websocket};
 
 /// Start the cinemotion broker services.
 #[derive(Args)]
@@ -17,12 +17,36 @@ impl ServerCmd {
             .server_bind_address
             .unwrap_or("0.0.0.0:7878".parse().unwrap());
 
+        let mut client_coordinator = client::coordinator::spawn();
+        let engine = engine::spawn(client_coordinator.clone());
         let listener = TcpListener::bind(address).await?;
-        let websocket_server = websocket::server(listener)?;
+
+        // Need to clone the handles to move into the closure
+        let engine_handle = engine.clone();
+        let client_coordinator_handle = client_coordinator.clone();
+
+        let websocket_server = websocket::server(listener, move |ws_stream| {
+            // Need to clone the engine handle and client coordinator handle to move into the async
+            // block
+            let engine_handle = engine_handle.clone();
+            let client_coordinator_handle = client_coordinator_handle.clone();
+            async move {
+                let client = client::spawn_websocket_client(
+                    ws_stream,
+                    client_coordinator_handle.clone(),
+                    engine_handle.clone(),
+                );
+                let _ = client_coordinator_handle.register(client).await;
+                Ok(())
+            }
+        })?;
+
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     websocket_server.stop().await;
+                    client_coordinator.stop().await;
+                    engine.stop().await;
                     break;
                 }
             }
@@ -30,76 +54,3 @@ impl ServerCmd {
         Ok(0)
     }
 }
-// mod net {
-//     use crate::Result;
-//     use futures::{Future, SinkExt, StreamExt};
-//     use tokio::{
-//         net::{TcpListener, TcpStream},
-//         sync::mpsc::UnboundedSender,
-//     };
-//     use tokio_tungstenite::{accept_async, tungstenite};
-//
-//     struct ConnectionAgent {
-//         uid: usize,
-//     }
-//
-//     struct NetAgent {}
-//
-//     struct NetConnectionGrp {}
-//
-//     pub async fn accept_connection(listener: &TcpListener, net_agent: &NetAgent) -> Result<()> {
-//         let (stream, _) = listener.accept().await?;
-//         let connection = net_agent.register().await?;
-//         tokio::spawn(handle_connection(stream, connection));
-//         net_agent.send(42).unwrap();
-//         Ok(())
-//     }
-//
-//     pub fn handle_connection(
-//         stream: TcpStream,
-//         connection: NetConnectionGroup,
-//     ) -> impl Future<Output = Result<()>> {
-//         async move {
-//             let ws_stream = accept_async(stream).await?;
-//             let (mut write, mut read) = ws_stream.split();
-//             let mut counter = 0;
-//             loop {
-//                 tokio::select! {
-//                     msg = read.next() => {
-//                         match msg {
-//                             Some(Ok(tungstenite::Message::Text(msg))) => {
-//                                 tracing::info!("received message: {}", msg);
-//                                 connection.receive(msg, false).await;
-//                             }
-//                             Some(Ok(tungstenite::Message::Close(_))) => {
-//                                 tracing::info!("closing connection");
-//                                 connection.close().await;
-//                                 break;
-//                             }
-//                             Some(Ok(msg)) => {
-//                                 tracing::info!("received binary message");
-//                                 connection.receive(msg, true);
-//                             }
-//                             Some(Err(e)) => {s
-//                                 tracing::error!("error reading message: {}", e);
-//                                 connection.error();
-//                                 break;
-//                             }
-//                             None => break,
-//                         };
-//                         counter += 1;
-//                     }
-//                     msg = connection.outbound_message() => {
-//                         if let Some(msg) = msg {
-//                             write.send(tungstenite::Message::Text(msg)).await?;
-//                         }
-//                     },
-//                     _msg = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-//                         write.send(tungstenite::Message::Text("ping".into())).await?;
-//                     }
-//                 }
-//             }
-//             Ok(())
-//         }
-//     }
-// }
