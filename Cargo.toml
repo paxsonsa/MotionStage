@@ -10,7 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1.0"
 arc-swap = "1.7.1"
-async-trait = "0.1.75"
+async-trait = "0.1.81"
 bytes = "1.6"
 chrono = "0.4.24"
 cinemotion = { path = "crates/cinemotion" }
