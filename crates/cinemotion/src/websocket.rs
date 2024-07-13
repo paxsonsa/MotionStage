@@ -3,13 +3,11 @@ use async_trait::async_trait;
 use derive_more::Display;
 use futures::Future;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 use crate::actor;
-use crate::client;
 
 #[derive(Clone, Debug)]
-enum Message {
+pub enum Message {
     Stop {
         respond_to: tokio::sync::mpsc::Sender<()>,
     },
@@ -94,11 +92,6 @@ impl actor::Handle for WebSocketHandle {
         self.sender.clone()
     }
 
-    #[doc = r" Creates a new handle with the given sender channel."]
-    fn new(sender: actor::Sender<Self::Message>) -> Self {
-        Self { sender }
-    }
-
     /// Stop the weovsocket server.
     ///
     /// This will stop the websocket server, all active connections will be closed.
@@ -127,6 +120,6 @@ where
         on_connection,
     };
 
-    let handle = actor::spawn(actor);
+    let handle = actor::spawn(actor, |sender| WebSocketHandle { sender });
     Ok(handle)
 }

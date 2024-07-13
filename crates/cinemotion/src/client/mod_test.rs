@@ -3,6 +3,7 @@ use derive_more::{Display, Error};
 use super::*;
 
 use crate::actor::{self, Handle};
+use crate::engine;
 
 #[derive(Debug, Display, Error)]
 struct TimeoutElapsed {}
@@ -19,10 +20,13 @@ impl<M> TestActor<M>
 where
     M: actor::Actor + 'static,
 {
-    pub fn new(model: M) -> (Self, M::Handle) {
+    pub fn new<F: FnOnce(actor::Sender<M::Message>) -> M::Handle>(
+        model: M,
+        handle_fn: F,
+    ) -> (Self, M::Handle) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let actor = Self { model, receiver };
-        (actor, M::Handle::new(sender.into()))
+        (actor, handle_fn(sender.into()))
     }
 
     /// Execute the actor loop and wait for the given future to complete or timeout.
@@ -66,12 +70,21 @@ where
     }
 }
 
-// Test the propogation of calling Actor.stop() on the ClientCoordinator
+/// Test that the client initializes successfully
 #[tokio::test]
-async fn test_stop_propogation() {
-    let (mut test_actor, mut handle) = TestActor::new(coordinator::ClientCoordinator::new());
+async fn test_client_initialization() {
+    // Create a pair of channels for sending/receiver messages form the client itself.
+    let (client_sender, client_receiver) = futures::channel::mpsc::unbounded();
+    // Crate a pair of channels for sending/receiving messages from the websocket.
+    let (ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let engine_ = engine::EngineHandle::new(tx.into());
+    let client = client::Client::new(ws_receiver, client_sender, engine_);
+    let id = client.id();
+    let (mut test_actor, mut handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
     test_actor
-        .wait_for(handle.stop(), None)
+        .wait_for(handle.initialize(), None)
         .await
-        .expect("stop call should return successfully.");
+        .expect("client should initialize successfully.");
 }

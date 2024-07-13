@@ -22,12 +22,12 @@ pub struct EngineState<'a, Param: SystemParam + 'static> {
     param_item: SystemParamItem<'a, 'a, Param>,
 }
 
-struct Engine {
+pub struct Engine {
     world: World,
 }
 
 impl Engine {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut world = world::new();
         scene::system::init(&mut world);
 
@@ -40,7 +40,7 @@ impl Engine {
         &mut self.world
     }
 
-    async fn tick(&mut self) -> Result<()> {
+    pub async fn tick(&mut self) -> Result<()> {
         // self.device_controller.update(&mut self.world).await?;
         // invoke!(self.scene_controller, update, &mut self.world);
         // self.take_controller.update(&mut self.world).await?;
@@ -49,7 +49,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn process(&mut self, dispatch: CommandInfo) -> Result<()> {
+    pub async fn process(&mut self, dispatch: CommandInfo) -> Result<()> {
         let CommandInfo { command, dispatch } = dispatch;
         let result = match command {
             commands::Command::Device(c) => devices::commands::process(&mut self.world, c),
@@ -63,7 +63,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn serialize(&mut self) -> StateTree {
+    pub async fn serialize(&mut self) -> StateTree {
         let state = StateTree::new();
         //
         // for device in self.world.query::<(&Device)>().iter() {

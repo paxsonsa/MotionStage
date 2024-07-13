@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error, PartialEq)]
-pub enum Error {
+pub enum ActorError {
     // Send Error
     #[error("failed to send message")]
     SendError,
@@ -31,14 +31,14 @@ impl<T> Response<T> {
 }
 
 impl<T> Future for Response<T> {
-    type Output = Result<T, Error>;
+    type Output = Result<T, ActorError>;
 
     /// Polls the `Response`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         Pin::new(&mut this.receiver).poll_recv(cx).map(|p| match p {
             Some(res) => Ok(res),
-            None => Err(Error::ResponseFailed),
+            None => Err(ActorError::ResponseFailed),
         })
     }
 }
@@ -51,8 +51,10 @@ pub struct Responder<T> {
 
 impl<T: Send + 'static> Responder<T> {
     /// Sends a value.
-    pub async fn dispatch(self, value: T) -> Result<(), Error> {
-        self.sender.try_send(value).map_err(|_| Error::SendError)
+    pub async fn dispatch(self, value: T) -> Result<(), ActorError> {
+        self.sender
+            .try_send(value)
+            .map_err(|_| ActorError::SendError)
     }
 }
 
@@ -71,13 +73,15 @@ where
     M: Send + Sync + 'static,
 {
     /// Sends a message.
-    pub fn send(&self, message: M) -> Result<(), self::Error> {
+    pub fn send(&self, message: M) -> Result<(), self::ActorError> {
         self.send_event(Event::Message(message))
     }
 
     /// Sends an event to the actor.
-    pub fn send_event(&self, event: Event<M>) -> Result<(), self::Error> {
-        self.sender.send(event).map_err(|_| self::Error::SendError)
+    pub fn send_event(&self, event: Event<M>) -> Result<(), self::ActorError> {
+        self.sender
+            .send(event)
+            .map_err(|_| self::ActorError::SendError)
     }
 }
 
@@ -111,6 +115,16 @@ where
     },
 }
 
+impl<M> Event<M>
+where
+    M: Send + Sync + 'static,
+{
+    pub fn stop() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self::Stop { respond_to: tx }, rx)
+    }
+}
+
 /// `Actor` represents the behavior of an actor in the system.
 /// It defines a `Handle` type, a `Message` type, and a `handle_message` function.
 #[async_trait]
@@ -139,18 +153,66 @@ where
 {
     type Message;
 
-    /// Creates a new handle with the given sender channel.
-    fn new(sender: Sender<Self::Message>) -> Self;
-
     /// Returns the sender channel associated with the handle.
     fn sender(&self) -> Sender<Self::Message>;
 
-    /// Sends a stop signal to the actor and waits for acknowledgment.
-    async fn stop(&mut self);
+    /// Snds a stop signal to the actor and waits for acknowledgment.
+    async fn stop(&mut self) {
+        let (stop, rx) = Event::stop();
+        if let Err(err) = self.sender().send_event(stop) {
+            tracing::error!(?err, "Failed to send stop event to actor");
+            return;
+        }
+        if let Err(err) = rx.await {
+            tracing::error!(?err, "Failed to receive acknowledgment from actor");
+        }
+    }
+}
+
+pub trait HandleExt: Handle {
+    /// Sends a message to the actor.
+    fn send(&mut self, message: Self::Message) -> Result<(), ActorError> {
+        self.sender().send(message)
+    }
+    /// Sends a message to the actor and awaits a response.
+    ///
+    /// This function takes a closure that returns a tuple of a message and a response future.
+    /// The message is sent to the actor, and then the function awaits the response.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T`: The type of the value that the response future resolves to. Must be `Send` and `Sync`.
+    /// * `F`: The type of the closure that produces the message and response. The closure must be `Send` and `Sync`.
+    ///
+    /// # Parameters
+    ///
+    /// * `message_fn`: The closure that produces the message and response.
+    ///
+    /// # Returns
+    ///
+    /// The value that the response future resolves to.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if sending the message fails or if the response future is erroneous.
+    async fn perform_send<
+        T: Send + Sync,
+        F: (FnOnce() -> (Self::Message, Response<T>)) + Send + Sync,
+    >(
+        &self,
+        message_fn: F,
+    ) -> T {
+        let (msg, response) = message_fn();
+        self.sender().send(msg).expect("send should work");
+        response.await.expect("response should not fail")
+    }
 }
 
 /// Spawns a new actor instance and returns its handle.
-pub fn spawn<M: Actor + 'static>(mut model: M) -> M::Handle {
+pub fn spawn<M: Actor + 'static, F: FnOnce(Sender<M::Message>) -> M::Handle>(
+    mut model: M,
+    new_handle: F,
+) -> M::Handle {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Event<M::Message>>();
 
     tokio::spawn(async move {
@@ -178,6 +240,5 @@ pub fn spawn<M: Actor + 'static>(mut model: M) -> M::Handle {
             }
         }
     });
-
-    M::Handle::new(sender.into())
+    new_handle(sender.into())
 }
