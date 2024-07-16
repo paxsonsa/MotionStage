@@ -10,3 +10,4 @@ bevy_ecs = "0.13.2"
 derive_more.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+cinemotion-proto.workspace = true

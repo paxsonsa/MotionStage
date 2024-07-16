@@ -10,7 +10,7 @@ pub mod proto {
 pub use proto::*;
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum ProtocolError {
     #[error("decoding error occurred: {0}")]
     DecodingError(#[from] prost::DecodeError),
 
@@ -18,8 +18,8 @@ pub enum Error {
     EncodingError(#[from] prost::EncodeError),
 }
 
-impl TryInto<bytes::Bytes> for Event {
-    type Error = self::Error;
+impl TryInto<bytes::Bytes> for ServerMessage {
+    type Error = self::ProtocolError;
     fn try_into(self) -> Result<bytes::Bytes, Self::Error> {
         let mut buf = bytes::BytesMut::new();
         self.encode(&mut buf)?;
@@ -27,8 +27,8 @@ impl TryInto<bytes::Bytes> for Event {
     }
 }
 
-impl TryFrom<bytes::Bytes> for Command {
-    type Error = self::Error;
+impl TryFrom<bytes::Bytes> for ClientMessage {
+    type Error = self::ProtocolError;
 
     fn try_from(value: bytes::Bytes) -> Result<Self, Self::Error> {
         match prost::Message::decode(value) {
@@ -40,14 +40,30 @@ impl TryFrom<bytes::Bytes> for Command {
 
 // This is a convenience macro to implement the From trait for our
 // generated protobuf types.
-macro_rules! impl_from_payload {
+macro_rules! impl_from_client_body {
     ($type:ident) => {
-        impl From<$type> for command::Payload {
+        impl From<$type> for client_message::Body {
             fn from(message: $type) -> Self {
-                command::Payload::$type(message)
+                client_message::Body::$type(message)
             }
         }
     };
 }
 
-impl_from_payload!(Echo);
+macro_rules! impl_into_server_message {
+    ($type:ident) => {
+        impl From<$type> for ServerMessage {
+            fn from(body: $type) -> Self {
+                ServerMessage {
+                    body: Some(server_message::Body::$type(body)),
+                }
+            }
+        }
+    };
+}
+impl_into_server_message!(Error);
+impl_into_server_message!(Ping);
+impl_into_server_message!(Pong);
+impl_into_server_message!(Initialize);
+
+impl_from_client_body!(InitializeAck);

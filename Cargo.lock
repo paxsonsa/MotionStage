@@ -535,6 +535,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bevy_ecs",
+ "cinemotion-proto",
  "derive_more",
  "thiserror",
  "tokio",

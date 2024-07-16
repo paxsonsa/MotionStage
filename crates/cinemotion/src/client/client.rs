@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -6,9 +6,9 @@ use tokio::net::TcpStream;
 
 use crate::actor::{self, HandleExt};
 use crate::engine;
-use crate::protocol;
+use cinemotion_core::protocol;
 
-static NEXT_ID: AtomicU16 = AtomicU16::new(0);
+static NEXT_ID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -33,108 +33,33 @@ pub enum ClientError {
     #[error("failed to send message to actor")]
     SendError,
 
+    #[error("bad message: {0}")]
+    BadMessage(&'static str),
+
     #[error(transparent)]
     ActorError(#[from] actor::ActorError),
 }
 
-/// `Client` is a generic struct that represents a client in the system.
-/// It is parameterized over two types: `R` and `W`.
-/// `R` is a type that implements `StreamExt` with `Item` being a `Result` of `tungstenite::Message`.
-/// `W` is a type that implements `SinkExt` with `Item` being a `tungstenite::Message`.
-/// The `Client` struct also contains an `engine::EngineHandle` and a `coordinator::ClientCoordinatorHandle`.
-///
-/// The `new` function is used to create a new instance of `Client`.
-///
-/// The `Client` struct also implements the `Actor` trait from the `actor` module.
-/// The `Message` associated type is set to `Message` and the `Handle` associated type is set to `ClientHandle`.
-/// The `handle_message` function is an asynchronous function that handles incoming messages.
-pub struct Client<R, W> {
-    id: u16,
-    reader: R,
-    writer: W,
-    engine: engine::EngineHandle,
+#[derive(Default)]
+enum Status {
+    /// The client is initializing and not ready to send or receive messages
+    #[default]
+    Initializing,
+    /// The client is ready to send and receive messages
+    Ready,
+    /// the client is disconnected and dead.
+    Disconnected,
 }
 
-impl<R, W> Client<R, W>
-where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin,
-    W: SinkExt<tungstenite::Message> + Unpin,
-{
-    pub fn new(reader: R, writer: W, engine: engine::EngineHandle) -> Self {
-        Self {
-            id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
-            reader,
-            writer,
-            engine,
-        }
-    }
-
-    pub fn id(&self) -> u16 {
-        self.id
-    }
-
-    pub async fn disconnect(&self) -> Result<(), ClientError> {
-        self.engine.remove_client(self.id);
-        Ok(())
-    }
-
-    pub async fn send_message(&mut self, message: protocol::Message) -> Result<(), ClientError> {
-        let message =
-            tungstenite::Message::binary(message.serialize().map_err(|_| ClientError::SendError)?);
-        self.writer
-            .send(message)
-            .await
-            .map_err(|_| ClientError::SendError)?;
-        Ok(())
-    }
-
-    pub async fn receive_message(&mut self, message: protocol::Message) -> Result<(), ClientError> {
-        match message {
-            protocol::Message::InitializeAck(m) => {
-                /*
-                 * self.status = ClientStatus::Active
-                 * self.engine.process_message(self.id, m).await?;
-                 * */
-            }
-            _ => {
-                // self.engine.process_message(self.id, m).await?;
-            }
-        }
-        Ok(())
-    }
+/// Internal state of the client
+#[derive(Default)]
+struct State {
+    pub status: Status,
 }
 
-#[async_trait]
-impl<R, W> actor::Actor for Client<R, W>
-where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin + Send + Sync,
-    W: SinkExt<tungstenite::Message> + Unpin + Send + Sync,
-{
-    type Message = Message;
-    type Handle = ClientHandle;
-    async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
-        match message {
-            Message::Init(respond_to) => {
-                match self
-                    .send_message(protocol::Initialize { id: self.id }.into())
-                    .await
-                {
-                    Ok(_) => {
-                        respond_to.dispatch(Ok(())).await;
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, "failed to send init message it client");
-                        respond_to.dispatch(Err(ClientError::SendError)).await;
-                    }
-                }
-            }
-        };
-        return None;
-    }
-}
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    pub(super) id: u16,
+    pub(super) id: i32,
     pub(super) sender: actor::Sender<Message>,
 }
 
@@ -142,7 +67,7 @@ impl ClientHandle {
     /// Returns the unique identifier for the client.
     ///
     /// This function is used to get the unique identifier (ID) for the client.
-    pub fn id(&self) -> u16 {
+    pub fn id(&self) -> i32 {
         self.id
     }
     /// Initialize the client connection
@@ -165,6 +90,115 @@ impl actor::Handle for ClientHandle {
 
 impl actor::HandleExt for ClientHandle {}
 
+/// `Client` is a generic struct that represents a client in the system.
+/// It is parameterized over two types: `R` and `W`.
+/// `R` is a type that implements `StreamExt` with `Item` being a `Result` of `tungstenite::Message`.
+/// `W` is a type that implements `SinkExt` with `Item` being a `tungstenite::Message`.
+/// The `Client` struct also contains an `engine::EngineHandle` and a `coordinator::ClientCoordinatorHandle`.
+///
+/// The `new` function is used to create a new instance of `Client`.
+///
+/// The `Client` struct also implements the `Actor` trait from the `actor` module.
+/// The `Message` associated type is set to `Message` and the `Handle` associated type is set to `ClientHandle`.
+/// The `handle_message` function is an asynchronous function that handles incoming messages.
+pub struct Client<R, W> {
+    id: i32,
+    reader: R,
+    writer: W,
+    engine: engine::EngineHandle,
+    state: State,
+}
+
+impl<R, W> Client<R, W>
+where
+    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin,
+    W: SinkExt<tungstenite::Message> + Unpin,
+{
+    pub fn new(reader: R, writer: W, engine: engine::EngineHandle) -> Self {
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
+            reader,
+            writer,
+            engine,
+            state: State::default(),
+        }
+    }
+
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub async fn initialize(&mut self) -> Result<(), ClientError> {
+        match self
+            .send_message(
+                protocol::Initialize {
+                    version: 1,
+                    id: self.id,
+                }
+                .into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                tracing::error!(?err, "failed to send init message it client");
+                Err(ClientError::SendError)
+            }
+        }
+    }
+
+    pub async fn disconnect(&self) -> Result<(), ClientError> {
+        self.engine.remove_client(self.id);
+        Ok(())
+    }
+
+    pub async fn send_message(
+        &mut self,
+        message: protocol::ServerMessage,
+    ) -> Result<(), ClientError> {
+        let bytes: bytes::Bytes = message.try_into().map_err(|_| ClientError::SendError)?;
+        let message = tungstenite::Message::binary(bytes.to_vec());
+        self.writer
+            .send(message)
+            .await
+            .map_err(|_| ClientError::SendError)?;
+        Ok(())
+    }
+
+    pub async fn receive_message(
+        &mut self,
+        message: protocol::ClientMessage,
+    ) -> Result<(), ClientError> {
+        let Some(message) = message.body else {
+            return Err(ClientError::BadMessage("missing message body"));
+        };
+        match message {
+            protocol::client_message::Body::InitializeAck(_) => {
+                self.state.status = Status::Ready;
+            }
+            _ => {
+                // self.engine.apply(self.id, m).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<R, W> actor::Actor for Client<R, W>
+where
+    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin + Send + Sync,
+    W: SinkExt<tungstenite::Message> + Unpin + Send + Sync,
+{
+    type Message = Message;
+    type Handle = ClientHandle;
+    async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
+        match message {
+            Message::Init(response) => response.dispatch(self.initialize().await).await,
+        };
+        return None;
+    }
+}
 pub fn spawn_websocket_client(
     ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
     engine: engine::EngineHandle,
@@ -187,12 +221,13 @@ pub fn spawn_websocket_client(
                             continue;
                         }
 
-                        let data = msg.into_data();
-                        let Ok(message) = protocol::Message::deserialize(&data) else {
-                            tracing::error!(?data, "failed to deserialize message from websocket");
+                        let data = bytes::Bytes::from(msg.into_data());
+                        let Ok(message) = data.try_into() else {
+                            tracing::error!("failed to deserialize message from websocket");
                             continue;
                         };
-                        model.receive_message(message.into()).await.unwrap();
+
+                        model.receive_message(message).await.unwrap();
 
                     },
                     Err(err) => {

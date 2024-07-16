@@ -1,8 +1,8 @@
-use bevy_ecs::system::{ReadOnlySystemParam, SystemParam, SystemParamItem, SystemState};
+use bevy_ecs::system::{SystemParam, SystemParamItem, SystemState};
 
-use crate::commands::{self, CommandError, CommandInfo, CommandReply, CommandResult};
 use crate::error::*;
 use crate::prelude::*;
+use crate::protocol;
 use crate::state::*;
 
 #[cfg(test)]
@@ -40,26 +40,13 @@ impl Engine {
         &mut self.world
     }
 
-    pub async fn tick(&mut self) -> Result<()> {
-        // self.device_controller.update(&mut self.world).await?;
-        // invoke!(self.scene_controller, update, &mut self.world);
-        // self.take_controller.update(&mut self.world).await?;
-        // self.render_controller.update(&mut self.world).await?;
-        // self.input_controller.update(&mut self.world).await?;
-        Ok(())
-    }
-
-    pub async fn process(&mut self, dispatch: CommandInfo) -> Result<()> {
-        let CommandInfo { command, dispatch } = dispatch;
-        let result = match command {
-            commands::Command::Device(c) => devices::commands::process(&mut self.world, c),
-            // commands::Command::Engine(c) => self.root_system(c)?,
-            // commands::Command::Scene(c) => self.scene_system.process(c)?,
-            // commands::Command::Object(c) => self.object_system.process(c)?,
-            // commands::Command::Take(c) => self.take_system.process(c)?,
+    pub async fn apply(&mut self, client: i32, message: protocol::ClientMessage) -> Result<()> {
+        let body = message
+            .body
+            .expect("message body should always be present, issue with serialization...");
+        match body {
+            protocol::client_message::Body::InitializeAck(_) => todo!(),
         };
-        dispatch(result);
-
         Ok(())
     }
 

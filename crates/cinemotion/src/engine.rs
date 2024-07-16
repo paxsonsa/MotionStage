@@ -21,12 +21,32 @@ pub enum Message {
         responder: actor::Responder<Result<(), EngineError>>,
     },
     RemoveClient {
-        id: u16,
+        id: i32,
+        responder: actor::Responder<Result<(), EngineError>>,
+    },
+    Apply {
+        client_id: i32,
+        message: core::protocol::ClientMessage,
         responder: actor::Responder<Result<(), EngineError>>,
     },
 }
 
 impl Message {
+    pub fn apply(
+        client_id: i32,
+        message: core::protocol::ClientMessage,
+    ) -> (Self, actor::Response<Result<(), EngineError>>) {
+        let (responder, response) = actor::Response::new();
+        (
+            Self::Apply {
+                client_id,
+                message,
+                responder,
+            },
+            response,
+        )
+    }
+
     pub fn add_client(
         client: client::ClientHandle,
     ) -> (Self, actor::Response<Result<(), EngineError>>) {
@@ -34,7 +54,7 @@ impl Message {
         (Self::AddClient { client, responder }, response)
     }
 
-    pub fn remove_client(id: u16) -> (Self, actor::Response<Result<(), EngineError>>) {
+    pub fn remove_client(id: i32) -> (Self, actor::Response<Result<(), EngineError>>) {
         let (responder, response) = actor::Response::new();
         (Self::RemoveClient { id, responder }, response)
     }
@@ -50,11 +70,20 @@ impl EngineHandle {
         Self { sender }
     }
 
+    pub async fn apply(
+        &self,
+        client_id: i32,
+        message: core::protocol::ClientMessage,
+    ) -> Result<(), EngineError> {
+        self.perform_send(|| Message::apply(client_id, message))
+            .await
+    }
+
     pub async fn add_client(&self, client: client::ClientHandle) -> Result<(), EngineError> {
         self.perform_send(|| Message::add_client(client)).await
     }
 
-    pub async fn remove_client(&self, id: u16) -> Result<(), EngineError> {
+    pub async fn remove_client(&self, id: i32) -> Result<(), EngineError> {
         self.perform_send(|| Message::remove_client(id)).await
     }
 }
@@ -70,7 +99,7 @@ impl actor::Handle for EngineHandle {
 impl actor::HandleExt for EngineHandle {}
 
 pub struct EngineActor {
-    clients: std::collections::HashMap<u16, client::ClientHandle>,
+    clients: std::collections::HashMap<i32, client::ClientHandle>,
     inner: core::engine::Engine,
 }
 
@@ -81,21 +110,27 @@ impl actor::Actor for EngineActor {
 
     async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
         match message {
+            Message::Apply {
+                client_id,
+                message,
+                responder,
+            } => {
+                // TODO: Implement the apply routine and think about whether we want to capture
+                // errors from apply the value? Probably not, just send errors to client by ID.
+                self.inner.apply(client_id, message).await;
+                responder.dispatch(Ok(())).await;
+            }
             Message::AddClient { client, responder } => {
                 self.clients.insert(client.id(), client.clone());
 
                 match client.initialize().await {
                     Ok(_) => {
-                        responder
-                            .dispatch(Ok(()))
-                            .await
-                            .expect("response receiver should not close.");
+                        responder.dispatch(Ok(())).await;
                     }
                     Err(e) => {
                         responder
                             .dispatch(Err(EngineError::MessageFailed(format!("{e:?}"))))
-                            .await
-                            .expect("response receiver should not close.");
+                            .await;
                     }
                 }
             }

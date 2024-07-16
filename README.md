@@ -50,6 +50,12 @@ There are a number of commands and events that are apart of the protocol for int
 
 TODO: Server Start Up
 TODO: Networking Layer (QUIC?)
+TODO: Connect/Move protocol messages into engine core and use that
+      Kind of of think the engine actor is the layer to translate messages to engine methods 
+      but need to look at the bevy impl on the main engine core and see if that makes sense. It would make testing 
+      engine state changes much easier!
+
+TODO: ProtocolMessages into cinemotion-proto
 TODO: Service Discovery
 TODO: Prototype Blender Integration
 
