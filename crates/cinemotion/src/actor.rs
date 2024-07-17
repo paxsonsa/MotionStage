@@ -51,10 +51,15 @@ pub struct Responder<T> {
 
 impl<T: Send + 'static> Responder<T> {
     /// Sends a value.
-    pub async fn dispatch(self, value: T) -> Result<(), ActorError> {
+    pub async fn try_dispatch(self, value: T) -> Result<(), ActorError> {
         self.sender
             .try_send(value)
             .map_err(|_| ActorError::SendError)
+    }
+    pub async fn dispatch(self, value: T) {
+        if let Err(err) = self.try_dispatch(value).await {
+            tracing::error!(?err, "failed to dispatch response");
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 
+mod debugger;
 mod server;
 
 /// A server for receiving and processing streamed motion data.
@@ -28,6 +29,8 @@ enum Command {
     Version,
     // Start the standalone cinemotion broker server.
     Server(server::ServerCmd),
+    // Start the debug client.
+    Debugger(debugger::DebuggerCmd),
 }
 
 impl Command {
@@ -46,6 +49,7 @@ impl Command {
                 Ok(0)
             }
             Self::Server(cmd) => cmd.run().await,
+            Self::Debugger(cmd) => cmd.run().await,
         }
     }
 }

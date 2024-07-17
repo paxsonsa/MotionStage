@@ -40,14 +40,14 @@ impl Engine {
         &mut self.world
     }
 
-    pub async fn apply(&mut self, client: i32, message: protocol::ClientMessage) -> Result<()> {
-        let body = message
-            .body
-            .expect("message body should always be present, issue with serialization...");
-        match body {
-            protocol::client_message::Body::InitializeAck(_) => todo!(),
-        };
-        Ok(())
+    pub async fn apply(
+        &mut self,
+        client: i32,
+        message: protocol::client_message::Body,
+    ) -> Result<()> {
+        match message {
+            protocol::client_message::Body::InitializeAck(_) => Ok(()),
+        }
     }
 
     pub async fn serialize(&mut self) -> StateTree {

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::net::TcpStream;
 
-use crate::actor::{self, HandleExt};
+use crate::actor::{self, Actor, HandleExt};
 use crate::engine;
 use cinemotion_core::protocol;
 
@@ -13,12 +13,29 @@ static NEXT_ID: AtomicI32 = AtomicI32::new(0);
 #[derive(Debug, Clone)]
 pub enum Message {
     Init(actor::Responder<Result<(), ClientError>>),
+    Send {
+        message: protocol::ServerMessage,
+        response: actor::Responder<Result<(), ClientError>>,
+    },
 }
 
 impl Message {
     pub fn init() -> (Self, actor::Response<Result<(), ClientError>>) {
         let (responder, response) = actor::Response::new();
         (Self::Init(responder), response)
+    }
+
+    pub fn send(
+        message: protocol::ServerMessage,
+    ) -> (Self, actor::Response<Result<(), ClientError>>) {
+        let (responder, response) = actor::Response::new();
+        (
+            Self::Send {
+                message,
+                response: responder,
+            },
+            response,
+        )
     }
 }
 
@@ -77,6 +94,14 @@ impl ClientHandle {
     /// is created.
     pub async fn initialize(&self) -> Result<(), ClientError> {
         self.perform_send(|| Message::init()).await
+    }
+
+    /// Sends a message to the server.
+    ///
+    /// This function is responsible for transmitting messages to the client. If the message is successfully sent, it returns `Ok`, otherwise it returns an `Err`.
+    ///
+    pub async fn send(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
+        self.perform_send(|| Message::send(message)).await
     }
 }
 
@@ -147,8 +172,11 @@ where
         }
     }
 
-    pub async fn disconnect(&self) -> Result<(), ClientError> {
-        self.engine.remove_client(self.id);
+    pub async fn disconnect(&mut self) -> Result<(), ClientError> {
+        if let Err(err) = self.engine.remove_client(self.id).await {
+            tracing::error!(?err, "failed to remove client from engine");
+        }
+        self.state.status = Status::Disconnected;
         Ok(())
     }
 
@@ -176,8 +204,11 @@ where
             protocol::client_message::Body::InitializeAck(_) => {
                 self.state.status = Status::Ready;
             }
-            _ => {
-                // self.engine.apply(self.id, m).await?;
+            m => {
+                self.engine
+                    .apply(self.id, m)
+                    .await
+                    .expect("engine apply should not fail");
             }
         }
         Ok(())
@@ -195,15 +226,17 @@ where
     async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
         match message {
             Message::Init(response) => response.dispatch(self.initialize().await).await,
-        };
-        return None;
+            Message::Send { message, response } => {
+                response.dispatch(self.send_message(message).await).await;
+            }
+        }
+        None
     }
 }
 pub fn spawn_websocket_client(
     ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
     engine: engine::EngineHandle,
 ) -> ClientHandle {
-    use crate::actor::Actor;
     let (writer, reader) = ws_stream.split();
     let mut model = Client::new(reader, writer, engine);
     let id = model.id();
@@ -213,52 +246,76 @@ pub fn spawn_websocket_client(
         loop {
             tokio::select! {
                 // Handle when a new message is received via websocket
-                Some(msg) = model.reader.next() => match msg {
-                    Ok(msg) => {
-                        tracing::debug!("received message: {:?}", msg);
-                        if !msg.is_binary() {
-                            tracing::warn!("received non-binary message, ignoring");
-                            continue;
-                        }
-
-                        let data = bytes::Bytes::from(msg.into_data());
-                        let Ok(message) = data.try_into() else {
-                            tracing::error!("failed to deserialize message from websocket");
-                            continue;
-                        };
-
-                        model.receive_message(message).await.unwrap();
-
-                    },
-                    Err(err) => {
-                        tracing::error!(?err, "failed to read message from websocket");
-                        model.disconnect().await;
-                        break;
-                    }
+                Some(msg) = model.reader.next() => {
+                    handle_websocket_message(&mut model, msg).await;
                 },
-
                 // Handle when a new message is received via the actor system
-                recv = receiver.recv() => match recv {
-                    Some(event) => match event {
-                        actor::Event::Stop { respond_to } => {
-                            respond_to.send(()).unwrap();
-                            break;
-                        }
-                        actor::Event::Message(message) => {
-                            if let Some(signal) = model.handle_message(message).await {
-                                match signal {
-                                    actor::Signal::Stop => break,
-                                }
-                            }
-                        }
-                    },
-                    None => break,
+                recv = receiver.recv() => {
+                    handle_actor_message(&mut model, recv).await;
                 }
             }
         }
     });
+
     ClientHandle {
         id,
         sender: sender.into(),
+    }
+}
+
+async fn handle_websocket_message<R, W>(
+    client: &mut Client<R, W>,
+    msg: tungstenite::Result<tungstenite::Message>,
+) where
+    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin,
+    W: SinkExt<tungstenite::Message> + Unpin,
+{
+    match msg {
+        Ok(msg) => {
+            tracing::debug!("received message: {:?}", msg);
+            if !msg.is_binary() {
+                tracing::warn!("received non-binary message, ignoring");
+                return;
+            }
+
+            let data = bytes::Bytes::from(msg.into_data());
+            let Ok(message) = data.try_into() else {
+                tracing::error!("failed to deserialize message from websocket");
+                return;
+            };
+
+            client.receive_message(message).await.unwrap();
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to read message from websocket");
+            if let Err(err) = client.disconnect().await {
+                tracing::error!(
+                    ?err,
+                    "while failing to read message from websocket, failed to disconnect client "
+                );
+            }
+        }
+    }
+}
+
+async fn handle_actor_message<R, W>(client: &mut Client<R, W>, recv: Option<actor::Event<Message>>)
+where
+    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin + Send + Sync,
+    W: SinkExt<tungstenite::Message> + Unpin + Send + Sync,
+{
+    match recv {
+        Some(event) => match event {
+            actor::Event::Stop { respond_to } => {
+                respond_to.send(()).unwrap();
+            }
+            actor::Event::Message(message) => {
+                if let Some(signal) = client.handle_message(message).await {
+                    match signal {
+                        actor::Signal::Stop => {}
+                    }
+                }
+            }
+        },
+        None => {}
     }
 }

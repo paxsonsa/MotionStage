@@ -75,10 +75,11 @@ where
 async fn test_client_initialization() {
     // Create a pair of channels for sending/receiver messages form the client itself.
     let (client_sender, client_receiver) = futures::channel::mpsc::unbounded();
+
     // Crate a pair of channels for sending/receiving messages from the websocket.
     let (ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let engine_ = engine::EngineHandle::new(tx.into());
     let client = client::Client::new(ws_receiver, client_sender, engine_);
     let id = client.id();

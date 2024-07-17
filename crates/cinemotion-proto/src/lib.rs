@@ -27,7 +27,7 @@ impl TryInto<bytes::Bytes> for ServerMessage {
     }
 }
 
-impl TryFrom<bytes::Bytes> for ClientMessage {
+impl TryFrom<bytes::Bytes> for ServerMessage {
     type Error = self::ProtocolError;
 
     fn try_from(value: bytes::Bytes) -> Result<Self, Self::Error> {
@@ -38,6 +38,16 @@ impl TryFrom<bytes::Bytes> for ClientMessage {
     }
 }
 
+impl TryFrom<bytes::Bytes> for ClientMessage {
+    type Error = self::ProtocolError;
+
+    fn try_from(value: bytes::Bytes) -> Result<Self, Self::Error> {
+        match prost::Message::decode(value) {
+            Ok(msg) => Ok(msg),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
 // This is a convenience macro to implement the From trait for our
 // generated protobuf types.
 macro_rules! impl_from_client_body {

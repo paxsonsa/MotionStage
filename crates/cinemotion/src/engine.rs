@@ -26,7 +26,7 @@ pub enum Message {
     },
     Apply {
         client_id: i32,
-        message: core::protocol::ClientMessage,
+        message: core::protocol::client_message::Body,
         responder: actor::Responder<Result<(), EngineError>>,
     },
 }
@@ -34,7 +34,7 @@ pub enum Message {
 impl Message {
     pub fn apply(
         client_id: i32,
-        message: core::protocol::ClientMessage,
+        message: core::protocol::client_message::Body,
     ) -> (Self, actor::Response<Result<(), EngineError>>) {
         let (responder, response) = actor::Response::new();
         (
@@ -73,7 +73,7 @@ impl EngineHandle {
     pub async fn apply(
         &self,
         client_id: i32,
-        message: core::protocol::ClientMessage,
+        message: core::protocol::client_message::Body,
     ) -> Result<(), EngineError> {
         self.perform_send(|| Message::apply(client_id, message))
             .await
@@ -114,18 +114,21 @@ impl actor::Actor for EngineActor {
                 client_id,
                 message,
                 responder,
-            } => {
-                // TODO: Implement the apply routine and think about whether we want to capture
-                // errors from apply the value? Probably not, just send errors to client by ID.
-                self.inner.apply(client_id, message).await;
-                responder.dispatch(Ok(())).await;
-            }
+            } => match self.inner.apply(client_id, message).await {
+                Ok(_) => {
+                    responder.dispatch(Ok(())).await;
+                    return None;
+                }
+                Err(err) => {
+                    tracing::error!(?err, "failed to apply message");
+                }
+            },
             Message::AddClient { client, responder } => {
                 self.clients.insert(client.id(), client.clone());
 
                 match client.initialize().await {
                     Ok(_) => {
-                        responder.dispatch(Ok(())).await;
+                        let _ = responder.try_dispatch(Ok(())).await;
                     }
                     Err(e) => {
                         responder
@@ -137,10 +140,7 @@ impl actor::Actor for EngineActor {
             Message::RemoveClient { id, responder } => {
                 // TODO: Remove client device from engine as well.
                 self.clients.remove(&id);
-                responder
-                    .dispatch(Ok(()))
-                    .await
-                    .expect("response receiver should not close.");
+                responder.dispatch(Ok(())).await;
             }
         };
         None
