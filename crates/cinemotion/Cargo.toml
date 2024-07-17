@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [[bin]]
 name = "cinemotion"
 path = "src/cli/cinemotion.rs"
@@ -19,8 +18,10 @@ arc-swap.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
+cinemotion-core.workspace = true
 cinemotion-proto.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -30,6 +31,7 @@ async-trait.workspace = true
 futures.workspace = true
 warp.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 webrtc.workspace = true
 base64.workspace = true
 quinn.workspace = true
@@ -37,6 +39,8 @@ rustls.workspace = true
 rcgen.workspace = true
 hostname.workspace = true
 get_if_addrs.workspace = true
+trait-variant = "0.1.2"
+futures-util = "0.3.30"
 
 [dev-dependencies]
 paste = "1.0"

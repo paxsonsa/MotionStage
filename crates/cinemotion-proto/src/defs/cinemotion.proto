@@ -1,161 +1,28 @@
 syntax = "proto3";
 package cinemotion;
 
-message Command {
-	oneof payload {
-    Echo echo = 1;
-    InitCommand init = 2;
-    AddSceneObject add_scene_object = 30;
-    ClearScene clear_scene = 31;
-    DeleteSceneObject delete_scene_object = 32;
-    UpdateSceneObject update_scene_object = 33;
-    ChangeMode change_mode = 40;
-    SendSample send_sample = 50;
-	}
-}
-
-message Event {
-  oneof payload {
-    Echo echo = 1;
-    ConnectionOpenedEvent connection_opened = 2;
-    StateChangeEvent state_change = 3;
-    ErrorEvent error = 4;
+message ServerMessage {
+  oneof body {
+    Error error = 1;
+    Ping ping = 2;
+    Pong pong = 3;
+    Initialize initialize = 10;
   }
 }
 
-// An echo to/from the server.
-message Echo {
-	string message = 1;
+message ClientMessage {
+  oneof body { InitializeAck initializeAck = 11; }
 }
 
-/******************************
-* Command Types
-******************************/
+message Error {}
 
-// Initiate the connection with the controller description.
-message InitCommand {
-  ControllerDef controller = 1;
+message Ping {}
+
+message Pong {}
+
+message Initialize {
+  int32 version = 1;
+  int32 id = 2;
 }
 
-// Add an object to the scene.
-message AddSceneObject {
-    SceneObject object = 10;
-}
-
-// Update an existing object in the scene.
-message UpdateSceneObject {
-    SceneObject object = 10;
-}
-
-// Delete an object from the scene.
-message DeleteSceneObject {
-    string name = 10;
-}
-
-// Clear the scene.
-message ClearScene {}
-
-message ChangeMode {
-  enum Mode {
-    IDLE = 0;
-    LIVE = 1;
-    RECORDING = 2;
-  }
-  Mode mode = 1;
-}
-
-message SendSample {
-  Sample sample = 1;
-}
-/*******************************
-* Event Types
-********************************/
-
-// A hello from the server to start the connection.
-message ConnectionOpenedEvent {}
-
-message StateChangeEvent {
-  State state = 1;
-}
-
-message ErrorEvent {
-  enum ErrorType {
-    UNKNOWN = 0;
-    INVALID_SCENE_OBJECT = 20;
-  }
-  ErrorType type = 10;
-  string description = 11;
-}
-
-/*******************************
-* Data Types
-********************************/
-message Controller {
-  string name = 2;
-  map<string, Property> properties = 3;
-}
-
-message ControllerDef {
-  string name = 2;
-  map<string, PropertyValue> properties = 3;
-}
-
-message State {
-  repeated Controller controllers = 1;
-}
-
-message Property {
-  string name = 1;
-  PropertyValue default_value = 2;
-  PropertyValue value = 3;
-}
-
-message PropertyValue {
-  oneof value {
-    double float_value = 1;
-    Vec3 vec3_value = 2;
-    Vec4 vec4_value = 3;
-    Matrix4x4 matrix4x4_value = 4;
-  }
-}
-
-message Sample {
-  map<string, PropertyValue> properties = 1;
-}
-
-message Vec3 {
-  double x = 1;
-  double y = 2;
-  double z = 3;
-}
-
-message Vec4 {
-  double x = 1;
-  double y = 2;
-  double z = 3;
-  double w = 4;
-}
-
-message Matrix4x4 {
-  Vec4 row0 = 1;
-  Vec4 row1 = 2;
-  Vec4 row2 = 3;
-  Vec4 row3 = 4;
-}
-
-message SceneObject {
-  string name = 1;
-  map<string, PropertyLink> properties = 2;
-}
-
-message PropertyLink {
-  enum BindState {
-    UNBOUND = 0;
-    BOUND = 1;
-  }
-
-  BindState bind_state = 1;
-  PropertyValue value = 2;
-  string namespace = 3;
-  string property = 4;
-}
+message InitializeAck {}
