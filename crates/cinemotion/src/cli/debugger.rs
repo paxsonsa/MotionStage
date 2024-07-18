@@ -45,7 +45,7 @@ impl DebuggerCmd {
                         return;
                     }
                 };
-                tracing::debug!("received message: {:?}", msg);
+                tracing::debug!("{:?}", serde_json::to_string(&msg).unwrap());
             })
         };
 

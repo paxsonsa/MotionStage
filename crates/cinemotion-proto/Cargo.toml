@@ -10,6 +10,11 @@ license.workspace = true
 prost.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+pbjson = "0.7.0"
+pbjson-build = "0.7.0"
+pbjson-types = "0.7.0"
 
 [build-dependencies]
 prost-build.workspace = true
+pbjson-build = "0.7.0"

@@ -6,6 +6,7 @@ use prost::Message;
 // Include the `items` module, which is generated from items.proto.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/cinemotion.rs"));
+    include!(concat!(env!("OUT_DIR"), "/cinemotion.serde.rs"));
 }
 pub use proto::*;
 

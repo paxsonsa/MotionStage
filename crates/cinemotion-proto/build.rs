@@ -1,9 +1,28 @@
+use std::env;
+use std::path::PathBuf;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = prost_build::Config::new();
-    // use Bytes type in protobuf messages to avoid additional
-    // allocations of our raw yaml data
-    config.bytes(["."]);
-    // generate prost types for our service.proto
-    let _ = config.compile_protos(&["src/defs/cinemotion.proto"], &["src/defs"])?;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/defs");
+    let proto_files = vec![root.join("cinemotion.proto")];
+
+    // Tell cargo to recompile if any of these proto files are changed
+    for proto_file in &proto_files {
+        println!("cargo:rerun-if-changed={}", proto_file.display());
+    }
+    let descriptor_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("proto_descriptor.bin");
+
+    prost_build::Config::new()
+        // Save descriptors to file
+        .file_descriptor_set_path(&descriptor_path)
+        // Override prost-types with pbjson-types
+        .compile_well_known_types()
+        .extern_path(".google.protobuf", "::pbjson_types")
+        .bytes(["."])
+        // Generate prost structs
+        .compile_protos(&proto_files, &[root])?;
+    let descriptor_set = std::fs::read(descriptor_path)?;
+    pbjson_build::Builder::new()
+        .register_descriptors(&descriptor_set)?
+        .build(&[".cinemotion"])?;
     Ok(())
 }
