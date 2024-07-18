@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicI32, Ordering};
-
 use async_trait::async_trait;
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use std::sync::atomic::{AtomicI32, Ordering};
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite;
 
 use crate::actor::{self, Actor, HandleExt};
 use crate::engine;
@@ -38,10 +39,6 @@ impl Message {
         )
     }
 }
-
-use futures::sink::SinkExt;
-use futures::stream::StreamExt;
-use tokio_tungstenite::tungstenite;
 
 /// `ClientError` is an enumeration that is intended to represent
 /// different types of errors that can occur within the client.
@@ -233,11 +230,13 @@ where
         None
     }
 }
-pub fn spawn_websocket_client(
-    ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
-    engine: engine::EngineHandle,
-) -> ClientHandle {
-    let (writer, reader) = ws_stream.split();
+
+/// Spawn a new client with the given reader and writer for communicating with the network layer
+pub fn spawn<R, W>(reader: R, writer: W, engine: engine::EngineHandle) -> ClientHandle
+where
+    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Send + Sync + Unpin + 'static,
+    W: SinkExt<tungstenite::Message> + Send + Sync + Unpin + 'static,
+{
     let mut model = Client::new(reader, writer, engine);
     let id = model.id();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<_>();

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use clap::Args;
+use futures::SinkExt;
+use futures::StreamExt;
 use tokio::net::TcpListener;
 
 use cinemotion::{actor::Handle, client, engine, websocket, Error};
@@ -26,9 +28,10 @@ impl ServerCmd {
         let mut websocket_server = websocket::server(listener, move |ws_stream| {
             // Need to clone the engine handle and client coordinator handle to move into the async
             // block
-            let mut engine_handle = engine_handle.clone();
+            let engine_handle = engine_handle.clone();
             async move {
-                let mut client = client::spawn_websocket_client(ws_stream, engine_handle.clone());
+                let (writer, reader) = ws_stream.split();
+                let mut client = client::spawn(reader, writer, engine_handle.clone());
 
                 if let Err(err) = engine_handle.add_client(client.clone()).await {
                     tracing::error!(?err, "failed to add new client.");
