@@ -3,7 +3,6 @@ use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use thiserror::Error;
-use tokio_tungstenite::tungstenite;
 
 use crate::actor::{self, Actor, HandleExt};
 use crate::engine;
@@ -48,7 +47,7 @@ pub enum ClientError {
     SendError,
 
     #[error("bad message: {0}")]
-    BadMessage(&'static str),
+    BadMessage(String),
 
     #[error(transparent)]
     ActorError(#[from] actor::ActorError),
@@ -113,7 +112,7 @@ impl actor::Handle for ClientHandle {
 impl actor::HandleExt for ClientHandle {}
 
 /// `Client` is a generic struct that represents a client in the system.
-/// It is parameterized over two types: `R` and `W`.
+/// It is parameterized over two types: `R` and `W`. a
 /// `R` is a type that implements `StreamExt` with `Item` being a `Result` of `tungstenite::Message`.
 /// `W` is a type that implements `SinkExt` with `Item` being a `tungstenite::Message`.
 /// The `Client` struct also contains an `engine::EngineHandle` and a `coordinator::ClientCoordinatorHandle`.
@@ -123,26 +122,44 @@ impl actor::HandleExt for ClientHandle {}
 /// The `Client` struct also implements the `Actor` trait from the `actor` module.
 /// The `Message` associated type is set to `Message` and the `Handle` associated type is set to `ClientHandle`.
 /// The `handle_message` function is an asynchronous function that handles incoming messages.
-pub struct Client<R, W> {
+pub struct Client<R, W, T, S, FnSend, FnReceive>
+where
+    R: StreamExt<Item = T> + Unpin,
+    W: SinkExt<S> + Unpin,
+    FnSend: FnMut(protocol::ServerMessage) -> S + Send + 'static,
+    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
+{
     id: i32,
     reader: R,
     writer: W,
     engine: engine::EngineHandle,
     state: State,
+    send_fn: FnSend,
+    receive_fn: FnReceive,
 }
 
-impl<R, W> Client<R, W>
+impl<R, W, T, S, FnTo, FnFrom> Client<R, W, T, S, FnTo, FnFrom>
 where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin,
-    W: SinkExt<tungstenite::Message> + Unpin,
+    R: StreamExt<Item = T> + Unpin,
+    W: SinkExt<S> + Unpin,
+    FnTo: FnMut(protocol::ServerMessage) -> S + Send + 'static,
+    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
-    pub fn new(reader: R, writer: W, engine: engine::EngineHandle) -> Self {
+    pub fn new(
+        reader: R,
+        writer: W,
+        engine: engine::EngineHandle,
+        send_fn: FnTo,
+        receive_fn: FnFrom,
+    ) -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             reader,
             writer,
             engine,
             state: State::default(),
+            send_fn,
+            receive_fn,
         }
     }
 
@@ -181,8 +198,9 @@ where
         &mut self,
         message: protocol::ServerMessage,
     ) -> Result<(), ClientError> {
-        let bytes: bytes::Bytes = message.try_into().map_err(|_| ClientError::SendError)?;
-        let message = tungstenite::Message::binary(bytes.to_vec());
+        let message = (self.send_fn)(message);
+        // let bytes: bytes::Bytes = message.try_into().map_err(|_| ClientError::SendError)?;
+        // let message = tungstenite::Message::binary(bytes.to_vec());
         self.writer
             .send(message)
             .await
@@ -190,12 +208,10 @@ where
         Ok(())
     }
 
-    pub async fn receive_message(
-        &mut self,
-        message: protocol::ClientMessage,
-    ) -> Result<(), ClientError> {
+    pub async fn receive_message(&mut self, message: T) -> Result<(), ClientError> {
+        let message = (self.receive_fn)(message)?;
         let Some(message) = message.body else {
-            return Err(ClientError::BadMessage("missing message body"));
+            return Err(ClientError::BadMessage(format!("missing message body")));
         };
         match message {
             protocol::client_message::Body::InitializeAck(_) => {
@@ -213,10 +229,14 @@ where
 }
 
 #[async_trait]
-impl<R, W> actor::Actor for Client<R, W>
+impl<R, W, T, S, FnTo, FnFrom> actor::Actor for Client<R, W, T, S, FnTo, FnFrom>
 where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin + Send + Sync,
-    W: SinkExt<tungstenite::Message> + Unpin + Send + Sync,
+    T: Sync + Send,
+    S: Sync + Send,
+    R: StreamExt<Item = T> + Unpin + Send + Sync,
+    W: SinkExt<S> + Unpin + Send + Sync,
+    FnTo: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
+    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
     type Message = Message;
     type Handle = ClientHandle;
@@ -232,12 +252,22 @@ where
 }
 
 /// Spawn a new client with the given reader and writer for communicating with the network layer
-pub fn spawn<R, W>(reader: R, writer: W, engine: engine::EngineHandle) -> ClientHandle
+pub fn spawn<R, W, T, S, FnSend, FnReceive>(
+    reader: R,
+    writer: W,
+    engine: engine::EngineHandle,
+    receive_fn: FnReceive,
+    send_fn: FnSend,
+) -> ClientHandle
 where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Send + Sync + Unpin + 'static,
-    W: SinkExt<tungstenite::Message> + Send + Sync + Unpin + 'static,
+    T: Sync + Send + 'static,
+    S: Sync + Send + 'static,
+    R: StreamExt<Item = T> + Unpin + Send + Sync + 'static,
+    W: SinkExt<S> + Unpin + Send + Sync + 'static,
+    FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
+    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
-    let mut model = Client::new(reader, writer, engine);
+    let mut model = Client::new(reader, writer, engine, send_fn, receive_fn);
     let id = model.id();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<_>();
 
@@ -246,7 +276,9 @@ where
             tokio::select! {
                 // Handle when a new message is received via websocket
                 Some(msg) = model.reader.next() => {
-                    handle_websocket_message(&mut model, msg).await;
+                    if let Err(err) = model.receive_message(msg).await {
+                        tracing::error!(?err, "failed to receive message from client reader");
+                    }
                 },
                 // Handle when a new message is received via the actor system
                 recv = receiver.recv() => {
@@ -262,45 +294,49 @@ where
     }
 }
 
-async fn handle_websocket_message<R, W>(
-    client: &mut Client<R, W>,
-    msg: tungstenite::Result<tungstenite::Message>,
+// async fn handle_receive<R, W, T>(client: &mut Client<R, W, T, FnSend, FnReceive>, msg: T)
+// where
+//     R: StreamExt<Item = T> + Unpin,
+//     W: SinkExt<T> + Unpin,
+// {
+//     match msg {
+//         Ok(msg) => {
+//             tracing::debug!("received message: {:?}", msg);
+//             if !msg.is_binary() {
+//                 tracing::warn!("received non-binary message, ignoring");
+//                 return;
+//             }
+//
+//             let data = bytes::Bytes::from(msg.into_data());
+//             let Ok(message) = data.try_into() else {
+//                 tracing::error!("failed to deserialize message from websocket");
+//                 return;
+//             };
+//
+//             client.receive_message(message).await.unwrap();
+//         }
+//         Err(err) => {
+//             tracing::error!(?err, "failed to read message from websocket");
+//             if let Err(err) = client.disconnect().await {
+//                 tracing::error!(
+//                     ?err,
+//                     "while failing to read message from websocket, failed to disconnect client "
+//                 );
+//             }
+//         }
+//     }
+// }
+
+async fn handle_actor_message<T, S, R, W, FnSend, FnReceive>(
+    client: &mut Client<R, W, T, S, FnSend, FnReceive>,
+    recv: Option<actor::Event<Message>>,
 ) where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin,
-    W: SinkExt<tungstenite::Message> + Unpin,
-{
-    match msg {
-        Ok(msg) => {
-            tracing::debug!("received message: {:?}", msg);
-            if !msg.is_binary() {
-                tracing::warn!("received non-binary message, ignoring");
-                return;
-            }
-
-            let data = bytes::Bytes::from(msg.into_data());
-            let Ok(message) = data.try_into() else {
-                tracing::error!("failed to deserialize message from websocket");
-                return;
-            };
-
-            client.receive_message(message).await.unwrap();
-        }
-        Err(err) => {
-            tracing::error!(?err, "failed to read message from websocket");
-            if let Err(err) = client.disconnect().await {
-                tracing::error!(
-                    ?err,
-                    "while failing to read message from websocket, failed to disconnect client "
-                );
-            }
-        }
-    }
-}
-
-async fn handle_actor_message<R, W>(client: &mut Client<R, W>, recv: Option<actor::Event<Message>>)
-where
-    R: StreamExt<Item = tungstenite::Result<tungstenite::Message>> + Unpin + Send + Sync,
-    W: SinkExt<tungstenite::Message> + Unpin + Send + Sync,
+    T: Sync + Send,
+    S: Sync + Send,
+    R: StreamExt<Item = T> + Unpin + Send + Sync,
+    W: SinkExt<S> + Unpin + Send + Sync,
+    FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
+    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
     match recv {
         Some(event) => match event {

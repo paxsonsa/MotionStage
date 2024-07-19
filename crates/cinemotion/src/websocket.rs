@@ -5,6 +5,8 @@ use futures::Future;
 use tokio::net::TcpListener;
 
 use crate::actor;
+use crate::client::ClientError;
+use cinemotion_core::protocol;
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -122,4 +124,49 @@ where
 
     let handle = actor::spawn(actor, |sender| WebSocketHandle { sender });
     Ok(handle)
+}
+
+pub fn receive_message(
+    msg: Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+) -> Result<protocol::ClientMessage, ClientError> {
+    match msg {
+        Ok(msg) => {
+            tracing::debug!("received message: {:?}", msg);
+            if !msg.is_binary() {
+                tracing::warn!("received non-binary message, ignoring");
+                return Err(ClientError::BadMessage(format!(
+                    "received non-binary message"
+                )));
+            }
+
+            let data = bytes::Bytes::from(msg.into_data());
+            let Ok(message) = data.try_into() else {
+                tracing::error!("failed to deserialize message from websocket");
+                return Err(ClientError::BadMessage(format!(
+                    "failed to convert message from websocket to local type"
+                )));
+            };
+            Ok(message)
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to read message from websocket");
+            Err(ClientError::BadMessage(format!(
+                "failed to read message from websocket: {:?}",
+                err
+            )))
+            // if let Err(err) = client.disconnect().await {
+            //     tracing::error!(
+            //         ?err,
+            //         "while failing to read message from websocket, failed to disconnect client "
+            //     );
+            // }
+        }
+    }
+}
+
+pub fn convert_message(msg: protocol::ServerMessage) -> tokio_tungstenite::tungstenite::Message {
+    let data: bytes::Bytes = msg
+        .try_into()
+        .expect("failed to generate bytes for protocol message");
+    tokio_tungstenite::tungstenite::Message::binary(data)
 }

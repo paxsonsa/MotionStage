@@ -31,7 +31,13 @@ impl ServerCmd {
             let engine_handle = engine_handle.clone();
             async move {
                 let (writer, reader) = ws_stream.split();
-                let mut client = client::spawn(reader, writer, engine_handle.clone());
+                let mut client = client::spawn(
+                    reader,
+                    writer,
+                    engine_handle.clone(),
+                    websocket::receive_message,
+                    websocket::convert_message,
+                );
 
                 if let Err(err) = engine_handle.add_client(client.clone()).await {
                     tracing::error!(?err, "failed to add new client.");

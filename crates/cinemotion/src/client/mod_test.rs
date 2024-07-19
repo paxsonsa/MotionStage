@@ -1,9 +1,9 @@
 use derive_more::{Display, Error};
 
 use super::*;
-
 use crate::actor::{self, Handle};
 use crate::engine;
+use cinemotion_core::protocol;
 
 #[derive(Debug, Display, Error)]
 struct TimeoutElapsed {}
@@ -74,18 +74,27 @@ where
 #[tokio::test]
 async fn test_client_initialization() {
     // Create a pair of channels for sending/receiver messages form the client itself.
-    let (client_sender, client_receiver) = futures::channel::mpsc::unbounded();
+    let (client_sender, mut client_receiver) = futures::channel::mpsc::unbounded();
 
     // Crate a pair of channels for sending/receiving messages from the websocket.
     let (ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let engine_ = engine::EngineHandle::new(tx.into());
-    let client = client::Client::new(ws_receiver, client_sender, engine_);
+
+    let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
+    let send_fn = move |msg| msg;
+
+    let client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
     let id = client.id();
     let (mut test_actor, mut handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
     test_actor
         .wait_for(handle.initialize(), None)
         .await
+        .unwrap()
         .expect("client should initialize successfully.");
+    let message = client_receiver
+        .try_next()
+        .expect("the init message should be present")
+        .unwrap();
 }
