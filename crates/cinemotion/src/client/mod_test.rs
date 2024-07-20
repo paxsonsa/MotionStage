@@ -1,4 +1,5 @@
 use derive_more::{Display, Error};
+use futures::SinkExt;
 
 use super::*;
 use crate::actor::{self, Handle};
@@ -51,8 +52,16 @@ where
                             break;
                         }
                         actor::Event::Message(message) => {
-                            self.model.handle_message(message).await;
+                            if let Some(actor::Signal::Stop) = self.model.handle_message(message).await {
+                                break;
+                            }
                         }
+                    }
+                }
+                signal = self.model.tick() => {
+                    match signal {
+                        Some(actor::Signal::Stop) => break,
+                        _ => {}
                     }
                 }
                 _ = &mut timeout => {
@@ -68,6 +77,37 @@ where
             Err(_) => Err(TimeoutElapsed {}),
         }
     }
+
+    pub async fn step(&mut self, timeout_secs: Option<u64>) -> Result<(), TimeoutElapsed> {
+        let timeout_secs = timeout_secs.unwrap_or(3);
+        let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(timeout);
+        tokio::select! {
+            Some(event) = self.receiver.recv() => {
+                match event {
+                    actor::Event::Stop { respond_to } => {
+                        respond_to.send(()).unwrap();
+                        Ok(())
+                    }
+                    actor::Event::Message(message) => {
+                        if let Some(actor::Signal::Stop) = self.model.handle_message(message).await {
+                            return Ok(());
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            signal = self.model.tick() => {
+                match signal {
+                    Some(actor::Signal::Stop) => Ok(()),
+                    _ => {Ok(())}
+                }
+            }
+            _ = &mut timeout => {
+                panic!("Timeout");
+            }
+        }
+    }
 }
 
 /// Test that the client initializes successfully
@@ -77,24 +117,46 @@ async fn test_client_initialization() {
     let (client_sender, mut client_receiver) = futures::channel::mpsc::unbounded();
 
     // Crate a pair of channels for sending/receiving messages from the websocket.
-    let (ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
+    let (mut ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let engine_ = engine::EngineHandle::new(tx.into());
 
     let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
     let send_fn = move |msg| msg;
 
-    let client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
+    let mut client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
     let id = client.id();
     let (mut test_actor, mut handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
+
     test_actor
         .wait_for(handle.initialize(), None)
         .await
         .unwrap()
         .expect("client should initialize successfully.");
+
     let message = client_receiver
         .try_next()
-        .expect("the init message should be present")
+        .expect("message should be present")
         .unwrap();
+
+    assert!(matches!(
+        message.body.unwrap(),
+        protocol::server_message::Body::Initialize(protocol::Initialize { .. })
+    ));
+
+    let init_ack = protocol::ClientMessage {
+        body: Some(protocol::client_message::Body::InitializeAck(
+            protocol::InitializeAck {},
+        )),
+    };
+    ws_sender.send(init_ack).await.unwrap();
+    test_actor.step(None).await.unwrap();
+
+    let state = test_actor
+        .wait_for(handle.state(), None)
+        .await
+        .unwrap()
+        .expect("client should return state");
+    assert!(matches!(state.status, Status::Ready));
 }

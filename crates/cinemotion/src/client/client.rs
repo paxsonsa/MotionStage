@@ -17,6 +17,7 @@ pub enum Message {
         message: protocol::ServerMessage,
         response: actor::Responder<Result<(), ClientError>>,
     },
+    State(actor::Responder<Result<State, ClientError>>),
 }
 
 impl Message {
@@ -37,6 +38,11 @@ impl Message {
             response,
         )
     }
+
+    pub fn state() -> (Self, actor::Response<Result<State, ClientError>>) {
+        let (responder, response) = actor::Response::new();
+        (Self::State(responder), response)
+    }
 }
 
 /// `ClientError` is an enumeration that is intended to represent
@@ -53,8 +59,8 @@ pub enum ClientError {
     ActorError(#[from] actor::ActorError),
 }
 
-#[derive(Default)]
-enum Status {
+#[derive(Clone, Debug, Default)]
+pub enum Status {
     /// The client is initializing and not ready to send or receive messages
     #[default]
     Initializing,
@@ -65,8 +71,8 @@ enum Status {
 }
 
 /// Internal state of the client
-#[derive(Default)]
-struct State {
+#[derive(Clone, Debug, Default)]
+pub struct State {
     pub status: Status,
 }
 
@@ -83,6 +89,7 @@ impl ClientHandle {
     pub fn id(&self) -> i32 {
         self.id
     }
+
     /// Initialize the client connection
     ///
     /// The client needs to initialize before it can respond to any messages
@@ -98,6 +105,10 @@ impl ClientHandle {
     ///
     pub async fn send(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
         self.perform_send(|| Message::send(message)).await
+    }
+
+    pub async fn state(&self) -> Result<State, ClientError> {
+        self.perform_send(|| Message::state()).await
     }
 }
 
@@ -246,6 +257,18 @@ where
             Message::Send { message, response } => {
                 response.dispatch(self.send_message(message).await).await;
             }
+            Message::State(response) => response.dispatch(Ok(self.state.clone())).await,
+        }
+        None
+    }
+
+    async fn tick(&mut self) -> Option<actor::Signal> {
+        let Some(msg) = self.reader.next().await else {
+            return Some(actor::Signal::Stop);
+        };
+
+        if let Err(err) = self.receive_message(msg).await {
+            tracing::error!(?err, "failed to receive message from client reader");
         }
         None
     }
@@ -267,90 +290,7 @@ where
     FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
-    let mut model = Client::new(reader, writer, engine, send_fn, receive_fn);
+    let model = Client::new(reader, writer, engine, send_fn, receive_fn);
     let id = model.id();
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<_>();
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                // Handle when a new message is received via websocket
-                Some(msg) = model.reader.next() => {
-                    if let Err(err) = model.receive_message(msg).await {
-                        tracing::error!(?err, "failed to receive message from client reader");
-                    }
-                },
-                // Handle when a new message is received via the actor system
-                recv = receiver.recv() => {
-                    handle_actor_message(&mut model, recv).await;
-                }
-            }
-        }
-    });
-
-    ClientHandle {
-        id,
-        sender: sender.into(),
-    }
-}
-
-// async fn handle_receive<R, W, T>(client: &mut Client<R, W, T, FnSend, FnReceive>, msg: T)
-// where
-//     R: StreamExt<Item = T> + Unpin,
-//     W: SinkExt<T> + Unpin,
-// {
-//     match msg {
-//         Ok(msg) => {
-//             tracing::debug!("received message: {:?}", msg);
-//             if !msg.is_binary() {
-//                 tracing::warn!("received non-binary message, ignoring");
-//                 return;
-//             }
-//
-//             let data = bytes::Bytes::from(msg.into_data());
-//             let Ok(message) = data.try_into() else {
-//                 tracing::error!("failed to deserialize message from websocket");
-//                 return;
-//             };
-//
-//             client.receive_message(message).await.unwrap();
-//         }
-//         Err(err) => {
-//             tracing::error!(?err, "failed to read message from websocket");
-//             if let Err(err) = client.disconnect().await {
-//                 tracing::error!(
-//                     ?err,
-//                     "while failing to read message from websocket, failed to disconnect client "
-//                 );
-//             }
-//         }
-//     }
-// }
-
-async fn handle_actor_message<T, S, R, W, FnSend, FnReceive>(
-    client: &mut Client<R, W, T, S, FnSend, FnReceive>,
-    recv: Option<actor::Event<Message>>,
-) where
-    T: Sync + Send,
-    S: Sync + Send,
-    R: StreamExt<Item = T> + Unpin + Send + Sync,
-    W: SinkExt<S> + Unpin + Send + Sync,
-    FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
-    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
-{
-    match recv {
-        Some(event) => match event {
-            actor::Event::Stop { respond_to } => {
-                respond_to.send(()).unwrap();
-            }
-            actor::Event::Message(message) => {
-                if let Some(signal) = client.handle_message(message).await {
-                    match signal {
-                        actor::Signal::Stop => {}
-                    }
-                }
-            }
-        },
-        None => {}
-    }
+    actor::spawn(model, move |sender| ClientHandle { id, sender })
 }
