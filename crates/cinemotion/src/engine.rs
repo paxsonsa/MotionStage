@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use cinemotion_core as core;
 
 use crate::actor;
-use crate::actor::HandleExt;
+use crate::actor::{ActorError, HandleExt};
 use crate::client;
+use crate::perform_send_with_error_handling;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum EngineError {
@@ -12,6 +13,9 @@ pub enum EngineError {
     EngineFailed,
     #[error("failed while processing message: {0}")]
     MessageFailed(String),
+
+    #[error(transparent)]
+    ActorError(#[from] actor::ActorError),
 }
 
 #[derive(Debug, Clone)]
@@ -75,16 +79,15 @@ impl EngineHandle {
         client_id: i32,
         message: core::protocol::client_message::Body,
     ) -> Result<(), EngineError> {
-        self.perform_send(|| Message::apply(client_id, message))
-            .await
+        perform_send_with_error_handling!(self, Message::apply(client_id, message))
     }
 
     pub async fn add_client(&self, client: client::ClientHandle) -> Result<(), EngineError> {
-        self.perform_send(|| Message::add_client(client)).await
+        perform_send_with_error_handling!(self, Message::add_client(client))
     }
 
     pub async fn remove_client(&self, id: i32) -> Result<(), EngineError> {
-        self.perform_send(|| Message::remove_client(id)).await
+        perform_send_with_error_handling!(self, Message::remove_client(id))
     }
 }
 
@@ -145,6 +148,21 @@ impl actor::Actor for EngineActor {
         };
         None
     }
+
+    async fn tick(&mut self) -> Option<actor::Signal> {
+        match self.inner.serialize().await {
+            Ok(state) => {
+                if let Err(err) = broadcast(&self.clients, state).await {
+                    tracing::error!(?err, "failed to broadcast state to clients");
+                }
+                None
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed during engine runtime tick");
+                Some(actor::Signal::Stop)
+            }
+        }
+    }
 }
 
 pub fn spawn() -> EngineHandle {
@@ -153,4 +171,19 @@ pub fn spawn() -> EngineHandle {
         inner: core::engine::Engine::new(),
     };
     actor::spawn(engine, EngineHandle::new)
+}
+
+async fn broadcast(
+    clients: &std::collections::HashMap<i32, client::ClientHandle>,
+    state: core::state::StateTree,
+) -> Result<(), EngineError> {
+    for client in clients.values() {
+        client.send(state.clone().into()).await.map_err(|err| {
+            EngineError::MessageFailed(format!(
+                "failed to broadcast state to client: err={:?}",
+                err
+            ))
+        })?;
+    }
+    Ok(())
 }

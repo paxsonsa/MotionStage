@@ -174,6 +174,7 @@ where
     }
 }
 
+#[async_trait]
 pub trait HandleExt: Handle {
     /// Sends a message to the actor.
     fn send(&mut self, message: Self::Message) -> Result<(), ActorError> {
@@ -206,10 +207,15 @@ pub trait HandleExt: Handle {
     >(
         &self,
         message_fn: F,
-    ) -> T {
+    ) -> Result<T, ActorError> {
         let (msg, response) = message_fn();
-        self.sender().send(msg).expect("send should work");
-        response.await.expect("response should not fail")
+        match self.sender().send(msg) {
+            Ok(_) => Ok(response.await.expect("response should not fail")),
+            Err(err) => {
+                tracing::error!(?err, "failed to send message");
+                Err(ActorError::SendError)
+            }
+        }
     }
 }
 
@@ -246,4 +252,17 @@ pub fn spawn<M: Actor + 'static, F: FnOnce(Sender<M::Message>) -> M::Handle>(
         }
     });
     new_handle(sender.into())
+}
+
+#[macro_export]
+macro_rules! perform_send_with_error_handling {
+    ($self:expr, $expr:expr) => {
+        match $self.perform_send(|| $expr).await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(?err, "failed to send init message to client");
+                Err(ActorError::SendError.into())
+            }
+        }
+    };
 }

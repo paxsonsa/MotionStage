@@ -9,7 +9,7 @@ pub mod name;
 mod globals;
 pub mod prelude;
 pub mod scene;
-mod state;
+pub mod state;
 pub mod world;
 
 pub use cinemotion_proto as protocol;

@@ -17,11 +17,6 @@ macro_rules! invoke {
     };
 }
 
-pub struct EngineState<'a, Param: SystemParam + 'static> {
-    system_state: SystemState<Param>,
-    param_item: SystemParamItem<'a, 'a, Param>,
-}
-
 pub struct Engine {
     world: World,
 }
@@ -50,13 +45,13 @@ impl Engine {
         }
     }
 
-    pub async fn serialize(&mut self) -> StateTree {
+    pub async fn serialize(&mut self) -> Result<StateTree> {
         let state = StateTree::new();
         //
         // for device in self.world.query::<(&Device)>().iter() {
         //     state.devices.push(device)
         // }
 
-        state
+        Ok(state)
     }
 }

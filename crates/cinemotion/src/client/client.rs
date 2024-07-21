@@ -4,8 +4,9 @@ use futures::stream::StreamExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use thiserror::Error;
 
-use crate::actor::{self, Actor, HandleExt};
+use crate::actor::{self, ActorError, HandleExt};
 use crate::engine;
+use crate::perform_send_with_error_handling;
 use cinemotion_core::protocol;
 
 static NEXT_ID: AtomicI32 = AtomicI32::new(0);
@@ -96,7 +97,7 @@ impl ClientHandle {
     /// and work with the engine runtime. This should be the first item after the client
     /// is created.
     pub async fn initialize(&self) -> Result<(), ClientError> {
-        self.perform_send(|| Message::init()).await
+        perform_send_with_error_handling!(self, Message::init())
     }
 
     /// Sends a message to the server.
@@ -104,11 +105,12 @@ impl ClientHandle {
     /// This function is responsible for transmitting messages to the client. If the message is successfully sent, it returns `Ok`, otherwise it returns an `Err`.
     ///
     pub async fn send(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
-        self.perform_send(|| Message::send(message)).await
+        perform_send_with_error_handling!(self, Message::send(message))
     }
 
+    /// Returns the current state of the client.
     pub async fn state(&self) -> Result<State, ClientError> {
-        self.perform_send(|| Message::state()).await
+        perform_send_with_error_handling!(self, Message::state())
     }
 }
 
@@ -123,16 +125,6 @@ impl actor::Handle for ClientHandle {
 impl actor::HandleExt for ClientHandle {}
 
 /// `Client` is a generic struct that represents a client in the system.
-/// It is parameterized over two types: `R` and `W`. a
-/// `R` is a type that implements `StreamExt` with `Item` being a `Result` of `tungstenite::Message`.
-/// `W` is a type that implements `SinkExt` with `Item` being a `tungstenite::Message`.
-/// The `Client` struct also contains an `engine::EngineHandle` and a `coordinator::ClientCoordinatorHandle`.
-///
-/// The `new` function is used to create a new instance of `Client`.
-///
-/// The `Client` struct also implements the `Actor` trait from the `actor` module.
-/// The `Message` associated type is set to `Message` and the `Handle` associated type is set to `ClientHandle`.
-/// The `handle_message` function is an asynchronous function that handles incoming messages.
 pub struct Client<R, W, T, S, FnSend, FnReceive>
 where
     R: StreamExt<Item = T> + Unpin,
@@ -156,6 +148,7 @@ where
     FnTo: FnMut(protocol::ServerMessage) -> S + Send + 'static,
     FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
+    /// Create a new client with the given reader and writer for communicating with the network layer.
     pub fn new(
         reader: R,
         writer: W,
@@ -174,10 +167,14 @@ where
         }
     }
 
+    /// Returns the unique identifier for the client.
     pub fn id(&self) -> i32 {
         self.id
     }
 
+    /// Initialize the client connection
+    ///
+    /// This should be called once the client's connection has been established.
     pub async fn initialize(&mut self) -> Result<(), ClientError> {
         match self
             .send_message(
@@ -197,6 +194,10 @@ where
         }
     }
 
+    /// Set the client into a disconnected state.
+    ///
+    /// No messages will be passed through, even if the client is still connected at the network
+    /// level.
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
         if let Err(err) = self.engine.remove_client(self.id).await {
             tracing::error!(?err, "failed to remove client from engine");
@@ -205,6 +206,9 @@ where
         Ok(())
     }
 
+    /// Send a message to the client.
+    ///
+    /// Note: The client needs to be initialized and not disconnected to send messages.
     pub async fn send_message(
         &mut self,
         message: protocol::ServerMessage,
@@ -219,6 +223,10 @@ where
         Ok(())
     }
 
+    /// Receive a message from the client.
+    ///
+    /// This function is responsible for receiving messages from the client and processing them.
+    /// The message is then passed to the engine for processing.
     pub async fn receive_message(&mut self, message: T) -> Result<(), ClientError> {
         let message = (self.receive_fn)(message)?;
         let Some(message) = message.body else {
@@ -253,15 +261,22 @@ where
     type Handle = ClientHandle;
     async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
         match message {
+            // Requesting to initialize the client
             Message::Init(response) => response.dispatch(self.initialize().await).await,
+            // Requesting to send a message to the client
             Message::Send { message, response } => {
                 response.dispatch(self.send_message(message).await).await;
             }
+            // Requesting the current state of the client
             Message::State(response) => response.dispatch(Ok(self.state.clone())).await,
         }
         None
     }
 
+    /// Handle a tick event.
+    ///
+    /// The tick event is responsible for reading the next message from the client.
+    /// The messages are passed onto the receive_message function for processing.
     async fn tick(&mut self) -> Option<actor::Signal> {
         let Some(msg) = self.reader.next().await else {
             return Some(actor::Signal::Stop);
