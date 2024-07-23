@@ -149,17 +149,11 @@ pub fn receive_message(
             Ok(message)
         }
         Err(err) => {
-            tracing::error!(?err, "failed to read message from websocket");
-            Err(ClientError::BadMessage(format!(
-                "failed to read message from websocket: {:?}",
-                err
-            )))
-            // if let Err(err) = client.disconnect().await {
-            //     tracing::error!(
-            //         ?err,
-            //         "while failing to read message from websocket, failed to disconnect client "
-            //     );
-            // }
+            tracing::error!(
+                ?err,
+                "failed to read message from websocket, closing connection."
+            );
+            Err(ClientError::Disconnected)
         }
     }
 }

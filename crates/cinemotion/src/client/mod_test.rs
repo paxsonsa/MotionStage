@@ -147,7 +147,9 @@ async fn test_client_initialization() {
 
     let init_ack = protocol::ClientMessage {
         body: Some(protocol::client_message::Body::InitializeAck(
-            protocol::InitializeAck {},
+            protocol::InitializeAck {
+                user_agent: "iOS Device".into(),
+            },
         )),
     };
     ws_sender.send(init_ack).await.unwrap();

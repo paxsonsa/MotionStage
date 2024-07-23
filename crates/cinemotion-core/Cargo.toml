@@ -11,3 +11,4 @@ derive_more.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 cinemotion-proto.workspace = true
+tracing.workspace = true

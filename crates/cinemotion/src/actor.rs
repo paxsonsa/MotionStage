@@ -210,11 +210,13 @@ pub trait HandleExt: Handle {
     ) -> Result<T, ActorError> {
         let (msg, response) = message_fn();
         match self.sender().send(msg) {
-            Ok(_) => Ok(response.await.expect("response should not fail")),
-            Err(err) => {
-                tracing::error!(?err, "failed to send message");
-                Err(ActorError::SendError)
-            }
+            Ok(_) => match response.await {
+                Ok(t) => Ok(t),
+                Err(err) => {
+                    return Err(ActorError::ResponseFailed);
+                }
+            },
+            Err(err) => Err(err),
         }
     }
 }
@@ -260,7 +262,7 @@ macro_rules! perform_send_with_error_handling {
         match $self.perform_send(|| $expr).await {
             Ok(s) => s,
             Err(err) => {
-                tracing::error!(?err, "failed to send init message to client");
+                tracing::debug!(?err, "failed to send message to client");
                 Err(ActorError::SendError.into())
             }
         }

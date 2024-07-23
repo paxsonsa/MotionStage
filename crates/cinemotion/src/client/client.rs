@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
 use crate::actor::{self, ActorError, HandleExt};
@@ -9,7 +9,7 @@ use crate::engine;
 use crate::perform_send_with_error_handling;
 use cinemotion_core::protocol;
 
-static NEXT_ID: AtomicI32 = AtomicI32::new(0);
+static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -56,6 +56,9 @@ pub enum ClientError {
     #[error("bad message: {0}")]
     BadMessage(String),
 
+    #[error("client is disconnected")]
+    Disconnected,
+
     #[error(transparent)]
     ActorError(#[from] actor::ActorError),
 }
@@ -79,7 +82,7 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    pub(super) id: i32,
+    pub(super) id: u32,
     pub(super) sender: actor::Sender<Message>,
 }
 
@@ -87,7 +90,7 @@ impl ClientHandle {
     /// Returns the unique identifier for the client.
     ///
     /// This function is used to get the unique identifier (ID) for the client.
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
@@ -132,7 +135,7 @@ where
     FnSend: FnMut(protocol::ServerMessage) -> S + Send + 'static,
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
-    id: i32,
+    id: u32,
     reader: R,
     writer: W,
     engine: engine::EngineHandle,
@@ -168,7 +171,7 @@ where
     }
 
     /// Returns the unique identifier for the client.
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
@@ -199,6 +202,7 @@ where
     /// No messages will be passed through, even if the client is still connected at the network
     /// level.
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
+        tracing::debug!("disconnecting client");
         if let Err(err) = self.engine.remove_client(self.id).await {
             tracing::error!(?err, "failed to remove client from engine");
         }
@@ -265,7 +269,9 @@ where
             Message::Init(response) => response.dispatch(self.initialize().await).await,
             // Requesting to send a message to the client
             Message::Send { message, response } => {
-                response.dispatch(self.send_message(message).await).await;
+                if let Status::Ready = self.state.status {
+                    response.dispatch(self.send_message(message).await).await;
+                }
             }
             // Requesting the current state of the client
             Message::State(response) => response.dispatch(Ok(self.state.clone())).await,
@@ -284,6 +290,12 @@ where
 
         if let Err(err) = self.receive_message(msg).await {
             tracing::error!(?err, "failed to receive message from client reader");
+            if let ClientError::Disconnected = err {
+                if let Err(err) = self.disconnect().await {
+                    tracing::error!(?err, "failed to disconnect client");
+                }
+                return Some(actor::Signal::Stop);
+            }
         }
         None
     }

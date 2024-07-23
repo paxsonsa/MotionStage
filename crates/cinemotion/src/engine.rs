@@ -25,11 +25,11 @@ pub enum Message {
         responder: actor::Responder<Result<(), EngineError>>,
     },
     RemoveClient {
-        id: i32,
+        id: u32,
         responder: actor::Responder<Result<(), EngineError>>,
     },
     Apply {
-        client_id: i32,
+        client_id: u32,
         message: core::protocol::client_message::Body,
         responder: actor::Responder<Result<(), EngineError>>,
     },
@@ -37,7 +37,7 @@ pub enum Message {
 
 impl Message {
     pub fn apply(
-        client_id: i32,
+        client_id: u32,
         message: core::protocol::client_message::Body,
     ) -> (Self, actor::Response<Result<(), EngineError>>) {
         let (responder, response) = actor::Response::new();
@@ -58,7 +58,7 @@ impl Message {
         (Self::AddClient { client, responder }, response)
     }
 
-    pub fn remove_client(id: i32) -> (Self, actor::Response<Result<(), EngineError>>) {
+    pub fn remove_client(id: u32) -> (Self, actor::Response<Result<(), EngineError>>) {
         let (responder, response) = actor::Response::new();
         (Self::RemoveClient { id, responder }, response)
     }
@@ -76,7 +76,7 @@ impl EngineHandle {
 
     pub async fn apply(
         &self,
-        client_id: i32,
+        client_id: u32,
         message: core::protocol::client_message::Body,
     ) -> Result<(), EngineError> {
         perform_send_with_error_handling!(self, Message::apply(client_id, message))
@@ -86,7 +86,7 @@ impl EngineHandle {
         perform_send_with_error_handling!(self, Message::add_client(client))
     }
 
-    pub async fn remove_client(&self, id: i32) -> Result<(), EngineError> {
+    pub async fn remove_client(&self, id: u32) -> Result<(), EngineError> {
         perform_send_with_error_handling!(self, Message::remove_client(id))
     }
 }
@@ -102,7 +102,7 @@ impl actor::Handle for EngineHandle {
 impl actor::HandleExt for EngineHandle {}
 
 pub struct EngineActor {
-    clients: std::collections::HashMap<i32, client::ClientHandle>,
+    clients: std::collections::HashMap<u32, client::ClientHandle>,
     inner: core::engine::Engine,
 }
 
@@ -141,6 +141,7 @@ impl actor::Actor for EngineActor {
                 }
             }
             Message::RemoveClient { id, responder } => {
+                tracing::debug!(id, "removing disconnected client");
                 // TODO: Remove client device from engine as well.
                 self.clients.remove(&id);
                 responder.dispatch(Ok(())).await;
@@ -153,7 +154,7 @@ impl actor::Actor for EngineActor {
         match self.inner.serialize().await {
             Ok(state) => {
                 if let Err(err) = broadcast(&self.clients, state).await {
-                    tracing::error!(?err, "failed to broadcast state to clients");
+                    // tracing::error!(?err, "failed to broadcast state to clients");
                 }
                 None
             }
@@ -174,7 +175,7 @@ pub fn spawn() -> EngineHandle {
 }
 
 async fn broadcast(
-    clients: &std::collections::HashMap<i32, client::ClientHandle>,
+    clients: &std::collections::HashMap<u32, client::ClientHandle>,
     state: core::state::StateTree,
 ) -> Result<(), EngineError> {
     for client in clients.values() {

@@ -1,5 +1,3 @@
-use crate::globals;
-
 use super::*;
 
 #[tokio::test]
@@ -84,7 +82,7 @@ async fn test_scene_command_remove_object() {
 async fn test_scene_system_attribute_links() {
     let mut world = world::new();
 
-    let mut device = Device::new("root");
+    let mut device = Device::new(0.into(), "root");
     device
         .attributes
         .insert(Attribute::new_matrix44("transform"));

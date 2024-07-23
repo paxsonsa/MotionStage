@@ -413,3 +413,14 @@ impl From<[f64; 16]> for Matrix44 {
         Self { data: value }
     }
 }
+
+// From Vec<f64> to Matrix44
+impl From<Vec<f64>> for Matrix44 {
+    fn from(value: Vec<f64>) -> Self {
+        let mut matrix = Matrix44::new();
+        for (i, v) in value.iter().enumerate() {
+            matrix.data[i] = *v;
+        }
+        matrix
+    }
+}

@@ -12,7 +12,10 @@ message ServerMessage {
 }
 
 message ClientMessage {
-  oneof body { InitializeAck initializeAck = 11; }
+  oneof body { 
+    InitializeAck initializeAck = 10;
+    DeviceSpec deviceSpec = 20;
+  }
 }
 
 message Error {}
@@ -22,10 +25,65 @@ message Ping {}
 message Pong {}
 
 message Initialize {
-  int32 version = 1;
-  int32 id = 2;
+  uint32 version = 1;
+  uint32 id = 2;
 }
 
-message InitializeAck {}
+message InitializeAck {
+  // The user agent string of the client
+  string user_agent = 1;
+}
 
 message State {}
+
+message DeviceSpec {
+  string name = 1;
+  map<string, AttributeValue> attributes = 2;
+}
+
+enum AttributeType { 
+    INVALID = 0;
+    FLOAT = 1;
+    VEC3 = 2;
+    VEC4 = 3;
+    MATRIX44 = 4;
+}
+
+
+// Data Types 
+message Attribute {
+  string name = 1;
+  AttributeType value_type = 2;
+  repeated double default = 3;
+  repeated double value = 4;
+}
+
+message AttributeValue {
+  oneof value {
+    double float = 1;
+    Vec3 vec3 = 2;
+    Vec4 vec4 = 3;
+    Matrix44 matrix44 = 4;
+  }
+}
+
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Vec4 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+// 4x4 matrix 
+message Matrix44 {
+  repeated double values = 1;
+}
+
+
+

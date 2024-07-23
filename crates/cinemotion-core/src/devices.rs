@@ -31,15 +31,40 @@ impl From<u32> for DeviceId {
     }
 }
 
+#[derive(Component, Debug, Clone)]
+pub struct RemoteId(u32);
+
+impl RemoteId {
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+impl Deref for RemoteId {
+    type Target = u32;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<u32> for RemoteId {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Component, Clone)]
 pub struct Device {
+    pub id: RemoteId,
     pub name: Name,
     pub attributes: AttributeMap,
 }
 
 impl Device {
-    pub fn new<N: Into<Name>>(name: N) -> Self {
+    pub fn new<N: Into<Name>>(id: RemoteId, name: N) -> Self {
         Self {
+            id,
             name: name.into(),
             attributes: AttributeMap::new(),
         }
@@ -47,8 +72,7 @@ impl Device {
 }
 
 pub enum Command {
-    Register(Device),
-    Update((DeviceId, Device)),
+    Set((DeviceId, Device)),
     Remove(DeviceId),
     Sample((DeviceId, Vec<AttributeSample>)),
     Reset(DeviceId),
@@ -62,21 +86,19 @@ pub mod commands {
 
     pub fn process(world: &mut World, command: Command) -> CommandResult {
         match command {
-            Command::Register(device) => {
+            Command::Set((id, device)) => {
                 let mut query = world.query::<(&Device, &Name)>();
                 for (_, name) in query.iter(&world).collect::<Vec<_>>() {
                     if name == &device.name {
-                        let reason = format!("device with name '{}' already exists.", device.name);
-                        return Err(CommandError::Failed { reason });
+                        return match system::set_device(world, id, device) {
+                            Some(id) => Ok(Some(CommandReply::EntityId(*id))),
+                            None => Err(CommandError::NotFound),
+                        };
                     }
                 }
                 let id = system::add_device(world, device);
                 Ok(Some(CommandReply::EntityId(*id)))
             }
-            Command::Update((id, device)) => match system::set_device(world, id, device) {
-                Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-                None => Err(CommandError::NotFound),
-            },
 
             Command::Remove(device_id) => match system::remove_device_by_id(world, device_id) {
                 Some(id) => Ok(Some(CommandReply::EntityId(*id))),
@@ -183,6 +205,16 @@ pub mod system {
         }
     }
 
+    pub(crate) fn get_by_remote_id<'a>(world: &'a mut World, id: u32) -> Option<DeviceEntityRef> {
+        let mut query = world.query::<(&DeviceEntity, &RemoteId, Entity)>();
+        for (_, remote_id, entity) in query.iter(&world).collect::<Vec<_>>() {
+            if remote_id.0 == id {
+                return Some(DeviceEntityRef { entity });
+            }
+        }
+        None
+    }
+
     pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
         let entity = Entity::from_raw(**id);
         let Some(entity_ref) = world.get_entity_mut(entity) else {
@@ -204,7 +236,7 @@ pub mod system {
     }
 
     pub(crate) fn add_device(world: &mut World, device: Device) -> DeviceId {
-        let entity = world.spawn((DeviceEntity, device.name, device.attributes));
+        let entity = world.spawn((DeviceEntity, device.id, device.name, device.attributes));
         entity.id().index().into()
     }
 

@@ -48,6 +48,11 @@ the protobuf bytes message. The server will not send ACKs only errors and state 
 
 There are a number of commands and events that are apart of the protocol for interacting with the server. This is an overview of them.
 
+TODO: Build out debugger
+  - Add ability to read into JSON Array for Message sending.
+  - Add ability to add object
+  - Add ability to send a sample
+  - Add Update Commands
 TODO: Swift Protobuf build out: Start a CLI Project and start building out Swift Code with Protobufs.
 TODO: Service Discovery
 TODO: Prototype Blender Integration

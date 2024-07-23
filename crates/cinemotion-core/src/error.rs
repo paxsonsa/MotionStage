@@ -7,6 +7,9 @@ pub enum Error {
 
     #[error("entity not found: {0}")]
     NotFound(String),
+
+    #[error("command failed.")]
+    CommandFailed,
 }
 
 pub type Result<T> = std::result::Result<T, self::Error>;
