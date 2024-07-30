@@ -43,19 +43,11 @@ impl Engine {
     ) -> Result<()> {
         match message {
             protocol::client_message::Body::InitializeAck(model) => {
-                let name = Name::from(model.user_agent);
-                let device = Device::new(client.into(), name);
-                devices::system::add_device(&mut self.world, device);
-                Ok(())
-            }
-            protocol::client_message::Body::DeviceSpec(spec) => {
-                let Some(mut device) = devices::system::get_by_remote_id(&mut self.world, client)
-                else {
-                    tracing::error!("device spec received for unknown device: {}", client);
-                    return Err(Error::NotFound(
-                        "device not found for client id".to_string(),
-                    ));
+                let Some(spec) = model.device_spec else {
+                    return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
+
+                let mut device = Device::new(client.into(), spec.name);
                 let mut attributes = HashMap::<Name, Attribute>::new();
                 for (name, value) in spec.attributes {
                     let Some(value) = value.value else {
@@ -86,9 +78,14 @@ impl Engine {
                     let name: Name = name.into();
                     attributes.insert(name.clone(), Attribute::new(name, value));
                 }
-                device.set_name(&mut self.world, spec.name.into());
-                device.set_attributes(&mut self.world, attributes.into());
+                device.attributes = attributes.into();
+                devices::system::add_device(&mut self.world, device);
                 Ok(())
+            }
+            protocol::client_message::Body::SceneCreateObject(_)
+            | protocol::client_message::Body::SceneUpdateObject(_)
+            | protocol::client_message::Body::SceneDeleteObject(_) => {
+                scene::commands::procces(&mut self.world, message).map(|_| ())
             }
         }
     }

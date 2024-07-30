@@ -119,15 +119,15 @@ async fn test_client_initialization() {
     // Crate a pair of channels for sending/receiving messages from the websocket.
     let (mut ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel();
     let engine_ = engine::EngineHandle::new(tx.into());
 
     let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
     let send_fn = move |msg| msg;
 
-    let mut client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
+    let client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
     let id = client.id();
-    let (mut test_actor, mut handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
+    let (mut test_actor, handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
 
     test_actor
         .wait_for(handle.initialize(), None)
@@ -148,7 +148,10 @@ async fn test_client_initialization() {
     let init_ack = protocol::ClientMessage {
         body: Some(protocol::client_message::Body::InitializeAck(
             protocol::InitializeAck {
-                user_agent: "iOS Device".into(),
+                device_spec: Some(protocol::DeviceSpec {
+                    name: "deviceA".to_string(),
+                    attributes: Default::default(),
+                }),
             },
         )),
     };

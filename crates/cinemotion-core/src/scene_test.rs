@@ -1,3 +1,5 @@
+use system::try_remove_scene_object_by_id;
+
 use super::*;
 
 #[tokio::test]
@@ -13,17 +15,13 @@ async fn test_scene_system_init() {
 }
 
 #[tokio::test]
-async fn test_scene_command_add_object() {
+async fn test_scene_add_object() {
     let mut world = world::new();
 
     let mut object = SceneObject::new("camera1");
     object.insert_attribute(Attribute::new_matrix44("transform"));
 
-    let command = Command::AddObject(object);
-    let _reply = commands::procces(&mut world, command)
-        .unwrap()
-        .expect("expected a object id for the engine");
-
+    system::try_add_scene_object(&mut world, object).expect("expect no error");
     let objects = system::get_all(&mut world);
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].name(&world), name!("camera1"));
@@ -35,19 +33,14 @@ async fn test_scene_command_add_object() {
 }
 
 #[tokio::test]
-async fn test_scene_command_update_object() {
+async fn test_scene_update_object() {
     let mut world = world::new();
 
     let mut object = SceneObject::new("camera1");
     object.insert_attribute(Attribute::new_matrix44("transform"));
     let id = system::add_scene_object(&mut world, object.clone());
-
     object.insert_attribute(Attribute::new_vec3("vel"));
-
-    let command = Command::UpdateObject(id, object);
-    let _reply = commands::procces(&mut world, command)
-        .unwrap()
-        .expect("expected a object id for the engine");
+    system::try_set_scene_object(&mut world, id, object).expect("no error");
 
     let objects = system::get_all(&mut world);
     assert_eq!(objects[0].name(&world), name!("camera1"));
@@ -69,10 +62,7 @@ async fn test_scene_command_remove_object() {
 
     object.insert_attribute(Attribute::new_vec3("vel"));
 
-    let command = Command::RemoveObject(id);
-    let _reply = commands::procces(&mut world, command)
-        .unwrap()
-        .expect("expected a object id for the engine");
+    try_remove_scene_object_by_id(&mut world, id).expect("expected a object id for the engine");
 
     let objects = system::get_all(&mut world);
     assert_eq!(objects.len(), 0);

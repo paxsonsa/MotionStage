@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::protocol;
 use std::{collections::HashMap, ops::Deref};
 
 #[cfg(test)]
@@ -63,12 +64,6 @@ impl SceneObject {
     pub fn insert_attribute(&mut self, attribute: Attribute) {
         self.attributes.insert(attribute.name().clone(), attribute);
     }
-}
-
-pub enum Command {
-    AddObject(SceneObject),
-    UpdateObject(ObjectId, SceneObject),
-    RemoveObject(ObjectId),
 }
 
 pub mod system {
@@ -193,11 +188,35 @@ pub mod system {
             .collect::<Vec<_>>()
     }
 
+    pub(super) fn try_add_scene_object(world: &mut World, object: SceneObject) -> Result<ObjectId> {
+        let mut query = world.query::<(&SceneObjectEntity, &Name)>();
+        for (_, name) in query.iter(&world).collect::<Vec<_>>() {
+            if name == &object.name {
+                let reason = format!("object with name '{}' already exists.", object.name);
+                return Err(Error::CommandFailed { reason });
+            }
+        }
+        Ok(add_scene_object(world, object).into())
+    }
+
     pub(super) fn add_scene_object(world: &mut World, object: SceneObject) -> ObjectId {
         let attributes = AttributeMap::from(object.attributes);
         let links = AttributeLinkMap::from(object.links);
         let entity = world.spawn((SceneObjectEntity, object.name, attributes, links));
         entity.id().index().into()
+    }
+
+    pub(super) fn try_set_scene_object(
+        world: &mut World,
+        id: ObjectId,
+        object: SceneObject,
+    ) -> Result<ObjectId> {
+        if let Some(id) = set_scene_object(world, id.clone(), object) {
+            Ok(id)
+        } else {
+            let reason = format!("object with id '{:?}' does not exist.", id);
+            Err(Error::CommandFailed { reason })
+        }
     }
 
     pub(super) fn set_scene_object(
@@ -214,6 +233,17 @@ pub mod system {
         object_ref.set_links(world, object.links.into());
 
         Some(object_ref.id())
+    }
+    pub(super) fn try_remove_scene_object_by_id(
+        world: &mut World,
+        id: ObjectId,
+    ) -> Result<ObjectId> {
+        if let Some(id) = remove_scene_object_by_id(world, id.clone()) {
+            Ok(id)
+        } else {
+            let reason = format!("object with id '{:?}' does not exist.", id);
+            Err(Error::CommandFailed { reason })
+        }
     }
 
     pub(super) fn remove_scene_object_by_id(
@@ -255,35 +285,47 @@ pub mod system {
 }
 
 pub mod commands {
-
-    use super::{system, Command};
-    use crate::commands::{CommandError, CommandReply, CommandResult};
-    use crate::prelude::Name;
+    use super::system;
+    use crate::protocol;
     use crate::world::World;
 
-    pub fn procces(world: &mut World, command: Command) -> CommandResult {
-        match command {
-            Command::AddObject(object) => {
-                let mut query = world.query::<(&system::SceneObjectEntity, &Name)>();
-                for (_, name) in query.iter(&world).collect::<Vec<_>>() {
-                    if name == &object.name {
-                        let reason = format!("object with name '{}' already exists.", object.name);
-                        return Err(CommandError::Failed { reason });
-                    }
-                }
-                let id = system::add_scene_object(world, object);
-                Ok(Some(CommandReply::EntityId(*id)))
+    pub fn procces(
+        world: &mut World,
+        message: protocol::client_message::Body,
+    ) -> Result<bool, crate::error::Error> {
+        match message {
+            protocol::client_message::Body::SceneCreateObject(model) => {
+                let Some(spec) = model.spec else {
+                    return Err(crate::error::Error::InvalidValue(
+                        "device spec is missing".to_string(),
+                    ));
+                };
+
+                let object = super::SceneObject::new(spec.name);
+                // TODO: extract attributes and links
+                system::try_add_scene_object(world, object)?;
+                Ok(true)
             }
-            Command::UpdateObject(id, object) => {
-                match system::set_scene_object(world, id, object) {
-                    Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-                    None => Err(CommandError::NotFound),
-                }
+            // Update an existing object in the world
+            protocol::client_message::Body::SceneUpdateObject(model) => {
+                let id = model.id;
+                let Some(spec) = model.spec else {
+                    return Err(crate::error::Error::InvalidValue(
+                        "device spec is missing".to_string(),
+                    ));
+                };
+
+                let object = super::SceneObject::new(spec.name);
+                // TODO: extract attributes and links
+                system::try_set_scene_object(world, id.into(), object)?;
+                Ok(true)
             }
-            Command::RemoveObject(id) => match system::remove_scene_object_by_id(world, id) {
-                Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-                None => Err(CommandError::NotFound),
-            },
+            protocol::client_message::Body::SceneDeleteObject(model) => {
+                let id = model.id;
+                system::try_remove_scene_object_by_id(world, id.into())?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 }

@@ -237,7 +237,7 @@ where
             return Err(ClientError::BadMessage(format!("missing message body")));
         };
         match message {
-            protocol::client_message::Body::InitializeAck(_) => {
+            protocol::client_message::Body::InitializeAck(ack) => {
                 self.state.status = Status::Ready;
             }
             m => {

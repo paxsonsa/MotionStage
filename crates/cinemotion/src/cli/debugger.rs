@@ -1,12 +1,18 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Result};
 use clap::Args;
 use futures_util::{future, pin_mut, StreamExt};
-
+use tokio::io::AsyncBufReadExt;
+use tokio::io::Lines;
 /// Start the cinemotion broker services.
 #[derive(Args)]
 pub struct DebuggerCmd {
     #[clap(long = "address")]
     server_address: Option<String>,
+
+    #[clap(long = "file")]
+    file_path: Option<PathBuf>,
 }
 
 impl DebuggerCmd {
@@ -22,6 +28,13 @@ impl DebuggerCmd {
         };
 
         let (writer, reader) = ws.split();
+
+        let mut stdin_reader = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let stdin_task = async {
+            while let Ok(Some(line)) = stdin_reader.next_line().await {
+                tracing::info!("{:?}", line);
+            }
+        };
 
         let receiver_task = {
             reader.for_each(|msg| async {
@@ -47,8 +60,13 @@ impl DebuggerCmd {
 
         let kill_switch = { tokio::signal::ctrl_c() };
 
-        pin_mut!(receiver_task, kill_switch);
-        future::select(receiver_task, kill_switch).await;
+        pin_mut!(receiver_task, stdin_task, kill_switch);
+        tokio::select! {
+            _ = receiver_task => {}
+            _ = stdin_task => {}
+            _ = kill_switch => {}
+        }
+
         Ok(0)
     }
 }

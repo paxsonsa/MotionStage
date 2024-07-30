@@ -46,6 +46,16 @@ the protobuf bytes message. The server will not send ACKs only errors and state 
 
 ## Commands and Events
 
+## Initial Client Setup
+- Connect to Server
+- Server will send initial message with given client ID
+- Client needs to acknowledge the initial message with device registration.
+- Once registered the client will receive state updates
+
+## Setup a Objects
+- New Session, engine builds default root object (cannot not be removed)
+- Devices can generate new objects.
+
 There are a number of commands and events that are apart of the protocol for interacting with the server. This is an overview of them.
 
 TODO: Build out debugger

@@ -8,8 +8,8 @@ pub enum Error {
     #[error("entity not found: {0}")]
     NotFound(String),
 
-    #[error("command failed.")]
-    CommandFailed,
+    #[error("command failed with reason: {reason}")]
+    CommandFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, self::Error>;
