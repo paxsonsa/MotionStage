@@ -54,7 +54,11 @@ message DeviceSpec {
   map<string, AttributeValue> attributes = 2;
 }
 
-message SceneObjectSpec { string name = 1; }
+message SceneObjectSpec {
+  string name = 1;
+  repeated Attribute attributes = 2;
+  repeated AttributeLink links = 3;
+}
 
 enum AttributeType {
   INVALID = 0;
@@ -67,9 +71,14 @@ enum AttributeType {
 // Data Types
 message Attribute {
   string name = 1;
-  AttributeType value_type = 2;
-  repeated double default = 3;
-  repeated double value = 4;
+  AttributeValue value = 2;
+  AttributeValue default_value = 3;
+}
+
+message AttributeLink {
+  uint32 device_id = 1;
+  string device_attr = 2;
+  string attribute = 3;
 }
 
 message AttributeValue {
