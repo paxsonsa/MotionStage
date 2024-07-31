@@ -72,7 +72,7 @@ async fn test_scene_command_remove_object() {
 async fn test_scene_system_attribute_links() {
     let mut world = world::new();
 
-    let mut device = Device::new(0.into(), "root");
+    let mut device = Device::new(0, "root");
     device
         .attributes
         .insert(Attribute::new_matrix44("transform"));
@@ -104,7 +104,8 @@ async fn test_scene_system_attribute_links() {
     let attribute = Attribute::new("transform", value);
     device.attributes.insert(attribute);
 
-    crate::devices::system::set_device(&mut world, device_id.clone(), device);
+    crate::devices::system::try_set_device(&mut world, device)
+        .expect("should set device without error");
 
     let object_ref = system::get_by_id(&mut world, &id).expect("object should exist");
     let device_ref = devices::system::get(&mut world, &device_id).expect("device should exist");

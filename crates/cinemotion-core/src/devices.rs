@@ -8,7 +8,7 @@ use crate::prelude::{Attribute, AttributeMap, AttributeSample, Error, Result};
 #[path = "device_test.rs"]
 mod device_test;
 
-#[derive(Debug, Clone)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct DeviceId(u32);
 
 impl DeviceId {
@@ -31,40 +31,17 @@ impl From<u32> for DeviceId {
     }
 }
 
-#[derive(Component, Debug, Clone)]
-pub struct RemoteId(u32);
-
-impl RemoteId {
-    pub fn as_u32(&self) -> u32 {
-        self.0
-    }
-}
-
-impl Deref for RemoteId {
-    type Target = u32;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<u32> for RemoteId {
-    fn from(value: u32) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Component, Clone)]
 pub struct Device {
-    pub id: RemoteId,
+    pub id: DeviceId,
     pub name: Name,
     pub attributes: AttributeMap,
 }
 
 impl Device {
-    pub fn new<N: Into<Name>>(id: RemoteId, name: N) -> Self {
+    pub fn new<N: Into<Name>, I: Into<DeviceId>>(id: I, name: N) -> Self {
         Self {
-            id,
+            id: id.into(),
             name: name.into(),
             attributes: AttributeMap::new(),
         }
@@ -79,47 +56,95 @@ pub enum Command {
 }
 
 pub mod commands {
-    use super::{system, Command, Device};
-    use crate::commands::{CommandError, CommandReply, CommandResult};
-    use crate::prelude::Name;
-    use crate::world::World;
+    use super::{system, Device};
+    use crate::error::{Error, Result};
+    use crate::prelude::*;
+    use crate::{commands::CommandResult, protocol, world::World};
+    use std::collections::HashMap;
 
-    pub fn process(world: &mut World, command: Command) -> CommandResult {
-        match command {
-            Command::Set((id, device)) => {
-                let mut query = world.query::<(&Device, &Name)>();
-                for (_, name) in query.iter(&world).collect::<Vec<_>>() {
-                    if name == &device.name {
-                        return match system::set_device(world, id, device) {
-                            Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-                            None => Err(CommandError::NotFound),
-                        };
-                    }
+    pub fn process(
+        client: u32,
+        world: &mut World,
+        message: protocol::client_message::Body,
+    ) -> Result<bool> {
+        match message {
+            protocol::client_message::Body::InitializeAck(model) => {
+                let Some(spec) = model.device_spec else {
+                    return Err(Error::InvalidValue("device spec is missing".to_string()));
+                };
+
+                let mut device = Device::new(client, spec.name);
+                let mut attributes = HashMap::<Name, Attribute>::new();
+                for (name, value) in spec.attributes {
+                    let Some(value) = value.value else {
+                        return Err(Error::InvalidValue(format!(
+                            "device spec attribute '{}' is missing a value",
+                            name
+                        )));
+                    };
+                    let value = match value {
+                        protocol::attribute_value::Value::Float(v) => AttributeValue::Float(v),
+                        protocol::attribute_value::Value::Vec3(v) => {
+                            AttributeValue::Vec3((v.x, v.y, v.z).into())
+                        }
+                        protocol::attribute_value::Value::Vec4(v) => {
+                            AttributeValue::Vec4((v.x, v.y, v.z, v.w).into())
+                        }
+                        protocol::attribute_value::Value::Matrix44(v) => {
+                            if v.values.len() != 16 {
+                                return Err(Error::InvalidValue(format!(
+                                    "device spec attribute '{}' matrix44 value has invalid length",
+                                    name
+                                )));
+                            }
+                            AttributeValue::Matrix44(v.values.into())
+                        }
+                    };
+
+                    let name: Name = name.into();
+                    attributes.insert(name.clone(), Attribute::new(name, value));
                 }
-                let id = system::add_device(world, device);
-                Ok(Some(CommandReply::EntityId(*id)))
+                device.attributes = attributes.into();
+                system::add_device(world, device);
+                Ok(true)
             }
-
-            Command::Remove(device_id) => match system::remove_device_by_id(world, device_id) {
-                Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-                None => Err(CommandError::NotFound),
-            },
-
-            Command::Sample((id, samples)) => match system::apply_samples(world, id, samples) {
-                Ok(_) => Ok(None),
-                Err(err) => Err(CommandError::Failed {
-                    reason: err.to_string(),
-                }),
-            },
-
-            Command::Reset(id) => match system::get(world, &id) {
-                Some(mut device) => {
-                    device.reset(world);
-                    Ok(None)
-                }
-                None => Err(CommandError::NotFound),
-            },
+            _ => Ok(false),
         }
+        // match command {
+        //     Command::Set((id, device)) => {
+        //         let mut query = world.query::<(&Device, &Name)>();
+        //         for (_, name) in query.iter(&world).collect::<Vec<_>>() {
+        //             if name == &device.name {
+        //                 return match system::set_device(world, id, device) {
+        //                     Some(id) => Ok(Some(CommandReply::EntityId(*id))),
+        //                     None => Err(CommandError::NotFound),
+        //                 };
+        //             }
+        //         }
+        //         let id = system::add_device(world, device);
+        //         Ok(Some(CommandReply::EntityId(*id)))
+        //     }
+        //
+        //     Command::Remove(device_id) => match system::remove_device_by_id(world, device_id) {
+        //         Some(id) => Ok(Some(CommandReply::EntityId(*id))),
+        //         None => Err(CommandError::NotFound),
+        //     },
+        //
+        //     Command::Sample((id, samples)) => match system::apply_samples(world, id, samples) {
+        //         Ok(_) => Ok(None),
+        //         Err(err) => Err(CommandError::Failed {
+        //             reason: err.to_string(),
+        //         }),
+        //     },
+        //
+        //     Command::Reset(id) => match system::get(world, &id) {
+        //         Some(mut device) => {
+        //             device.reset(world);
+        //             Ok(None)
+        //         }
+        //         None => Err(CommandError::NotFound),
+        //     },
+        // }
     }
 }
 
@@ -205,16 +230,6 @@ pub mod system {
         }
     }
 
-    pub(crate) fn get_by_remote_id<'a>(world: &'a mut World, id: u32) -> Option<DeviceEntityRef> {
-        let mut query = world.query::<(&DeviceEntity, &RemoteId, Entity)>();
-        for (_, remote_id, entity) in query.iter(&world).collect::<Vec<_>>() {
-            if remote_id.0 == id {
-                return Some(DeviceEntityRef { entity });
-            }
-        }
-        None
-    }
-
     pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
         let entity = Entity::from_raw(**id);
         let Some(entity_ref) = world.get_entity_mut(entity) else {
@@ -235,29 +250,46 @@ pub mod system {
             .collect::<Vec<_>>()
     }
 
+    pub(crate) fn try_add_device(world: &mut World, device: Device) -> Result<DeviceId> {
+        if globals::system::is_motion_enabled(world) {
+            return Err(Error::InvalidState(
+                "cannot add device while in motion".into(),
+            ));
+        }
+
+        if let Some(_) = get(world, &device.id) {
+            return Err(Error::NotFound(
+                "no device with matching id found for update".into(),
+            ));
+        };
+
+        Ok(add_device(world, device))
+    }
+
     pub(crate) fn add_device(world: &mut World, device: Device) -> DeviceId {
         let entity = world.spawn((DeviceEntity, device.id, device.name, device.attributes));
         entity.id().index().into()
     }
 
-    pub(crate) fn set_device(
-        world: &mut World,
-        device_id: DeviceId,
-        device: Device,
-    ) -> Option<DeviceId> {
+    pub(crate) fn try_set_device(world: &mut World, device: Device) -> Result<DeviceId> {
         // We cannot update device instances while in motion
         if globals::system::is_motion_enabled(world) {
-            return None;
+            return Err(Error::InvalidState(
+                "cannot set device while in motion".into(),
+            ));
         }
 
+        let device_id = device.id;
         let Some(mut device_ref) = get(world, &device_id) else {
-            return None;
+            return Err(Error::NotFound(
+                "no device with matching id found for update".into(),
+            ));
         };
 
         device_ref.set_name(world, device.name);
         device_ref.set_attributes(world, device.attributes);
 
-        Some(device_id)
+        Ok(device_id)
     }
 
     pub(crate) fn remove_device_by_id(world: &mut World, device_id: DeviceId) -> Option<DeviceId> {

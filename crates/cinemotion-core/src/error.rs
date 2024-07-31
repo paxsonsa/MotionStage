@@ -5,6 +5,9 @@ pub enum Error {
     #[error("invalid property value: {0}")]
     InvalidValue(String),
 
+    #[error("invalid state while performing operation: {0}")]
+    InvalidState(String),
+
     #[error("entity not found: {0}")]
     NotFound(String),
 
