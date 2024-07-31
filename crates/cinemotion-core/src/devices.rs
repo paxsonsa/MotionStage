@@ -59,7 +59,7 @@ pub mod commands {
     use super::{system, Device};
     use crate::error::{Error, Result};
     use crate::prelude::*;
-    use crate::{commands::CommandResult, protocol, world::World};
+    use crate::{protocol, world::World};
     use std::collections::HashMap;
 
     pub fn process(

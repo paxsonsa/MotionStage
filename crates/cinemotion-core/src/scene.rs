@@ -286,19 +286,15 @@ pub mod system {
 
 pub mod commands {
     use super::system;
+    use crate::error::{Error, Result};
     use crate::protocol;
     use crate::world::World;
 
-    pub fn procces(
-        world: &mut World,
-        message: protocol::client_message::Body,
-    ) -> Result<bool, crate::error::Error> {
+    pub fn procces(world: &mut World, message: protocol::client_message::Body) -> Result<bool> {
         match message {
             protocol::client_message::Body::SceneCreateObject(model) => {
                 let Some(spec) = model.spec else {
-                    return Err(crate::error::Error::InvalidValue(
-                        "device spec is missing".to_string(),
-                    ));
+                    return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
                 let object = super::SceneObject::new(spec.name);
@@ -310,9 +306,7 @@ pub mod commands {
             protocol::client_message::Body::SceneUpdateObject(model) => {
                 let id = model.id;
                 let Some(spec) = model.spec else {
-                    return Err(crate::error::Error::InvalidValue(
-                        "device spec is missing".to_string(),
-                    ));
+                    return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
                 let object = super::SceneObject::new(spec.name);
