@@ -73,7 +73,7 @@ async fn test_device_system_motion_samples() {
     );
 
     // Enable Motion and Try again
-    globals::system::enable_motion(&mut world);
+    globals::system::set_motion_mode(&mut world, true);
 
     system::try_apply_samples(&mut world, id.clone(), vec![sample.clone()])
         .expect("should not failed");

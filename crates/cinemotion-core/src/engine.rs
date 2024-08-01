@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::devices;
 use crate::error::*;
+use crate::globals;
 use crate::prelude::*;
 use crate::protocol;
 use crate::protocol::client_message::Body as ClientBody;
@@ -43,6 +44,10 @@ impl Engine {
         message: protocol::client_message::Body,
     ) -> Result<()> {
         match message {
+            ClientBody::MotionSetMode(model) => {
+                globals::system::set_motion_mode(&mut self.world, model.enabled);
+                Ok(())
+            }
             ClientBody::DeviceInitAck(_) | ClientBody::DeviceSample(_) => {
                 devices::commands::process(client, &mut self.world, message).map(|_| ())
             }

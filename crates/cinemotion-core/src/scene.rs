@@ -290,6 +290,13 @@ pub mod commands {
     use crate::world::World;
 
     pub fn procces(world: &mut World, message: protocol::client_message::Body) -> Result<bool> {
+        // No matter what, we cannot update the scene while we are in motion or recording.
+        if crate::globals::system::is_motion_enabled(world) {
+            return Err(Error::InvalidState(
+                "cannot update the scene state while in motion".to_string(),
+            ));
+        }
+
         match message {
             protocol::client_message::Body::SceneCreateObject(model) => {
                 let Some(spec) = model.spec else {

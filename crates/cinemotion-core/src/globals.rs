@@ -35,10 +35,13 @@ pub mod system {
 
     use crate::world::World;
 
-    pub fn enable_motion(world: &mut World) {
+    pub fn set_motion_mode(world: &mut World, enabled: bool) {
         let mut settings = get_settings_mut(world);
-        settings.motion.on();
-        println!("setting update: {:?}", settings);
+        if enabled {
+            settings.motion.on();
+        } else {
+            settings.motion.off();
+        }
     }
 
     pub fn is_motion_enabled(world: &World) -> bool {

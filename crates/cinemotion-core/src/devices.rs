@@ -82,7 +82,6 @@ pub mod commands {
             protocol::client_message::Body::DeviceSample(model) => {
                 let mut samples = vec![];
                 for (name, value) in model.attributes.into_iter() {
-                    // FIXME: gather list of failed samples for error.
                     samples.push(attributes::AttributeSample::new(name, value.try_into()?));
                 }
                 system::try_apply_samples(world, client, samples)?;
