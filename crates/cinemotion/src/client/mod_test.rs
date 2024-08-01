@@ -142,12 +142,12 @@ async fn test_client_initialization() {
 
     assert!(matches!(
         message.body.unwrap(),
-        protocol::server_message::Body::Initialize(protocol::Initialize { .. })
+        protocol::server_message::Body::DeviceInit(protocol::DeviceInit { .. })
     ));
 
     let init_ack = protocol::ClientMessage {
-        body: Some(protocol::client_message::Body::InitializeAck(
-            protocol::InitializeAck {
+        body: Some(protocol::client_message::Body::DeviceInitAck(
+            protocol::DeviceInitAck {
                 device_spec: Some(protocol::DeviceSpec {
                     name: "deviceA".to_string(),
                     attributes: Default::default(),

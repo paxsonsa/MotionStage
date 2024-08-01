@@ -181,7 +181,7 @@ where
     pub async fn initialize(&mut self) -> Result<(), ClientError> {
         match self
             .send_message(
-                protocol::Initialize {
+                protocol::DeviceInit {
                     version: 1,
                     id: self.id,
                 }
@@ -237,7 +237,7 @@ where
             return Err(ClientError::BadMessage(format!("missing message body")));
         };
         match message {
-            protocol::client_message::Body::InitializeAck(ack) => {
+            protocol::client_message::Body::DeviceInitAck(ack) => {
                 self.state.status = Status::Ready;
             }
             m => {

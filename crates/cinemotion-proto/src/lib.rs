@@ -75,6 +75,5 @@ macro_rules! impl_into_server_message {
 impl_into_server_message!(Error);
 impl_into_server_message!(Ping);
 impl_into_server_message!(Pong);
-impl_into_server_message!(Initialize);
-
-impl_from_client_body!(InitializeAck);
+impl_into_server_message!(DeviceInit);
+impl_from_client_body!(DeviceInitAck);

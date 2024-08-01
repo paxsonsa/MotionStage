@@ -6,14 +6,15 @@ message ServerMessage {
     Error error = 1;
     Ping ping = 2;
     Pong pong = 3;
-    Initialize initialize = 10;
+    DeviceInit device_init = 10;
     State state = 20;
   }
 }
 
 message ClientMessage {
   oneof body {
-    InitializeAck initializeAck = 10;
+    DeviceInitAck device_init_ack = 10;
+    DeviceSample device_sample = 15;
     SceneCreateObject scene_create_object = 30;
     SceneUpdateObject scene_update_object = 31;
     SceneDeleteObject scene_delete_object = 32;
@@ -26,15 +27,17 @@ message Ping {}
 
 message Pong {}
 
-message Initialize {
+message DeviceInit {
   uint32 version = 1;
   uint32 id = 2;
 }
 
-message InitializeAck {
+message DeviceInitAck {
   // The user agent string of the client
   DeviceSpec deviceSpec = 2;
 }
+
+message DeviceSample { map<string, AttributeValue> attributes = 1; }
 
 message State {}
 

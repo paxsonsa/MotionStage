@@ -43,7 +43,7 @@ impl Engine {
         message: protocol::client_message::Body,
     ) -> Result<()> {
         match message {
-            ClientBody::InitializeAck(_) => {
+            ClientBody::DeviceInitAck(_) | ClientBody::DeviceSample(_) => {
                 devices::commands::process(client, &mut self.world, message).map(|_| ())
             }
             ClientBody::SceneCreateObject(_)

@@ -58,23 +58,34 @@ pub enum Command {
 
 pub mod commands {
     use super::{system, Device};
+    use crate::attributes;
     use crate::error::{Error, Result};
     use crate::{protocol, world::World};
 
-    pub fn process(
-        client: u32,
+    pub fn process<I: Into<super::DeviceId>>(
+        client: I,
         world: &mut World,
         message: protocol::client_message::Body,
     ) -> Result<bool> {
+        let client = client.into();
         match message {
-            protocol::client_message::Body::InitializeAck(model) => {
+            protocol::client_message::Body::DeviceInitAck(model) => {
                 let Some(spec) = model.device_spec else {
                     return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
                 let mut device: Device = spec.try_into()?;
-                device.id = client.into();
+                device.id = client;
                 system::add_device(world, device);
+                Ok(true)
+            }
+            protocol::client_message::Body::DeviceSample(model) => {
+                let mut samples = vec![];
+                for (name, value) in model.attributes.into_iter() {
+                    // FIXME: gather list of failed samples for error.
+                    samples.push(attributes::AttributeSample::new(name, value.try_into()?));
+                }
+                system::try_apply_samples(world, client, samples)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -234,7 +245,7 @@ pub mod system {
         }
     }
 
-    pub(crate) fn apply_samples(
+    pub(crate) fn try_apply_samples(
         world: &mut World,
         device_id: DeviceId,
         samples: Vec<AttributeSample>,
