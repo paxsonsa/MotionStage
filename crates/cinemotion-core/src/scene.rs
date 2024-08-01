@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use crate::protocol;
 use std::{collections::HashMap, ops::Deref};
 
 #[cfg(test)]
@@ -286,58 +285,10 @@ pub mod system {
 
 pub mod commands {
     use super::system;
-    use super::SceneObject;
     use crate::error::{Error, Result};
-    use crate::protocol::SceneObjectSpec;
+    use crate::protocol;
     use crate::world::World;
-    use crate::{attributes, protocol};
 
-    fn create_scene_object(spec: SceneObjectSpec) -> Result<SceneObject> {
-        let mut object = super::SceneObject::new(spec.name);
-
-        for attr in spec.attributes {
-            let name = attr.name;
-            let default_value = attr.default_value.ok_or_else(|| {
-                Error::InvalidValue(format!("default value for attribute '{}' is missing", name))
-            })?;
-            let value = match default_value.value.ok_or_else(|| {
-                Error::InvalidValue(format!("value for attribute '{}' is missing", name))
-            })? {
-                protocol::attribute_value::Value::Vec3(v) => {
-                    attributes::AttributeValue::from((v.x, v.y, v.z))
-                }
-                protocol::attribute_value::Value::Vec4(v) => {
-                    attributes::AttributeValue::from((v.x, v.y, v.z, v.w))
-                }
-                protocol::attribute_value::Value::Matrix44(v) => {
-                    if v.values.len() != 16 {
-                        return Err(Error::InvalidValue(format!(
-                            "attribute '{}' matrix44 value has invalid length",
-                            name
-                        )));
-                    }
-                    attributes::AttributeValue::Matrix44(v.values.into())
-                }
-                protocol::attribute_value::Value::Float(v) => attributes::AttributeValue::from(v),
-            };
-
-            let attribute = super::Attribute::new(name.clone(), value);
-            object.insert_attribute(attribute);
-        }
-
-        for link in spec.links {
-            let attribute = link.attribute;
-            let device = link.device_id;
-            let device_attr = link.device_attr;
-            let link = super::AttributeLink::new(device.into(), device_attr, attribute);
-            if let Err(err) = object.insert_link(link) {
-                tracing::warn!("failed to add link: {}", err);
-                continue;
-            }
-        }
-
-        Ok(object)
-    }
     pub fn procces(world: &mut World, message: protocol::client_message::Body) -> Result<bool> {
         match message {
             protocol::client_message::Body::SceneCreateObject(model) => {
@@ -345,7 +296,7 @@ pub mod commands {
                     return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
-                let object = create_scene_object(spec)?;
+                let object = spec.try_into()?;
                 system::try_add_scene_object(world, object)?;
                 Ok(true)
             }
@@ -356,7 +307,7 @@ pub mod commands {
                     return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
-                let object = create_scene_object(spec)?;
+                let object = spec.try_into()?;
                 system::try_set_scene_object(world, id.into(), object)?;
                 Ok(true)
             }

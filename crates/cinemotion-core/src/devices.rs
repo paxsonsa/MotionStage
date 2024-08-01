@@ -4,6 +4,7 @@ use bevy_ecs::prelude::Component;
 
 use crate::name::*;
 use crate::prelude::{Attribute, AttributeMap, AttributeSample, Error, Result};
+
 #[cfg(test)]
 #[path = "device_test.rs"]
 mod device_test;
@@ -58,9 +59,7 @@ pub enum Command {
 pub mod commands {
     use super::{system, Device};
     use crate::error::{Error, Result};
-    use crate::prelude::*;
     use crate::{protocol, world::World};
-    use std::collections::HashMap;
 
     pub fn process(
         client: u32,
@@ -73,78 +72,13 @@ pub mod commands {
                     return Err(Error::InvalidValue("device spec is missing".to_string()));
                 };
 
-                let mut device = Device::new(client, spec.name);
-                let mut attributes = HashMap::<Name, Attribute>::new();
-                for (name, value) in spec.attributes {
-                    let Some(value) = value.value else {
-                        return Err(Error::InvalidValue(format!(
-                            "device spec attribute '{}' is missing a value",
-                            name
-                        )));
-                    };
-                    let value = match value {
-                        protocol::attribute_value::Value::Float(v) => AttributeValue::Float(v),
-                        protocol::attribute_value::Value::Vec3(v) => {
-                            AttributeValue::Vec3((v.x, v.y, v.z).into())
-                        }
-                        protocol::attribute_value::Value::Vec4(v) => {
-                            AttributeValue::Vec4((v.x, v.y, v.z, v.w).into())
-                        }
-                        protocol::attribute_value::Value::Matrix44(v) => {
-                            if v.values.len() != 16 {
-                                return Err(Error::InvalidValue(format!(
-                                    "device spec attribute '{}' matrix44 value has invalid length",
-                                    name
-                                )));
-                            }
-                            AttributeValue::Matrix44(v.values.into())
-                        }
-                    };
-
-                    let name: Name = name.into();
-                    attributes.insert(name.clone(), Attribute::new(name, value));
-                }
-                device.attributes = attributes.into();
+                let mut device: Device = spec.try_into()?;
+                device.id = client.into();
                 system::add_device(world, device);
                 Ok(true)
             }
             _ => Ok(false),
         }
-        // match command {
-        //     Command::Set((id, device)) => {
-        //         let mut query = world.query::<(&Device, &Name)>();
-        //         for (_, name) in query.iter(&world).collect::<Vec<_>>() {
-        //             if name == &device.name {
-        //                 return match system::set_device(world, id, device) {
-        //                     Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-        //                     None => Err(CommandError::NotFound),
-        //                 };
-        //             }
-        //         }
-        //         let id = system::add_device(world, device);
-        //         Ok(Some(CommandReply::EntityId(*id)))
-        //     }
-        //
-        //     Command::Remove(device_id) => match system::remove_device_by_id(world, device_id) {
-        //         Some(id) => Ok(Some(CommandReply::EntityId(*id))),
-        //         None => Err(CommandError::NotFound),
-        //     },
-        //
-        //     Command::Sample((id, samples)) => match system::apply_samples(world, id, samples) {
-        //         Ok(_) => Ok(None),
-        //         Err(err) => Err(CommandError::Failed {
-        //             reason: err.to_string(),
-        //         }),
-        //     },
-        //
-        //     Command::Reset(id) => match system::get(world, &id) {
-        //         Some(mut device) => {
-        //             device.reset(world);
-        //             Ok(None)
-        //         }
-        //         None => Err(CommandError::NotFound),
-        //     },
-        // }
     }
 }
 

@@ -7,6 +7,7 @@ mod error;
 pub mod name;
 mod globals;
 pub mod prelude;
+mod protocol_ext;
 pub mod scene;
 pub mod state;
 pub mod world;
