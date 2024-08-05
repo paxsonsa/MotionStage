@@ -198,9 +198,6 @@ pub trait HandleExt: Handle {
     ///
     /// The value that the response future resolves to.
     ///
-    /// # Panics
-    ///
-    /// This function will panic if sending the message fails or if the response future is erroneous.
     async fn perform_send<
         T: Send + Sync,
         F: (FnOnce() -> (Self::Message, Response<T>)) + Send + Sync,
@@ -213,6 +210,7 @@ pub trait HandleExt: Handle {
             Ok(_) => match response.await {
                 Ok(t) => Ok(t),
                 Err(err) => {
+                    tracing::error!(?err, "Failed to await response from actor");
                     return Err(ActorError::ResponseFailed);
                 }
             },
@@ -262,7 +260,7 @@ macro_rules! perform_send_with_error_handling {
         match $self.perform_send(|| $expr).await {
             Ok(s) => s,
             Err(err) => {
-                tracing::debug!(?err, "failed to send message to client");
+                tracing::error!(?err, "failed to send message to actor");
                 Err(ActorError::SendError.into())
             }
         }

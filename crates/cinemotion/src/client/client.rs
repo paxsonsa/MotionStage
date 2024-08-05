@@ -103,11 +103,12 @@ impl ClientHandle {
         perform_send_with_error_handling!(self, Message::init())
     }
 
-    /// Sends a message to the server.
+    /// Sends a message to the client.
     ///
     /// This function is responsible for transmitting messages to the client. If the message is successfully sent, it returns `Ok`, otherwise it returns an `Err`.
     ///
     pub async fn send(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
+        tracing::debug!(?message, "sending message to client");
         perform_send_with_error_handling!(self, Message::send(message))
     }
 
@@ -268,11 +269,10 @@ where
             // Requesting to initialize the client
             Message::Init(response) => response.dispatch(self.initialize().await).await,
             // Requesting to send a message to the client
-            Message::Send { message, response } => {
-                if let Status::Ready = self.state.status {
-                    response.dispatch(self.send_message(message).await).await;
-                }
-            }
+            Message::Send { message, response } => match self.state.status {
+                Status::Ready => response.dispatch(self.send_message(message).await).await,
+                _ => response.dispatch(Ok(())).await,
+            },
             // Requesting the current state of the client
             Message::State(response) => response.dispatch(Ok(self.state.clone())).await,
         }
