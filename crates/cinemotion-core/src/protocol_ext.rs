@@ -1,8 +1,73 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::*;
 use cinemotion_proto as protocol;
 use name::Name;
+
+/// Implements the `From` trait for converting a `state::StateTree`
+/// into a `protocol::ServerMessage`.
+impl From<state::StateTree> for protocol::ServerMessage {
+    fn from(value: state::StateTree) -> Self {
+        protocol::ServerMessage {
+            body: Some(protocol::server_message::Body::State(value.into())),
+        }
+    }
+}
+
+/// Implements the `From` trait for converting a `state::StateTree`
+/// into a `protocol::State`.
+impl From<state::StateTree> for protocol::State {
+    fn from(value: state::StateTree) -> Self {
+        protocol::State {
+            utime: value.utime as u64,
+            session: Some(value.session.into()),
+            devices: value
+                .devices
+                .into_iter()
+                .map(|(id, device)| (id, device.into()))
+                .collect(),
+            scene: Some(value.scene.into()),
+        }
+    }
+}
+
+/// Implements the `Into` trait for converting a `state::SceneState`
+/// into a `protocol::SceneState`.
+impl Into<protocol::SceneState> for state::SceneState {
+    fn into(self) -> protocol::SceneState {
+        protocol::SceneState {
+            objects: self.objects.into_iter().map(|obj| obj.into()).collect(),
+        }
+    }
+}
+
+/// Implements the `Into` trait for converting a `scene::SceneObject`
+/// into a `protocol::SceneObjectState`.
+impl Into<protocol::SceneObjectState> for scene::SceneObject {
+    fn into(self) -> protocol::SceneObjectState {
+        protocol::SceneObjectState {
+            name: self.name.to_string(),
+            attributes: self
+                .attributes
+                .into_values()
+                .map(|attr| attr.into())
+                .collect(),
+            links: self.links.into_values().map(|link| link.into()).collect(),
+        }
+    }
+}
+
+/// Implements the `Into` trait for converting an `attributes::AttributeLink`
+/// into a `protocol::AttributeLink`.
+impl Into<protocol::AttributeLink> for attributes::AttributeLink {
+    fn into(self) -> protocol::AttributeLink {
+        protocol::AttributeLink {
+            attribute: self.attribute().to_string(),
+            device_id: self.device().as_u32(),
+            device_attr: self.device_attr().to_string(),
+        }
+    }
+}
 
 /// Implements the conversion from `protocol::AttributeValue` to `attributes::AttributeValue`.
 /// This conversion may fail, in which case an `error::Error` is returned.
@@ -134,6 +199,12 @@ impl TryFrom<Option<protocol::AttributeValue>> for attributes::AttributeValue {
     }
 }
 
+impl Into<protocol::AttributeValue> for attributes::AttributeValue {
+    fn into(self) -> protocol::AttributeValue {
+        todo!()
+    }
+}
+
 /// Implements the conversion from `protocol::Attribute` to `attributes::Attribute`.
 /// This conversion may fail, in which case an `error::Error` is returned.
 impl TryFrom<protocol::Attribute> for attributes::Attribute {
@@ -156,6 +227,16 @@ impl TryFrom<protocol::Attribute> for attributes::Attribute {
         let value = attr.default_value.try_into()?;
         // Return the constructed `attributes::Attribute` instance.
         Ok(attributes::Attribute::new(name, value))
+    }
+}
+
+impl Into<protocol::Attribute> for attributes::Attribute {
+    fn into(self) -> protocol::Attribute {
+        protocol::Attribute {
+            name: self.name().to_string(),
+            value: Some((*(self.value())).clone().into()),
+            default_value: Some((*(self.default_value())).clone().into()),
+        }
     }
 }
 
@@ -193,5 +274,21 @@ impl TryFrom<protocol::DeviceSpec> for devices::Device {
             name: spec.name.into(),
             attributes: attributes.into(),
         })
+    }
+}
+
+/// Implements the `Into` trait for converting a `devices::Device`
+/// into a `protocol::DeviceState`.
+impl Into<protocol::DeviceState> for devices::Device {
+    fn into(self) -> protocol::DeviceState {
+        let mut attributes: Vec<protocol::Attribute> = vec![];
+        let attribute_map: HashMap<_, _> = self.attributes.into();
+        for attr in attribute_map.into_values().into_iter() {
+            attributes.push(attr.into());
+        }
+        protocol::DeviceState {
+            name: self.name.to_string(),
+            attributes,
+        }
     }
 }

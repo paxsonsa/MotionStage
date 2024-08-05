@@ -110,6 +110,17 @@ pub mod system {
     }
 
     impl DeviceEntityRef {
+        pub fn as_device(self, world: &World) -> Device {
+            Device {
+                id: self.id(),
+                name: self.name(world).clone(),
+                attributes: self.attributes(world).clone(),
+            }
+        }
+        pub fn id(&self) -> DeviceId {
+            self.entity.index().into()
+        }
+
         pub fn name<'w>(&self, world: &'w World) -> &'w Name {
             world
                 .get::<Name>(self.entity)
@@ -186,7 +197,7 @@ pub mod system {
         Some(DeviceEntityRef { entity })
     }
 
-    pub(super) fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {
+    pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {
         world
             .query::<(&DeviceEntity, Entity)>()
             .iter(&world)

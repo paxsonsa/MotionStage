@@ -151,7 +151,7 @@ impl actor::Actor for EngineActor {
     }
 
     async fn tick(&mut self) -> Option<actor::Signal> {
-        match self.inner.serialize().await {
+        match self.inner.update().await {
             Ok(state) => {
                 if let Err(err) = broadcast(&self.clients, state).await {
                     // tracing::error!(?err, "failed to broadcast state to clients");

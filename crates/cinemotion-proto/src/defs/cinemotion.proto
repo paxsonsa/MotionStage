@@ -40,7 +40,27 @@ message DeviceInitAck {
 
 message DeviceSample { map<string, AttributeValue> attributes = 1; }
 
-message State {}
+message DeviceState {
+  string name = 1;
+  repeated Attribute attributes = 2;
+}
+
+message SceneState { repeated SceneObjectState objects = 1; }
+
+message SceneObjectState {
+  string name = 1;
+  repeated Attribute attributes = 2;
+  repeated AttributeLink links = 3;
+}
+
+message State {
+  uint64 utime = 1;
+  SessionState session = 2;
+  map<uint32, DeviceState> devices = 3;
+  SceneState scene = 4;
+}
+
+message SessionState { bool motion_enabled = 1; }
 
 message SceneCreateObject { SceneObjectSpec spec = 2; }
 
@@ -51,9 +71,8 @@ message SceneUpdateObject {
 
 message SceneDeleteObject { uint32 id = 1; }
 
-message MotionSetMode {
-  bool enabled = 1;
-}
+message MotionSetMode { bool enabled = 1; }
+
 // Data Types
 // ------------
 message DeviceSpec {
@@ -67,15 +86,6 @@ message SceneObjectSpec {
   repeated AttributeLink links = 3;
 }
 
-enum AttributeType {
-  INVALID = 0;
-  FLOAT = 1;
-  VEC3 = 2;
-  VEC4 = 3;
-  MATRIX44 = 4;
-}
-
-// Data Types
 message Attribute {
   string name = 1;
   AttributeValue value = 2;

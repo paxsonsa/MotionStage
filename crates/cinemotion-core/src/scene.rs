@@ -5,8 +5,9 @@ use std::{collections::HashMap, ops::Deref};
 #[path = "scene_test.rs"]
 mod scene_test;
 
-pub struct Scene {
-    name: Name,
+#[derive(Clone)]
+pub struct SceneInfo {
+    pub name: Name,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +90,17 @@ pub mod system {
     impl SceneObjectEntityRef {
         pub fn id(&self) -> ObjectId {
             self.entity.index().into()
+        }
+
+        pub fn as_scene_object(self, world: &World) -> SceneObject {
+            let name = self.name(world);
+            let attributes = self.attributes(world).clone();
+            let links = self.links(world).clone();
+            SceneObject {
+                name,
+                attributes: attributes.into(),
+                links: links.into(),
+            }
         }
 
         pub fn name<'w>(&self, world: &'w World) -> Name {
@@ -179,7 +191,7 @@ pub mod system {
         Some(SceneObjectEntityRef { entity })
     }
 
-    pub(super) fn get_all<'a>(world: &'a mut World) -> Vec<SceneObjectEntityRef> {
+    pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<SceneObjectEntityRef> {
         world
             .query::<(&SceneObjectEntity, Entity)>()
             .iter(&world)

@@ -59,13 +59,8 @@ impl Engine {
         }
     }
 
-    pub async fn serialize(&mut self) -> Result<StateTree> {
-        let state = StateTree::new();
-        //
-        // for device in self.world.query::<(&Device)>().iter() {
-        //     state.devices.push(device)
-        // }
-
+    pub async fn update(&mut self) -> Result<StateTree> {
+        let state = StateTree::new(&mut self.world);
         Ok(state)
     }
 }

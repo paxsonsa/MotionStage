@@ -45,6 +45,12 @@ impl From<HashMap<Name, Attribute>> for AttributeMap {
     }
 }
 
+impl Into<HashMap<Name, Attribute>> for AttributeMap {
+    fn into(self) -> HashMap<Name, Attribute> {
+        self.0
+    }
+}
+
 #[derive(Clone, Component)]
 pub struct AttributeLinkMap(HashMap<Name, AttributeLink>);
 
@@ -70,6 +76,12 @@ impl DerefMut for AttributeLinkMap {
 impl From<HashMap<Name, AttributeLink>> for AttributeLinkMap {
     fn from(value: HashMap<Name, AttributeLink>) -> Self {
         Self(value)
+    }
+}
+
+impl Into<HashMap<Name, AttributeLink>> for AttributeLinkMap {
+    fn into(self) -> HashMap<Name, AttributeLink> {
+        self.0
     }
 }
 
@@ -160,6 +172,10 @@ impl Attribute {
 
     pub fn name(&self) -> &Name {
         &self.name
+    }
+
+    pub fn default_value(&self) -> Arc<AttributeValue> {
+        self.default_value.clone()
     }
 
     pub fn value(&self) -> Arc<AttributeValue> {
