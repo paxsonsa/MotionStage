@@ -6,6 +6,7 @@ use crate::actor;
 use crate::actor::{ActorError, HandleExt};
 use crate::client;
 use crate::perform_send_with_error_handling;
+use core::protocol;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum EngineError {
@@ -64,6 +65,19 @@ impl Message {
     }
 }
 
+#[async_trait]
+pub trait EngineResource: Send + Sync {
+    async fn apply(
+        &self,
+        client_id: u32,
+        message: protocol::client_message::Body,
+    ) -> Result<(), EngineError>;
+
+    async fn add_client(&self, client: client::ClientHandle) -> Result<(), EngineError>;
+
+    async fn remove_client(&self, id: u32) -> Result<(), EngineError>;
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineHandle {
     sender: actor::Sender<Message>,
@@ -74,7 +88,14 @@ impl EngineHandle {
         Self { sender }
     }
 
-    pub async fn apply(
+    pub(crate) fn boxed(sender: actor::Sender<Message>) -> Box<Self> {
+        Box::new(Self::new(sender))
+    }
+}
+
+#[async_trait]
+impl EngineResource for EngineHandle {
+    async fn apply(
         &self,
         client_id: u32,
         message: core::protocol::client_message::Body,
@@ -82,11 +103,11 @@ impl EngineHandle {
         perform_send_with_error_handling!(self, Message::apply(client_id, message))
     }
 
-    pub async fn add_client(&self, client: client::ClientHandle) -> Result<(), EngineError> {
+    async fn add_client(&self, client: client::ClientHandle) -> Result<(), EngineError> {
         perform_send_with_error_handling!(self, Message::add_client(client))
     }
 
-    pub async fn remove_client(&self, id: u32) -> Result<(), EngineError> {
+    async fn remove_client(&self, id: u32) -> Result<(), EngineError> {
         perform_send_with_error_handling!(self, Message::remove_client(id))
     }
 }
@@ -154,7 +175,7 @@ impl actor::Actor for EngineActor {
         match self.inner.update().await {
             Ok(state) => {
                 if let Err(err) = broadcast(&self.clients, state).await {
-                    // tracing::error!(?err, "failed to broadcast state to clients");
+                    tracing::error!(?err, "failed to broadcast state to clients");
                 }
                 None
             }

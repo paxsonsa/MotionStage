@@ -1,4 +1,5 @@
 use anyhow::Result;
+use cinemotion::engine::EngineResource;
 use clap::Args;
 use futures::SinkExt;
 use futures::StreamExt;

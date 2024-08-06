@@ -1,5 +1,8 @@
+use async_trait::async_trait;
 use derive_more::{Display, Error};
+use futures::channel::mpsc;
 use futures::SinkExt;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use super::*;
 use crate::actor::{self, Handle};
@@ -110,22 +113,67 @@ where
     }
 }
 
+struct FakeEngine {}
+
+#[async_trait]
+impl engine::EngineResource for FakeEngine {
+    async fn apply(
+        &self,
+        _client_id: u32,
+        _message: protocol::client_message::Body,
+    ) -> Result<(), engine::EngineError> {
+        Ok(())
+    }
+    async fn add_client(&self, _client: client::ClientHandle) -> Result<(), engine::EngineError> {
+        Ok(())
+    }
+    async fn remove_client(&self, _id: u32) -> Result<(), engine::EngineError> {
+        Ok(())
+    }
+}
+
+struct ChannelHandles {
+    server_rx: mpsc::UnboundedReceiver<protocol::ServerMessage>,
+    websocket_tx: mpsc::UnboundedSender<protocol::ClientMessage>,
+}
+
+fn initialize_channels() -> (
+    ChannelHandles,
+    mpsc::UnboundedSender<protocol::ServerMessage>,
+    mpsc::UnboundedReceiver<protocol::ClientMessage>,
+    FakeEngine,
+) {
+    // Create a pair of channels for sending/receiving messages from a fake network client.
+    let (client_sender, server_rx) = mpsc::unbounded();
+
+    // Create a pair of channels for sending/receiving messages from the websocket.
+    let (websocket_tx, websocket_rx) = mpsc::unbounded();
+
+    let engine_handle = FakeEngine {};
+
+    // Create the struct with the channels.
+    let handles = ChannelHandles {
+        server_rx,
+        websocket_tx,
+    };
+
+    (handles, client_sender, websocket_rx, engine_handle)
+}
+
 /// Test that the client initializes successfully
 #[tokio::test]
 async fn test_client_initialization() {
-    // Create a pair of channels for sending/receiver messages form the client itself.
-    let (client_sender, mut client_receiver) = futures::channel::mpsc::unbounded();
-
-    // Crate a pair of channels for sending/receiving messages from the websocket.
-    let (mut ws_sender, ws_receiver) = futures::channel::mpsc::unbounded();
-
-    let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel();
-    let engine_ = engine::EngineHandle::new(tx.into());
-
+    let (mut handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
     let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
     let send_fn = move |msg| msg;
 
-    let client = client::Client::new(ws_receiver, client_sender, engine_, send_fn, receive_fn);
+    let client = client::Client::new(
+        ws_receiver,
+        client_sender,
+        engine_handle,
+        send_fn,
+        receive_fn,
+    );
     let id = client.id();
     let (mut test_actor, handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
 
@@ -135,7 +183,8 @@ async fn test_client_initialization() {
         .unwrap()
         .expect("client should initialize successfully.");
 
-    let message = client_receiver
+    let message = handles
+        .server_rx
         .try_next()
         .expect("message should be present")
         .unwrap();
@@ -155,7 +204,7 @@ async fn test_client_initialization() {
             },
         )),
     };
-    ws_sender.send(init_ack).await.unwrap();
+    handles.websocket_tx.send(init_ack).await.unwrap();
     test_actor.step(None).await.unwrap();
 
     let state = test_actor
@@ -164,4 +213,84 @@ async fn test_client_initialization() {
         .unwrap()
         .expect("client should return state");
     assert!(matches!(state.status, Status::Ready));
+}
+
+#[tokio::test]
+async fn test_client_actor_initialization() {
+    let (mut handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
+    let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
+    let send_fn = move |msg| msg;
+
+    let mut client = client::Client::new(
+        ws_receiver,
+        client_sender,
+        engine_handle,
+        send_fn,
+        receive_fn,
+    );
+    client
+        .initialize()
+        .await
+        .expect("client should initialize successfully.");
+    let msg = handles
+        .server_rx
+        .try_next()
+        .expect("message should be present")
+        .unwrap();
+    let body = msg.body.expect("body should be present");
+    assert!(
+        matches!(body, protocol::server_message::Body::DeviceInit(_)),
+        "expected DeviceInit message"
+    );
+}
+
+#[tokio::test]
+async fn test_client_actor_disconnection() {
+    let (_handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
+    let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
+    let send_fn = move |msg| msg;
+
+    let mut client = client::Client::new(
+        ws_receiver,
+        client_sender,
+        engine_handle,
+        send_fn,
+        receive_fn,
+    );
+    client.state.status = Status::Ready;
+
+    client
+        .disconnect()
+        .await
+        .expect("client should disconnect successfully.");
+
+    assert_eq!(client.state.status, Status::Disconnected);
+}
+
+#[tokio::test]
+async fn test_client_actor_send_message() {
+    let (mut handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
+    let receive_fn = move |msg: protocol::ClientMessage| Ok(msg);
+    let send_fn = move |msg| msg;
+    let mut client = client::Client::new(
+        ws_receiver,
+        client_sender,
+        engine_handle,
+        send_fn,
+        receive_fn,
+    );
+    client.state.status = Status::Ready;
+    let message = protocol::ServerMessage {
+        body: Some(protocol::server_message::Body::Ping(protocol::Ping {})),
+    };
+    client
+        .send_message(message.clone())
+        .await
+        .expect("client should send message successfully.");
+    let msg = handles
+        .server_rx
+        .try_next()
+        .expect("message should be present")
+        .unwrap();
+    assert_eq!(msg, message);
 }

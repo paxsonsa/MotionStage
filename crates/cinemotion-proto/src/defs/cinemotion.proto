@@ -13,6 +13,8 @@ message ServerMessage {
 
 message ClientMessage {
   oneof body {
+    Ping ping = 2;
+    Pong pong = 3;
     DeviceInitAck device_init_ack = 10;
     DeviceSample device_sample = 15;
     SceneCreateObject scene_create_object = 30;

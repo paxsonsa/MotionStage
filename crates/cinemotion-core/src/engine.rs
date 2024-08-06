@@ -56,6 +56,9 @@ impl Engine {
             | ClientBody::SceneDeleteObject(_) => {
                 scene::commands::procces(&mut self.world, message).map(|_| ())
             }
+
+            // Do nothing
+            ClientBody::Ping(_) | ClientBody::Pong(_) => Ok(()),
         }
     }
 

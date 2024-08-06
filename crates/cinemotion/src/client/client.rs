@@ -63,7 +63,7 @@ pub enum ClientError {
     ActorError(#[from] actor::ActorError),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
     /// The client is initializing and not ready to send or receive messages
     #[default]
@@ -129,37 +129,33 @@ impl actor::Handle for ClientHandle {
 impl actor::HandleExt for ClientHandle {}
 
 /// `Client` is a generic struct that represents a client in the system.
-pub struct Client<R, W, T, S, FnSend, FnReceive>
+pub struct Client<R, W, T, S, Engine, FnSend, FnReceive>
 where
     R: StreamExt<Item = T> + Unpin,
     W: SinkExt<S> + Unpin,
+    Engine: engine::EngineResource,
     FnSend: FnMut(protocol::ServerMessage) -> S + Send + 'static,
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
     id: u32,
     reader: R,
     writer: W,
-    engine: engine::EngineHandle,
-    state: State,
+    engine: Engine,
+    pub(super) state: State,
     send_fn: FnSend,
     receive_fn: FnReceive,
 }
 
-impl<R, W, T, S, FnTo, FnFrom> Client<R, W, T, S, FnTo, FnFrom>
+impl<R, W, T, S, Engine, FnTo, FnFrom> Client<R, W, T, S, Engine, FnTo, FnFrom>
 where
     R: StreamExt<Item = T> + Unpin,
     W: SinkExt<S> + Unpin,
+    Engine: engine::EngineResource,
     FnTo: FnMut(protocol::ServerMessage) -> S + Send + 'static,
     FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
     /// Create a new client with the given reader and writer for communicating with the network layer.
-    pub fn new(
-        reader: R,
-        writer: W,
-        engine: engine::EngineHandle,
-        send_fn: FnTo,
-        receive_fn: FnFrom,
-    ) -> Self {
+    pub fn new(reader: R, writer: W, engine: Engine, send_fn: FnTo, receive_fn: FnFrom) -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             reader,
@@ -253,12 +249,13 @@ where
 }
 
 #[async_trait]
-impl<R, W, T, S, FnTo, FnFrom> actor::Actor for Client<R, W, T, S, FnTo, FnFrom>
+impl<R, W, T, S, Engine, FnTo, FnFrom> actor::Actor for Client<R, W, T, S, Engine, FnTo, FnFrom>
 where
     T: Sync + Send,
     S: Sync + Send,
     R: StreamExt<Item = T> + Unpin + Send + Sync,
     W: SinkExt<S> + Unpin + Send + Sync,
+    Engine: engine::EngineResource + Send + Send,
     FnTo: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
     FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
@@ -302,10 +299,10 @@ where
 }
 
 /// Spawn a new client with the given reader and writer for communicating with the network layer
-pub fn spawn<R, W, T, S, FnSend, FnReceive>(
+pub fn spawn<R, W, T, S, Engine, FnSend, FnReceive>(
     reader: R,
     writer: W,
-    engine: engine::EngineHandle,
+    engine: Engine,
     receive_fn: FnReceive,
     send_fn: FnSend,
 ) -> ClientHandle
@@ -314,6 +311,7 @@ where
     S: Sync + Send + 'static,
     R: StreamExt<Item = T> + Unpin + Send + Sync + 'static,
     W: SinkExt<S> + Unpin + Send + Sync + 'static,
+    Engine: engine::EngineResource + Send + 'static,
     FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
