@@ -1,24 +1,24 @@
-use async_trait::async_trait;
-
-use cinemotion_core as core;
-
 use crate::actor;
 use crate::actor::{ActorError, HandleExt};
 use crate::client;
 use crate::perform_send_with_error_handling;
+use async_trait::async_trait;
+use cinemotion_core as core;
 use core::protocol;
+use std::collections::HashMap;
 
+/// Errors that can occur in the Engine.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("engine is fatally failed")]
     EngineFailed,
     #[error("failed while processing message: {0}")]
     MessageFailed(String),
-
     #[error(transparent)]
     ActorError(#[from] actor::ActorError),
 }
 
+/// Messages that can be sent to the Engine.
 #[derive(Debug, Clone)]
 pub enum Message {
     AddClient {
@@ -65,6 +65,7 @@ impl Message {
     }
 }
 
+/// Trait defining the operations that can be performed on the Engine.
 #[async_trait]
 pub trait EngineResource: Send + Sync {
     async fn apply(
@@ -78,6 +79,7 @@ pub trait EngineResource: Send + Sync {
     async fn remove_client(&self, id: u32) -> Result<(), EngineError>;
 }
 
+/// Handle for interacting with the Engine.
 #[derive(Clone, Debug)]
 pub struct EngineHandle {
     sender: actor::Sender<Message>,
@@ -118,8 +120,9 @@ impl actor::Handle for EngineHandle {
 
 impl actor::HandleExt for EngineHandle {}
 
+/// Actor representing the Engine.
 pub struct EngineActor {
-    clients: std::collections::HashMap<u32, client::ClientHandle>,
+    clients: HashMap<u32, client::ClientHandle>,
     inner: core::engine::Engine,
 }
 
@@ -134,32 +137,25 @@ impl actor::Actor for EngineActor {
                 client_id,
                 message,
                 responder,
-            } => match self.inner.apply(client_id, message).await {
-                Ok(_) => {
-                    responder.dispatch(Ok(())).await;
-                    return None;
-                }
-                Err(err) => {
+            } => {
+                if let Err(err) = self.inner.apply(client_id, message).await {
                     tracing::error!(?err, "failed to apply message");
+                } else {
+                    responder.dispatch(Ok(())).await;
                 }
-            },
+            }
             Message::AddClient { client, responder } => {
                 self.clients.insert(client.id(), client.clone());
-
-                match client.initialize().await {
-                    Ok(_) => {
-                        let _ = responder.try_dispatch(Ok(())).await;
-                    }
-                    Err(e) => {
-                        responder
-                            .dispatch(Err(EngineError::MessageFailed(format!("{e:?}"))))
-                            .await;
-                    }
+                if let Err(e) = client.initialize().await {
+                    responder
+                        .dispatch(Err(EngineError::MessageFailed(format!("{e:?}"))))
+                        .await;
+                } else {
+                    let _ = responder.try_dispatch(Ok(())).await;
                 }
             }
             Message::RemoveClient { id, responder } => {
                 tracing::debug!(id, "removing disconnected client");
-                // TODO: Remove client device from engine as well.
                 self.clients.remove(&id);
                 responder.dispatch(Ok(())).await;
             }
@@ -183,16 +179,18 @@ impl actor::Actor for EngineActor {
     }
 }
 
+/// Spawns a new EngineActor and returns its handle.
 pub fn spawn() -> EngineHandle {
     let engine = EngineActor {
-        clients: std::collections::HashMap::new(),
+        clients: HashMap::new(),
         inner: core::engine::Engine::new(),
     };
     actor::spawn(engine, EngineHandle::new)
 }
 
+/// Broadcasts the state to all clients.
 async fn broadcast(
-    clients: &std::collections::HashMap<u32, client::ClientHandle>,
+    clients: &HashMap<u32, client::ClientHandle>,
     state: core::state::StateTree,
 ) -> Result<(), EngineError> {
     for client in clients.values() {
