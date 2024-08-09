@@ -1,34 +1,37 @@
 use async_trait::async_trait;
+use cinemotion_core::protocol;
 use derive_more::{Display, Error};
 use futures::channel::mpsc;
 use futures::SinkExt;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::*;
-use crate::actor::{self, Handle};
+use crate::actor;
 use crate::engine;
-use cinemotion_core::protocol;
 
+/// Custom error for timeout
 #[derive(Debug, Display, Error)]
 struct TimeoutElapsed {}
 
+/// Test actor struct to simulate actor behavior
 struct TestActor<M>
 where
     M: actor::Actor + 'static,
 {
     pub model: M,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<actor::Event<M::Message>>,
+    receiver: tokio_mpsc::UnboundedReceiver<actor::Event<M::Message>>,
 }
 
 impl<M> TestActor<M>
 where
     M: actor::Actor + 'static,
 {
+    /// Create a new TestActor
     pub fn new<F: FnOnce(actor::Sender<M::Message>) -> M::Handle>(
         model: M,
         handle_fn: F,
     ) -> (Self, M::Handle) {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio_mpsc::unbounded_channel();
         let actor = Self { model, receiver };
         (actor, handle_fn(sender.into()))
     }
@@ -46,6 +49,7 @@ where
         let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs));
         tokio::pin!(timeout);
         tokio::pin!(future);
+
         loop {
             tokio::select! {
                 Some(event) = self.receiver.recv() => {
@@ -62,17 +66,19 @@ where
                     }
                 }
                 signal = self.model.tick() => {
-                    match signal {
-                        Some(actor::Signal::Stop) => break,
-                        _ => {}
+                    if let Some(actor::Signal::Stop) = signal {
+                        break;
                     }
                 }
                 _ = &mut timeout => {
                     panic!("Timeout");
                 }
-                result = &mut future => { return Ok(result) },
+                result = &mut future => {
+                    return Ok(result);
+                }
             }
         }
+
         // Handle case where the loop breaks but we are still waiting on the future.
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         match tokio::time::timeout(timeout, future).await {
@@ -81,10 +87,12 @@ where
         }
     }
 
+    /// Step through the actor loop with a timeout
     pub async fn step(&mut self, timeout_secs: Option<u64>) -> Result<(), TimeoutElapsed> {
         let timeout_secs = timeout_secs.unwrap_or(3);
         let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs));
         tokio::pin!(timeout);
+
         tokio::select! {
             Some(event) = self.receiver.recv() => {
                 match event {
@@ -101,9 +109,10 @@ where
                 }
             }
             signal = self.model.tick() => {
-                match signal {
-                    Some(actor::Signal::Stop) => Ok(()),
-                    _ => {Ok(())}
+                if let Some(actor::Signal::Stop) = signal {
+                    Ok(())
+                } else {
+                    Ok(())
                 }
             }
             _ = &mut timeout => {
@@ -113,6 +122,7 @@ where
     }
 }
 
+/// Fake engine for testing purposes
 struct FakeEngine {}
 
 #[async_trait]
@@ -124,19 +134,23 @@ impl engine::EngineResource for FakeEngine {
     ) -> Result<(), engine::EngineError> {
         Ok(())
     }
+
     async fn add_client(&self, _client: client::ClientHandle) -> Result<(), engine::EngineError> {
         Ok(())
     }
+
     async fn remove_client(&self, _id: u32) -> Result<(), engine::EngineError> {
         Ok(())
     }
 }
 
+/// Struct to hold channel handles
 struct ChannelHandles {
     server_rx: mpsc::UnboundedReceiver<protocol::ServerMessage>,
     websocket_tx: mpsc::UnboundedSender<protocol::ClientMessage>,
 }
 
+/// Initialize channels for testing
 fn initialize_channels() -> (
     ChannelHandles,
     mpsc::UnboundedSender<protocol::ServerMessage>,
@@ -215,6 +229,7 @@ async fn test_client_initialization() {
     assert!(matches!(state.status, Status::Ready));
 }
 
+/// Test that the client actor initializes successfully
 #[tokio::test]
 async fn test_client_actor_initialization() {
     let (mut handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
@@ -244,6 +259,7 @@ async fn test_client_actor_initialization() {
     );
 }
 
+/// Test that the client actor disconnects successfully
 #[tokio::test]
 async fn test_client_actor_disconnection() {
     let (_handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
@@ -267,6 +283,7 @@ async fn test_client_actor_disconnection() {
     assert_eq!(client.state.status, Status::Disconnected);
 }
 
+/// Test that the client actor sends a message successfully
 #[tokio::test]
 async fn test_client_actor_send_message() {
     let (mut handles, client_sender, ws_receiver, engine_handle) = initialize_channels();
