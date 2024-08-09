@@ -68,7 +68,7 @@ impl Message {
 #[async_trait]
 pub trait EngineResource: Send + Sync {
     async fn apply(
-        &self,
+        &mut self,
         client_id: u32,
         message: protocol::client_message::Body,
     ) -> Result<(), EngineError>;
@@ -87,16 +87,12 @@ impl EngineHandle {
     pub(crate) fn new(sender: actor::Sender<Message>) -> Self {
         Self { sender }
     }
-
-    pub(crate) fn boxed(sender: actor::Sender<Message>) -> Box<Self> {
-        Box::new(Self::new(sender))
-    }
 }
 
 #[async_trait]
 impl EngineResource for EngineHandle {
     async fn apply(
-        &self,
+        &mut self,
         client_id: u32,
         message: core::protocol::client_message::Body,
     ) -> Result<(), EngineError> {

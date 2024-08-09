@@ -215,12 +215,10 @@ where
         message: protocol::ServerMessage,
     ) -> Result<(), ClientError> {
         let message = (self.send_fn)(message);
-        // let bytes: bytes::Bytes = message.try_into().map_err(|_| ClientError::SendError)?;
-        // let message = tungstenite::Message::binary(bytes.to_vec());
         self.writer
             .send(message)
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|err| ClientError::SendError)?;
         Ok(())
     }
 
@@ -234,8 +232,19 @@ where
             return Err(ClientError::BadMessage(format!("missing message body")));
         };
         match message {
-            protocol::client_message::Body::DeviceInitAck(ack) => {
+            protocol::client_message::Body::DeviceInitAck(_) => {
                 self.state.status = Status::Ready;
+            }
+            protocol::client_message::Body::Ping(_) => {
+                self.send_message(protocol::ServerMessage {
+                    body: Some(protocol::server_message::Body::Pong(protocol::Pong {})),
+                })
+                .await
+                .map_err(|err| ClientError::SendError)?;
+                self.engine
+                    .apply(self.id, message)
+                    .await
+                    .expect("engine should apply ping");
             }
             m => {
                 self.engine
