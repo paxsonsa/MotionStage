@@ -82,8 +82,8 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    pub(super) id: u32,
-    pub(super) sender: actor::Sender<Message>,
+    pub id: u32,
+    pub sender: actor::Sender<Message>,
 }
 
 impl ClientHandle {

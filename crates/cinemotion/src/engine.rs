@@ -7,6 +7,10 @@ use cinemotion_core as core;
 use core::protocol;
 use std::collections::HashMap;
 
+#[cfg(test)]
+#[path = "engine_test.rs"]
+mod engine_test;
+
 /// Errors that can occur in the Engine.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum EngineError {
