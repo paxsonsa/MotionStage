@@ -69,9 +69,9 @@ impl SceneObject {
 pub mod system {
     use std::sync::Arc;
 
-    use crate::name::*;
     use crate::prelude::{Error, Result};
     use crate::world::World;
+    use crate::{globals, name::*};
 
     use bevy_ecs::prelude::{Component, Entity};
 
@@ -175,7 +175,7 @@ pub mod system {
         Ok(())
     }
 
-    pub(super) fn get_by_id<'a>(
+    pub(crate) fn get_by_id<'a>(
         world: &'a mut World,
         id: &ObjectId,
     ) -> Option<SceneObjectEntityRef> {
@@ -191,6 +191,19 @@ pub mod system {
         Some(SceneObjectEntityRef { entity })
     }
 
+    pub(crate) fn get_by_name<'a>(
+        world: &'a mut World,
+        name: &Name,
+    ) -> Option<SceneObjectEntityRef> {
+        let mut query = world.query::<(&SceneObjectEntity, &Name, Entity)>();
+        for (_, other_name, entity) in query.iter(&world).collect::<Vec<_>>() {
+            if name == other_name {
+                return Some(SceneObjectEntityRef { entity });
+            }
+        }
+        return None;
+    }
+
     pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<SceneObjectEntityRef> {
         world
             .query::<(&SceneObjectEntity, Entity)>()
@@ -200,12 +213,14 @@ pub mod system {
     }
 
     pub(super) fn try_add_scene_object(world: &mut World, object: SceneObject) -> Result<ObjectId> {
-        let mut query = world.query::<(&SceneObjectEntity, &Name)>();
-        for (_, name) in query.iter(&world).collect::<Vec<_>>() {
-            if name == &object.name {
-                let reason = format!("object with name '{}' already exists.", object.name);
-                return Err(Error::CommandFailed { reason });
-            }
+        if globals::system::is_motion_enabled(world) {
+            return Err(Error::InvalidState(
+                "cannot update the scene state while in motion".to_string(),
+            ));
+        }
+        if let Some(_) = get_by_name(world, &object.name) {
+            let reason = format!("object with name '{}' already exists.", object.name);
+            return Err(Error::CommandFailed { reason });
         }
         Ok(add_scene_object(world, object).into())
     }

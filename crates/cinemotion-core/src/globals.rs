@@ -1,5 +1,9 @@
 use bevy_ecs::prelude::*;
 
+#[cfg(test)]
+#[path = "globals_test.rs"]
+mod globals_test;
+
 #[derive(Resource, Default, Debug)]
 pub struct GlobalSettings {
     pub motion: MotionStatus,

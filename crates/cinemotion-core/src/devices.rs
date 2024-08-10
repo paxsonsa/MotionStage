@@ -13,6 +13,9 @@ mod device_test;
 pub struct DeviceId(u32);
 
 impl DeviceId {
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
     pub fn as_u32(&self) -> u32 {
         self.0
     }
@@ -76,7 +79,8 @@ pub mod commands {
 
                 let mut device: Device = spec.try_into()?;
                 device.id = client;
-                system::add_device(world, device);
+                let id = system::add_device(world, device);
+                tracing::debug!("added device with id {}", id.as_u32());
                 Ok(true)
             }
             protocol::client_message::Body::DeviceSample(model) => {
@@ -186,15 +190,12 @@ pub mod system {
     }
 
     pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
-        let entity = Entity::from_raw(**id);
-        let Some(entity_ref) = world.get_entity_mut(entity) else {
-            return None;
-        };
-        if entity_ref.get::<DeviceEntity>().is_none() {
-            return None;
+        for (did, entity) in world.query::<(&DeviceId, Entity)>().iter(&world) {
+            if did == id {
+                return Some(DeviceEntityRef { entity });
+            }
         }
-
-        Some(DeviceEntityRef { entity })
+        return None;
     }
 
     pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {

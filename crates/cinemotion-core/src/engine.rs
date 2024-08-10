@@ -12,14 +12,6 @@ use crate::state::*;
 #[path = "engine_test.rs"]
 mod engine_test;
 
-macro_rules! invoke {
-    ($option:expr, $method:ident $(, $args:expr)*) => {
-        if let Some(ref value) = $option {
-            value.$method($($args),*).await?;
-        }
-    };
-}
-
 pub struct Engine {
     world: World,
 }
