@@ -234,23 +234,30 @@ impl AttributeValue {
         }
     }
 
-    pub fn as_f64(&self) -> Option<&f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Self::Float(value) => Some(value),
+            Self::Float(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub fn as_vec3(&self) -> Option<&Vec3> {
+    pub fn as_vec3(&self) -> Option<Vec3> {
         match self {
-            Self::Vec3(value) => Some(value),
+            Self::Vec3(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub fn as_matrix44(&self) -> Option<&Matrix44> {
+    pub fn as_vec4(&self) -> Option<Vec4> {
         match self {
-            Self::Matrix44(value) => Some(value),
+            Self::Vec4(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn as_matrix44(&self) -> Option<Matrix44> {
+        match self {
+            Self::Matrix44(value) => Some(value.clone()),
             _ => None,
         }
     }

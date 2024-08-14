@@ -13,7 +13,11 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Init(actor::Responder<Result<(), ClientError>>),
+    Id(actor::Responder<Result<u32, ClientError>>),
+    Init {
+        assigned_id: u32,
+        response: actor::Responder<Result<(), ClientError>>,
+    },
     Send {
         message: protocol::ServerMessage,
         response: actor::Responder<Result<(), ClientError>>,
@@ -22,9 +26,19 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn init() -> (Self, actor::Response<Result<(), ClientError>>) {
+    pub fn id() -> (Self, actor::Response<Result<u32, ClientError>>) {
         let (responder, response) = actor::Response::new();
-        (Self::Init(responder), response)
+        (Self::Id(responder), response)
+    }
+    pub fn init(id: u32) -> (Self, actor::Response<Result<(), ClientError>>) {
+        let (responder, response) = actor::Response::new();
+        (
+            Self::Init {
+                assigned_id: id,
+                response: responder,
+            },
+            response,
+        )
     }
 
     pub fn send(
@@ -61,17 +75,21 @@ pub enum ClientError {
 
     #[error(transparent)]
     ActorError(#[from] actor::ActorError),
+
+    #[error("client is in undefined state")]
+    UndefinedState,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
-    /// The client is initializing and not ready to send or receive messages
     #[default]
-    Initializing,
+    Undefined,
+    /// The client is initializing and not ready to send or receive messages
+    Initializing(u32),
     /// The client is ready to send and receive messages
-    Ready,
+    Ready(u32),
     /// the client is disconnected and dead.
-    Disconnected,
+    Disconnected(u32),
 }
 
 /// Internal state of the client
@@ -82,7 +100,6 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    pub id: u32,
     pub sender: actor::Sender<Message>,
 }
 
@@ -90,8 +107,8 @@ impl ClientHandle {
     /// Returns the unique identifier for the client.
     ///
     /// This function is used to get the unique identifier (ID) for the client.
-    pub fn id(&self) -> u32 {
-        self.id
+    pub async fn id(&self) -> Result<u32, ClientError> {
+        perform_send_with_error_handling!(self, Message::id())
     }
 
     /// Initialize the client connection
@@ -99,8 +116,8 @@ impl ClientHandle {
     /// The client needs to initialize before it can respond to any messages
     /// and work with the engine runtime. This should be the first item after the client
     /// is created.
-    pub async fn initialize(&self) -> Result<(), ClientError> {
-        perform_send_with_error_handling!(self, Message::init())
+    pub async fn initialize(&self, id: u32) -> Result<(), ClientError> {
+        perform_send_with_error_handling!(self, Message::init(id))
     }
 
     /// Sends a message to the client.
@@ -137,7 +154,6 @@ where
     FnSend: FnMut(protocol::ServerMessage) -> S + Send + 'static,
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
 {
-    id: u32,
     reader: R,
     writer: W,
     engine: Engine,
@@ -157,7 +173,6 @@ where
     /// Create a new client with the given reader and writer for communicating with the network layer.
     pub fn new(reader: R, writer: W, engine: Engine, send_fn: FnTo, receive_fn: FnFrom) -> Self {
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             reader,
             writer,
             engine,
@@ -168,19 +183,23 @@ where
     }
 
     /// Returns the unique identifier for the client.
-    pub fn id(&self) -> u32 {
-        self.id
+    pub fn id(&self) -> Option<u32> {
+        match self.state.status {
+            Status::Undefined => None,
+            Status::Initializing(id) | Status::Ready(id) | Status::Disconnected(id) => Some(id),
+        }
     }
 
     /// Initialize the client connection
     ///
     /// This should be called once the client's connection has been established.
-    pub async fn initialize(&mut self) -> Result<(), ClientError> {
+    pub async fn initialize(&mut self, id: u32) -> Result<(), ClientError> {
+        self.state.status = Status::Initializing(id);
         match self
             .send_message(
                 protocol::DeviceInit {
                     version: 1,
-                    id: self.id,
+                    id: self.id().unwrap(),
                 }
                 .into(),
             )
@@ -200,10 +219,10 @@ where
     /// level.
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
         tracing::debug!("disconnecting client");
-        if let Err(err) = self.engine.remove_client(self.id).await {
+        if let Err(err) = self.engine.remove_client(self.id().unwrap()).await {
             tracing::error!(?err, "failed to remove client from engine");
         }
-        self.state.status = Status::Disconnected;
+        self.state.status = Status::Disconnected(self.id().unwrap());
         Ok(())
     }
 
@@ -227,13 +246,16 @@ where
     /// This function is responsible for receiving messages from the client and processing them.
     /// The message is then passed to the engine for processing.
     pub async fn receive_message(&mut self, message: T) -> Result<(), ClientError> {
+        let Some(id) = self.id() else {
+            return Err(ClientError::UndefinedState);
+        };
         let message = (self.receive_fn)(message)?;
         let Some(message) = message.body else {
             return Err(ClientError::BadMessage(format!("missing message body")));
         };
         match message {
             protocol::client_message::Body::DeviceInitAck(_) => {
-                self.state.status = Status::Ready;
+                self.state.status = Status::Ready(id);
             }
             protocol::client_message::Body::Ping(_) => {
                 self.send_message(protocol::ServerMessage {
@@ -242,13 +264,13 @@ where
                 .await
                 .map_err(|err| ClientError::SendError)?;
                 self.engine
-                    .apply(self.id, message)
+                    .apply(id, message)
                     .await
                     .expect("engine should apply ping");
             }
             m => {
                 self.engine
-                    .apply(self.id, m)
+                    .apply(id, m)
                     .await
                     .expect("engine apply should not fail");
             }
@@ -272,11 +294,20 @@ where
     type Handle = ClientHandle;
     async fn handle_message(&mut self, message: Self::Message) -> Option<actor::Signal> {
         match message {
+            Message::Id(response) => match self.id() {
+                Some(id) => response.dispatch(Ok(id)).await,
+                None => response.dispatch(Err(ClientError::UndefinedState)).await,
+            },
             // Requesting to initialize the client
-            Message::Init(response) => response.dispatch(self.initialize().await).await,
+            Message::Init {
+                assigned_id,
+                response,
+            } => {
+                response.dispatch(self.initialize(assigned_id).await).await;
+            }
             // Requesting to send a message to the client
             Message::Send { message, response } => match self.state.status {
-                Status::Ready => response.dispatch(self.send_message(message).await).await,
+                Status::Ready(_) => response.dispatch(self.send_message(message).await).await,
                 _ => response.dispatch(Ok(())).await,
             },
             // Requesting the current state of the client
@@ -325,6 +356,5 @@ where
     FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
 {
     let model = Client::new(reader, writer, engine, send_fn, receive_fn);
-    let id = model.id();
-    actor::spawn(model, move |sender| ClientHandle { id, sender })
+    actor::spawn(model, move |sender| ClientHandle { sender })
 }

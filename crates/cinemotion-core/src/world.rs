@@ -7,3 +7,7 @@ pub fn new() -> World {
     world.init_resource::<globals::GlobalSettings>();
     return world;
 }
+
+pub fn reserve_entity(world: &mut World) -> u32 {
+    world.spawn_empty().id().index()
+}

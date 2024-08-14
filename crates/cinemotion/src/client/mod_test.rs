@@ -201,11 +201,11 @@ async fn test_client_initialization() {
         send_fn,
         receive_fn,
     );
-    let id = client.id();
-    let (mut test_actor, handle) = TestActor::new(client, |sender| ClientHandle { id, sender });
+    let id: u32 = 10;
+    let (mut test_actor, handle) = TestActor::new(client, |sender| ClientHandle { sender });
 
     test_actor
-        .wait_for(handle.initialize(), None)
+        .wait_for(handle.initialize(id), None)
         .await
         .unwrap()
         .expect("client should initialize successfully.");
@@ -239,7 +239,7 @@ async fn test_client_initialization() {
         .await
         .unwrap()
         .expect("client should return state");
-    assert!(matches!(state.status, Status::Ready));
+    assert!(matches!(state.status, Status::Ready(10)));
 }
 
 /// Test that the client actor initializes successfully
@@ -257,7 +257,7 @@ async fn test_client_actor_initialization() {
         receive_fn,
     );
     client
-        .initialize()
+        .initialize(10)
         .await
         .expect("client should initialize successfully.");
     let msg = handles
@@ -286,14 +286,14 @@ async fn test_client_actor_disconnection() {
         send_fn,
         receive_fn,
     );
-    client.state.status = Status::Ready;
+    client.state.status = Status::Ready(10);
 
     client
         .disconnect()
         .await
         .expect("client should disconnect successfully.");
 
-    assert_eq!(client.state.status, Status::Disconnected);
+    assert_eq!(client.state.status, Status::Disconnected(10));
 }
 
 /// Test that the client actor sends a message successfully
@@ -309,7 +309,7 @@ async fn test_client_actor_send_message() {
         send_fn,
         receive_fn,
     );
-    client.state.status = Status::Ready;
+    client.state.status = Status::Ready(10);
     let message = protocol::ServerMessage {
         body: Some(protocol::server_message::Body::Ping(protocol::Ping {})),
     };
@@ -338,7 +338,7 @@ async fn test_client_actor_receive_message_with_bad_message() {
         send_fn,
         receive_fn,
     );
-    client.state.status = Status::Ready;
+    client.state.status = Status::Ready(10);
     let message = protocol::ClientMessage { body: None };
     let result = client.receive_message(message.clone()).await;
     assert!(result.is_err());
@@ -358,7 +358,7 @@ async fn test_client_actor_receive_message_calls_engine_apply() {
         send_fn,
         receive_fn,
     );
-    client.state.status = Status::Ready;
+    client.state.status = Status::Ready(10);
     let message = protocol::ClientMessage {
         body: Some(protocol::client_message::Body::Ping(protocol::Ping {})),
     };
@@ -383,7 +383,7 @@ async fn test_client_actor_receive_message_ping() {
         send_fn,
         receive_fn,
     );
-    client.state.status = Status::Ready;
+    client.state.status = Status::Ready(10);
     let message = protocol::ClientMessage {
         body: Some(protocol::client_message::Body::Ping(protocol::Ping {})),
     };

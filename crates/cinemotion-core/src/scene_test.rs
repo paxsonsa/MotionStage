@@ -35,7 +35,6 @@ async fn test_scene_add_object() {
 #[tokio::test]
 async fn test_scene_update_object() {
     let mut world = world::new();
-
     let mut object = SceneObject::new("camera1");
     object.insert_attribute(Attribute::new_matrix44("transform"));
     let id = system::add_scene_object(&mut world, object.clone());
@@ -71,8 +70,8 @@ async fn test_scene_command_remove_object() {
 #[tokio::test]
 async fn test_scene_system_attribute_links() {
     let mut world = world::new();
-
-    let mut device = Device::new(0, "root");
+    let id = world::reserve_entity(&mut world);
+    let mut device = Device::new(id, "root");
     device
         .attributes
         .insert(Attribute::new_matrix44("transform"));

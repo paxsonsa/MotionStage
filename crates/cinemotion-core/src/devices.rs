@@ -79,7 +79,7 @@ pub mod commands {
 
                 let mut device: Device = spec.try_into()?;
                 device.id = client;
-                let id = system::add_device(world, device);
+                let id = system::try_add_device(world, device)?;
                 tracing::debug!("added device with id {}", id.as_u32());
                 Ok(true)
             }
@@ -91,6 +91,7 @@ pub mod commands {
                 system::try_apply_samples(world, client, samples)?;
                 Ok(true)
             }
+            // TODO: Add Remove Device/Add Device Update
             _ => Ok(false),
         }
     }
@@ -190,12 +191,15 @@ pub mod system {
     }
 
     pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
-        for (did, entity) in world.query::<(&DeviceId, Entity)>().iter(&world) {
-            if did == id {
-                return Some(DeviceEntityRef { entity });
-            }
+        let entity = Entity::from_raw(**id);
+        let Some(entity_ref) = world.get_entity(entity) else {
+            return None;
+        };
+
+        if entity_ref.get::<DeviceEntity>().is_none() {
+            return None;
         }
-        return None;
+        return Some(DeviceEntityRef { entity });
     }
 
     pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {
@@ -213,9 +217,10 @@ pub mod system {
             ));
         }
 
-        if let Some(_) = get(world, &device.id) {
+        let entity = Entity::from_raw(*device.id);
+        let Some(_) = world.get_entity(entity) else {
             return Err(Error::NotFound(
-                "no device with matching id found for update".into(),
+                "did not find reserved entity to apply device to.".into(),
             ));
         };
 
@@ -223,7 +228,9 @@ pub mod system {
     }
 
     pub(crate) fn add_device(world: &mut World, device: Device) -> DeviceId {
-        let entity = world.spawn((DeviceEntity, device.id, device.name, device.attributes));
+        let entity = Entity::from_raw(*device.id);
+        let mut entity = world.get_entity_mut(entity).unwrap();
+        entity.insert((DeviceEntity, device.id, device.name, device.attributes));
         entity.id().index().into()
     }
 
@@ -273,11 +280,7 @@ pub mod system {
 
         for sample in samples {
             if let Err(err) = device.apply_sample(world, sample) {
-                println!(
-                    "failed to apply samples to device {}: {}",
-                    device_id.as_u32(),
-                    err
-                );
+                tracing::error!(?device_id, ?err, "failed to apply samples to device");
             }
         }
 

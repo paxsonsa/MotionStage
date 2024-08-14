@@ -149,8 +149,9 @@ impl actor::Actor for EngineActor {
                 }
             }
             Message::AddClient { client, responder } => {
-                self.clients.insert(client.id(), client.clone());
-                if let Err(e) = client.initialize().await {
+                let id = self.inner.reserve_entity().await;
+                self.clients.insert(id, client.clone());
+                if let Err(e) = client.initialize(id).await {
                     responder
                         .dispatch(Err(EngineError::MessageFailed(format!("{e:?}"))))
                         .await;

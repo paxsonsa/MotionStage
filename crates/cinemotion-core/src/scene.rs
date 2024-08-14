@@ -165,10 +165,9 @@ pub mod system {
 
     pub fn update(world: &mut World) -> Result<()> {
         for object in get_all(world) {
-            let links = object.links(&world).clone();
+            let links = object.links(world).clone();
             for (name, link) in links.iter() {
                 let value = read_link_value(world, &link)?;
-                println!("{:?} {:?} {:?}", name, link, value);
                 object.update_attribute(world, &name, value)?;
             }
         }

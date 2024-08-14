@@ -6,14 +6,15 @@ use crate::prelude::name;
 #[tokio::test]
 async fn test_device_system_command_registration() {
     let mut world = crate::world::new();
-    let mut device = Device::new(0, "deviceA");
+    let id = crate::world::reserve_entity(&mut world);
+    let mut device = Device::new(id, "deviceA");
     device
         .attributes
         .insert(Attribute::new("transform", AttributeValue::matrix44()));
 
     let reply = system::try_add_device(&mut world, device.clone()).expect("no device id returned");
 
-    assert_eq!(DeviceId::from(0), reply,);
+    assert_eq!(DeviceId::from(id), reply,);
     let devices = system::get_all(&mut world);
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name(&world), &name!("deviceA"));
@@ -26,7 +27,8 @@ async fn test_device_system_command_registration() {
 #[tokio::test]
 async fn test_device_system_command_remove() {
     let mut world = crate::world::new();
-    let mut device = Device::new(0, "deviceA");
+    let id = crate::world::reserve_entity(&mut world);
+    let mut device = Device::new(id, "deviceA");
     device
         .attributes
         .insert(Attribute::new_matrix44("transform"));
@@ -42,7 +44,8 @@ async fn test_device_system_command_remove() {
 #[tokio::test]
 async fn test_device_system_motion_samples() {
     let mut world = crate::world::new();
-    let mut device = Device::new(0, "deviceA");
+    let id = crate::world::reserve_entity(&mut world);
+    let mut device = Device::new(id, "deviceA");
     device
         .attributes
         .insert(Attribute::new_matrix44("transform"));

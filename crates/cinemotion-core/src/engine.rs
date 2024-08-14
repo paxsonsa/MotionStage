@@ -30,6 +30,11 @@ impl Engine {
         &mut self.world
     }
 
+    /// Reserve a engine entity and return the ID.
+    pub async fn reserve_entity(&mut self) -> u32 {
+        world::reserve_entity(&mut self.world)
+    }
+
     pub async fn apply(
         &mut self,
         client: u32,
@@ -55,6 +60,8 @@ impl Engine {
     }
 
     pub async fn update(&mut self) -> Result<StateTree> {
+        let world = &mut self.world;
+        scene::system::update(world)?;
         let state = StateTree::new(&mut self.world);
         Ok(state)
     }
