@@ -67,6 +67,7 @@ impl SceneObject {
 }
 
 pub mod system {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::prelude::{Error, Result};
@@ -171,6 +172,27 @@ pub mod system {
                 object.update_attribute(world, &name, value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Remove all attribute links that reference the given device id
+    ///
+    /// For each object in the scene, check the links for the object and remove
+    /// any links whose device_id matches the given device_id.
+    pub fn remove_device_links(world: &mut World, device_id: u32) -> Result<()> {
+        let mut objects = get_all(world);
+
+        objects.iter_mut().for_each(|object| {
+            let links = object.links(world).clone();
+            // Filter out any links that reference the device id.
+            let links = links
+                .iter()
+                .filter(|(_, link)| **link.device() != device_id)
+                .map(|(name, link)| (name.clone(), link.clone()))
+                .collect::<HashMap<_, _>>();
+
+            object.set_links(world, links.into());
+        });
         Ok(())
     }
 

@@ -58,7 +58,7 @@ the protobuf bytes message. The server will not send ACKs only errors and state 
 
 There are a number of commands and events that are apart of the protocol for interacting with the server. This is an overview of them.
 
-TODO: Build out debugger
+TrDO: Build out debugger
   - Add ability to read into JSON Array for Message sending.
   - Add ability to add object
   - Add ability to send a sample

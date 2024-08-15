@@ -149,7 +149,7 @@ impl actor::Actor for EngineActor {
                 }
             }
             Message::AddClient { client, responder } => {
-                let id = self.inner.reserve_entity().await;
+                let id = self.inner.reserve_client().await;
                 self.clients.insert(id, client.clone());
                 if let Err(e) = client.initialize(id).await {
                     responder
@@ -161,6 +161,9 @@ impl actor::Actor for EngineActor {
             }
             Message::RemoveClient { id, responder } => {
                 tracing::debug!(id, "removing disconnected client");
+                if let Err(err) = self.inner.remove_client(id).await {
+                    tracing::error!(id, ?err, "failed to remove the client.");
+                }
                 self.clients.remove(&id);
                 responder.dispatch(Ok(())).await;
             }

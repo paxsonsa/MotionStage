@@ -30,8 +30,15 @@ impl Engine {
         &mut self.world
     }
 
+    /// Remove the client entity
+    pub async fn remove_client(&mut self, client: u32) -> Result<()> {
+        scene::system::remove_device_links(&mut self.world, client.clone())?;
+        devices::system::remove_device_by_id(&mut self.world, client.into());
+        Ok(())
+    }
+
     /// Reserve a engine entity and return the ID.
-    pub async fn reserve_entity(&mut self) -> u32 {
+    pub async fn reserve_client(&mut self) -> u32 {
         world::reserve_entity(&mut self.world)
     }
 

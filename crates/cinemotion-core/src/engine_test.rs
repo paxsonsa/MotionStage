@@ -17,7 +17,7 @@ async fn test_motion_mode() {
 #[tokio::test]
 async fn test_device_init() {
     let mut engine = Engine::new();
-    let id = engine.reserve_entity().await;
+    let id = engine.reserve_client().await;
     let message = protocol::client_message::Body::DeviceInitAck(protocol::DeviceInitAck {
         device_spec: Some(protocol::DeviceSpec {
             name: "test".to_string(),
@@ -99,7 +99,7 @@ async fn test_scene_creation_object() {
 #[tokio::test]
 async fn test_standard_integration() {
     let mut engine = Engine::new();
-    let id = engine.reserve_entity().await;
+    let id = engine.reserve_client().await;
     let message = protocol::client_message::Body::DeviceInitAck(protocol::DeviceInitAck {
         device_spec: Some(protocol::DeviceSpec {
             name: "DeviceA".to_string(),
