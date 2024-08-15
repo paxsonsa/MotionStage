@@ -1,15 +1,12 @@
 use async_trait::async_trait;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
 use crate::actor::{self, ActorError, HandleExt};
 use crate::engine;
 use crate::perform_send_with_error_handling;
 use cinemotion_core::protocol;
-
-static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -124,7 +121,7 @@ impl ClientHandle {
     ///
     /// This function is responsible for transmitting messages to the client. If the message is successfully sent, it returns `Ok`, otherwise it returns an `Err`.
     ///
-    pub async fn send(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
+    pub async fn send_message(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
         tracing::debug!(?message, "sending message to client");
         perform_send_with_error_handling!(self, Message::send(message))
     }
