@@ -39,6 +39,15 @@ impl TryFrom<bytes::Bytes> for ServerMessage {
     }
 }
 
+impl TryInto<bytes::Bytes> for ClientMessage {
+    type Error = self::ProtocolError;
+    fn try_into(self) -> Result<bytes::Bytes, Self::Error> {
+        let mut buf = bytes::BytesMut::new();
+        self.encode(&mut buf)?;
+        Ok(buf.freeze())
+    }
+}
+
 impl TryFrom<bytes::Bytes> for ClientMessage {
     type Error = self::ProtocolError;
 

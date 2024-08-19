@@ -202,12 +202,15 @@ async fn broadcast(
     state: core::state::StateTree,
 ) -> Result<(), EngineError> {
     for client in clients.values() {
-        client.send(state.clone().into()).await.map_err(|err| {
-            EngineError::MessageFailed(format!(
-                "failed to broadcast state to client: err={:?}",
-                err
-            ))
-        })?;
+        client
+            .send_message(state.clone().into())
+            .await
+            .map_err(|err| {
+                EngineError::MessageFailed(format!(
+                    "failed to broadcast state to client: err={:?}",
+                    err
+                ))
+            })?;
     }
     Ok(())
 }

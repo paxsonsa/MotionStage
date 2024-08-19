@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 
 mod debugger;
+mod jsondoc;
 mod server;
 
 /// A server for receiving and processing streamed motion data.
@@ -31,6 +32,8 @@ enum Command {
     Server(server::ServerCmd),
     // Start the debug client.
     Debugger(debugger::DebuggerCmd),
+    // Doc Protocol JSON
+    JsonDoc(jsondoc::JsonDocCmd),
 }
 
 impl Command {
@@ -50,6 +53,7 @@ impl Command {
             }
             Self::Server(cmd) => cmd.run().await,
             Self::Debugger(cmd) => cmd.run().await,
+            Self::JsonDoc(cmd) => cmd.run().await,
         }
     }
 }
