@@ -190,7 +190,7 @@ impl JsonDocCmd {
             "MotionSetMode",
             protocol::ClientMessage {
                 body: Some(protocol::client_message::Body::MotionSetMode(
-                    protocol::MotionSetMode { enabled: true },
+                    protocol::MotionSetMode { enabled: false },
                 )),
             },
             &mut stdout,

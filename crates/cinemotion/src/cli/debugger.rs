@@ -1,54 +1,70 @@
-use cinemotion_core::protocol;
-use futures::SinkExt;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::Mutex;
-
 use anyhow::{anyhow, Result};
+use cinemotion_core::protocol;
 use clap::Args;
+use crossterm::terminal;
+use futures::SinkExt;
 use futures_util::{future, pin_mut, StreamExt};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
-use tokio::io::Lines;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[derive(Clone, clap::ValueEnum)]
 enum Mode {
-    /// Run the debugger in interactive mode and simulate a device client.
     Debugger,
-    /// Run the debugger in observer mode that will monitor the server and its state.
     Observer,
 }
 
 /// Start the cinemotion broker services.
 #[derive(Args)]
 pub struct DebuggerCmd {
-    /// The server address to connect too.
     #[clap(long = "address")]
     server_address: Option<String>,
-
-    /// A path to a JSON file that describes a device spec to use inplace of the default one.
     #[clap(long = "device")]
     device_spec_path: Option<PathBuf>,
-
-    /// A path to a JSON file that descrives a object spec to use inplace of the default objects.
     #[clap(long = "objects")]
     objects_spec_path: Option<PathBuf>,
-
-    /// The mode to run the debugger in, the default is debugger.
     #[clap(long = "mode", default_value = "debugger")]
     mode: Mode,
 }
-
-/*
-* TODO: Implement the debugger system.
-* - Interactive ability start/stop motion streaming and recording
-* - Interactive ability to ability to reset the device.
-*/
 
 static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7788";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
+        terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+
+        let mut stdout = std::io::stdout();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut stdout);
+        let mut terminal = ratatui::Terminal::new(backend)?;
+
+        // Preemptive clear of the window
+        terminal.clear()?;
+
+        // Create shared screen state and log holder
+        let log: Vec<String> = vec![];
+        let log = Arc::new(Mutex::new(log));
+        let log_for_tracing = Arc::clone(&log);
+        let screen_state = Arc::new(Screen { log });
+
+        // Set up tracing subscriber with custom log writer
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(fmt::Layer::new().with_writer(Box::new(move || LogWriter {
+                log: Arc::clone(&log_for_tracing),
+            })));
+        tracing::subscriber::set_global_default(subscriber)?;
+
         let address = self
             .server_address
             .clone()
@@ -74,73 +90,126 @@ impl DebuggerCmd {
             }
         })?;
 
-        let ws = match tokio_tungstenite::connect_async(address).await {
-            Ok((ws, _)) => ws,
-            Err(err) => return Err(anyhow!("failed to connect to server, aborting: {:?}", err)),
-        };
-
-        let (writer, reader) = ws.split();
-        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-
-        let mut stdin_reader = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-        let stdin_task = async {
-            while let Ok(Some(line)) = stdin_reader.next_line().await {
-                tracing::info!("{:?}", line);
-            }
-        };
-
-        let debugger_state = Arc::new(Mutex::new(DebuggerState {
-            init_acked: false,
-            initial_device_spec: device_spec,
-            device_id: None,
-        }));
-        let receiver_task = {
-            reader.for_each(move |msg| {
-                let writer = writer.clone();
-                let debugger_state = debugger_state.clone();
-                async move {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::error!(?err, "failed to read message from server");
-                            return;
+        // TODO: Spin off a task for the writer which needs an actor handle
+        // TODO: Start a loop for the reader and use actor for working with the results.
+        // 1. Establish a connection via websocket
+        let conn = cinemotion::connect(address.clone()).await?;
+        let runtime = cinemotion::Runtime::<_>::builder()
+            .name("cinemotion-debugger".to_string())
+            .connection(conn)
+            .runtime_fn(Box::new(|message| {
+                Box::pin(async move {
+                    match message {
+                        cinemotion::Message::Log(log) => {
+                            tracing::info!("Log: {}", log);
                         }
-                    };
-                    let bytes = bytes::Bytes::from(msg.into_data());
-
-                    let msg = match cinemotion_proto::ServerMessage::try_from(bytes) {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::error!(?err, "failed to decode message from server");
-                            return;
+                        cinemotion::Message::Command(cmd) => {
+                            tracing::info!("Command: {}", cmd);
+                            // Handle command
                         }
-                    };
-                    tracing::debug!("{:?}", serde_json::to_string(&msg).unwrap());
-                    if let Err(err) =
-                        handle_server_message(debugger_state.clone(), msg, writer.clone()).await
-                    {
-                        tracing::error!(?err, "failed to handle server message");
+                    }
+                    None
+                })
+                    as std::pin::Pin<Box<dyn future::Future<Output = Option<()>> + Send>>
+            }))
+            .build();
+
+        let runtime_handle = runtime.start().await;
+
+        let mut input = String::new();
+
+        // Render the log messages and input field to the terminal
+        loop {
+            terminal.draw(|f| {
+                let size = f.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(10), Constraint::Length(3)].as_ref())
+                    .split(size);
+
+                // Log window
+                let logs = screen_state.log();
+                let log_items: Vec<ListItem> =
+                    logs.iter().map(|i| ListItem::new(i.as_str())).collect();
+                let log_list =
+                    List::new(log_items).block(Block::default().title("Log").borders(Borders::ALL));
+                f.render_widget(log_list, chunks[0]);
+
+                // Input field
+                let input_paragraph = Paragraph::new(input.as_str())
+                    .block(Block::default().title("Input").borders(Borders::ALL));
+                f.render_widget(input_paragraph, chunks[1]);
+            })?;
+
+            if crossterm::event::poll(std::time::Duration::from_millis(50))? {
+                if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('c')
+                            if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
+                        {
+                            break;
+                        }
+                        crossterm::event::KeyCode::Char(c) => input.push(c),
+                        crossterm::event::KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            // Here you would handle the input, for example, sending a command
+                            // Add user input to log
+                            screen_state.write(input.clone());
+                            input.clear(); // Clear the input after processing
+                        }
+                        // Exit on ESC
+                        crossterm::event::KeyCode::Esc => break,
+                        // Exit on Ctrl+C
+                        _ => {}
                     }
                 }
-            })
-        };
-
-        let kill_switch = { tokio::signal::ctrl_c() };
-
-        pin_mut!(receiver_task, stdin_task, kill_switch);
-        tokio::select! {
-            _ = receiver_task => {}
-            _ = stdin_task => {}
-            _ = kill_switch => {}
+            }
         }
-
+        terminal.clear()?;
+        terminal::disable_raw_mode()?;
         Ok(0)
+    }
+}
+
+struct LogWriter {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let log_line = String::from_utf8_lossy(buf).into_owned();
+        let mut logs = self.log.lock().unwrap();
+        logs.push(log_line);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Screen {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Screen {
+    fn write(&self, msg: String) {
+        let mut logs = self.log.lock().unwrap();
+        logs.push(format!("> {msg}"));
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
     }
 }
 
 #[derive(Default)]
 struct DebuggerState {
     init_acked: bool,
+    motion_enabled: bool,
     initial_device_spec: protocol::DeviceSpec,
     device_id: Option<u32>,
 }

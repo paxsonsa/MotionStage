@@ -37,21 +37,24 @@ enum Command {
 }
 
 impl Command {
-    pub fn run(&self) -> Result<i32> {
+    pub fn run(&self, opts: &Opt) -> Result<i32> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("Failed to establish async runtime")?;
-        rt.block_on(self.run_async())
+        rt.block_on(self.run_async(opts))
     }
 
-    pub async fn run_async(&self) -> Result<i32> {
+    pub async fn run_async(&self, opts: &Opt) -> Result<i32> {
         match self {
             Self::Version => {
                 println!("cinemotion: {}", cinemotion::VERSION);
                 Ok(0)
             }
-            Self::Server(cmd) => cmd.run().await,
+            Self::Server(cmd) => {
+                configure_logging(i32::from(opts.verbose) - i32::from(opts.quiet));
+                cmd.run().await
+            }
             Self::Debugger(cmd) => cmd.run().await,
             Self::JsonDoc(cmd) => cmd.run().await,
         }
@@ -60,8 +63,7 @@ impl Command {
 
 fn main() -> Result<()> {
     let opts = Opt::parse();
-    configure_logging(i32::from(opts.verbose) - i32::from(opts.quiet));
-    let code = opts.command.run()?;
+    let code = opts.command.run(&opts)?;
     std::process::exit(code);
 }
 

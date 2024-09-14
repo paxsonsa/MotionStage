@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&proto_files, &[root])?;
     let descriptor_set = std::fs::read(descriptor_path)?;
     pbjson_build::Builder::new()
+        .emit_fields()
         .register_descriptors(&descriptor_set)?
         .build(&[".cinemotion"])?;
     Ok(())
