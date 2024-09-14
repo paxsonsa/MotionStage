@@ -7,7 +7,9 @@ use futures_util::{future, pin_mut, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    style::Stylize,
+    text::{self, Text, ToLine, ToText},
+    widgets::{Block, Borders, List, ListItem, Padding, Paragraph},
     Terminal,
 };
 use std::path::PathBuf;
@@ -52,10 +54,13 @@ impl DebuggerCmd {
         terminal.clear()?;
 
         // Create shared screen state and log holder
-        let log: Vec<String> = vec![];
+        let log = vec![];
         let log = Arc::new(Mutex::new(log));
         let log_for_tracing = Arc::clone(&log);
-        let screen_state = Arc::new(Screen { log });
+        let screen_state = Arc::new(Screen {
+            app: Arc::new(Mutex::new(App::default())),
+            log,
+        });
 
         // Set up tracing subscriber with custom log writer
         let subscriber = tracing_subscriber::registry()
@@ -90,36 +95,26 @@ impl DebuggerCmd {
             }
         })?;
 
-        // TODO: Spin off a task for the writer which needs an actor handle
-        // TODO: Start a loop for the reader and use actor for working with the results.
-        // 1. Establish a connection via websocket
-        let conn = cinemotion::connect(address.clone()).await?;
-        let runtime = cinemotion::Runtime::<_>::builder()
-            .name("cinemotion-debugger".to_string())
-            .connection(conn)
-            .runtime_fn(Box::new(|message| {
-                Box::pin(async move {
-                    match message {
-                        cinemotion::Message::Log(log) => {
-                            tracing::info!("Log: {}", log);
-                        }
-                        cinemotion::Message::Command(cmd) => {
-                            tracing::info!("Command: {}", cmd);
-                            // Handle command
-                        }
-                    }
-                    None
-                })
-                    as std::pin::Pin<Box<dyn future::Future<Output = Option<()>> + Send>>
-            }))
-            .build();
-
-        let runtime_handle = runtime.start().await;
-
-        let mut input = String::new();
+        // let conn = cinemotion::connect(address.clone()).await?;
+        // let runtime = cinemotion::Runtime::<_>::builder()
+        //     .name("cinemotion-debugger".to_string())
+        //     .connection(conn)
+        //     .runtime_fn(Box::new(|message| {
+        //         Box::pin(async move {
+        //             // TODO: Handle incoming messages.
+        //             None
+        //         })
+        //             as std::pin::Pin<Box<dyn future::Future<Output = Option<()>> + Send>>
+        //     }))
+        //     .build();
+        //
+        // let runtime_handle = runtime.start().await;
+        //
+        let mut input_text = String::new();
+        screen_state.message("Debugger started, awaiting command".into());
 
         // Render the log messages and input field to the terminal
-        loop {
+        while screen_state.app.lock().unwrap().is_running {
             terminal.draw(|f| {
                 let size = f.area();
                 let chunks = Layout::default()
@@ -130,14 +125,18 @@ impl DebuggerCmd {
                 // Log window
                 let logs = screen_state.log();
                 let log_items: Vec<ListItem> =
-                    logs.iter().map(|i| ListItem::new(i.as_str())).collect();
+                    logs.iter().map(|i| ListItem::new(i.to_line())).collect();
                 let log_list =
                     List::new(log_items).block(Block::default().title("Log").borders(Borders::ALL));
                 f.render_widget(log_list, chunks[0]);
 
                 // Input field
-                let input_paragraph = Paragraph::new(input.as_str())
-                    .block(Block::default().title("Input").borders(Borders::ALL));
+                let input_paragraph = Paragraph::new(input_text.as_str()).block(
+                    Block::default()
+                        .title("Input")
+                        .borders(Borders::ALL)
+                        .padding(Padding::left(1)),
+                );
                 f.render_widget(input_paragraph, chunks[1]);
             })?;
 
@@ -149,15 +148,14 @@ impl DebuggerCmd {
                         {
                             break;
                         }
-                        crossterm::event::KeyCode::Char(c) => input.push(c),
+                        crossterm::event::KeyCode::Char(c) => input_text.push(c),
                         crossterm::event::KeyCode::Backspace => {
-                            input.pop();
+                            input_text.pop();
                         }
                         crossterm::event::KeyCode::Enter => {
-                            // Here you would handle the input, for example, sending a command
-                            // Add user input to log
-                            screen_state.write(input.clone());
-                            input.clear(); // Clear the input after processing
+                            if let Ok(_) = screen_state.submit_command(&input_text) {
+                                input_text.clear();
+                            }
                         }
                         // Exit on ESC
                         crossterm::event::KeyCode::Esc => break,
@@ -173,15 +171,21 @@ impl DebuggerCmd {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("invalid command: '{0}'")]
+    InvalidCommand(String),
+}
+
 struct LogWriter {
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Mutex<Vec<text::Line<'static>>>>,
 }
 
 impl std::io::Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let log_line = String::from_utf8_lossy(buf).into_owned();
         let mut logs = self.log.lock().unwrap();
-        logs.push(log_line);
+        logs.push(log_line.into());
         Ok(buf.len())
     }
 
@@ -192,17 +196,65 @@ impl std::io::Write for LogWriter {
 
 #[derive(Default)]
 struct Screen {
-    log: Arc<Mutex<Vec<String>>>,
+    app: Arc<Mutex<App>>,
+    log: Arc<Mutex<Vec<text::Line<'static>>>>,
 }
 
 impl Screen {
-    fn write(&self, msg: String) {
+    fn present_error<T>(&self, err: Error) -> Result<T, Error> {
         let mut logs = self.log.lock().unwrap();
-        logs.push(format!("> {msg}"));
+        logs.push(Stylize::red(format!("ERROR: {err}")).into());
+        Err(err)
+    }
+    fn message(&self, msg: String) {
+        let mut logs = self.log.lock().unwrap();
+        logs.push(format!("> {msg}").into());
     }
 
-    fn log(&self) -> Vec<String> {
+    fn submit_command<'a>(&self, command: &'a str) -> Result<(), Error> {
+        let cmd = command.trim();
+        let command_tokens: Vec<&str> = cmd.split_whitespace().collect();
+
+        let main_command = match command_tokens.get(0) {
+            Some(command) => command,
+            None => {
+                return Err(Error::InvalidCommand("".into()));
+            }
+        };
+        let args = &command_tokens[1..];
+
+        match *main_command {
+            // Connect Command
+            "help" => {
+                // Better Help Output that is more readable.
+                self.message("Commands: help, clear, exit".into());
+            }
+            "clear" => {
+                self.log.lock().unwrap().clear();
+            }
+            "exit" => {
+                // TODO: Prompt for confirmation
+                self.app.lock().unwrap().is_running = false;
+            }
+            _ => {
+                // TODO: Make Error Message Passed.
+                return self.present_error(Error::InvalidCommand(main_command.to_string()));
+            }
+        };
+        Ok(())
+    }
+    fn log(&self) -> Vec<text::Line> {
         self.log.lock().unwrap().clone()
+    }
+}
+
+struct App {
+    is_running: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self { is_running: true }
     }
 }
 

@@ -48,11 +48,14 @@ where
 {
     pub async fn start(mut self) -> RuntimeHandle {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    msg = self.connection.reader.next() => {},
+                    // Receive messages from the network connection
+                    msg = self.connection.reader.next() => {
+
+                    },
+                    // Receive messages from the runtime handle.
                     msg = rx.recv() => {
                         match msg {
                             Some(msg) => {}
