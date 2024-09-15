@@ -7,7 +7,7 @@ use futures_util::{future, pin_mut, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::Stylize,
+    style::{self, Stylize},
     text::{self, Text, ToLine, ToText},
     widgets::{Block, Borders, List, ListItem, Padding, Paragraph},
     Terminal,
@@ -123,11 +123,10 @@ impl DebuggerCmd {
                     .split(size);
 
                 // Log window
-                let logs = screen_state.log();
-                let log_items: Vec<ListItem> =
-                    logs.iter().map(|i| ListItem::new(i.to_line())).collect();
-                let log_list =
-                    List::new(log_items).block(Block::default().title("Log").borders(Borders::ALL));
+
+                // FIXME: Look into better state management flux/ELM
+                let log_list = List::new(screen_state.log())
+                    .block(Block::default().title("Log").borders(Borders::ALL));
                 f.render_widget(log_list, chunks[0]);
 
                 // Input field
@@ -153,9 +152,8 @@ impl DebuggerCmd {
                             input_text.pop();
                         }
                         crossterm::event::KeyCode::Enter => {
-                            if let Ok(_) = screen_state.submit_command(&input_text) {
-                                input_text.clear();
-                            }
+                            if let Ok(_) = screen_state.submit_command(&input_text) {}
+                            input_text.clear();
                         }
                         // Exit on ESC
                         crossterm::event::KeyCode::Esc => break,
@@ -203,7 +201,10 @@ struct Screen {
 impl Screen {
     fn present_error<T>(&self, err: Error) -> Result<T, Error> {
         let mut logs = self.log.lock().unwrap();
-        logs.push(Stylize::red(format!("ERROR: {err}")).into());
+        logs.push(text::Line::styled(
+            format!("ERROR: {err}"),
+            style::Style::default().red(),
+        ));
         Err(err)
     }
     fn message(&self, msg: String) {
@@ -237,7 +238,7 @@ impl Screen {
                 self.app.lock().unwrap().is_running = false;
             }
             _ => {
-                // TODO: Make Error Message Passed.
+                // FIXME: Why is error not colored in terminal?
                 return self.present_error(Error::InvalidCommand(main_command.to_string()));
             }
         };
