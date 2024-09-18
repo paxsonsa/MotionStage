@@ -37,8 +37,9 @@ static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7788";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
-        // TODO: Handle Keyboard input and setup basic terminal events
+        // TODO: Setup Log Messaging
         // TODO: Configure debugger and setup server task.
+        // TODO: Button to start and top motion/recording
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
@@ -104,54 +105,47 @@ impl DebuggerCmd {
         //
         // let runtime_handle = runtime.start().await;
         //
-
-        // if crossterm::event::poll(std::time::Duration::from_millis(50))? {
-        //     if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-        //         match key.code {
-        //             crossterm::event::KeyCode::Char('c')
-        //                 if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
-        //             {
-        //                 break;
-        //             }
-        //             crossterm::event::KeyCode::Char(c) => input_text.push(c),
-        //             crossterm::event::KeyCode::Backspace => {
-        //                 input_text.pop();
-        //             }
-        //             crossterm::event::KeyCode::Enter => {
-        //                 if let Ok(_) = screen_state.submit_command(&input_text) {}
-        //                 input_text.clear();
-        //             }
-        //             // Exit on ESC
-        //             crossterm::event::KeyCode::Esc => break,
-        //             // Exit on Ctrl+C
-        //             _ => {}
-        //         }
-        //     }
-        // }
-        // }
     }
 }
 
-pub enum Event {}
+pub enum Event {
+    Init,
+    FocusGained,
+    FocusLost,
+    Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
+    Paste(String),
+    Resize(u16, u16),
+    Tick,
+    Render,
+    Error,
+}
 
-pub enum Action {}
+pub enum Action {
+    Quit,
+}
 
 struct TerminalUI {
     task: tokio::task::JoinHandle<()>,
     terminal: ratatui::Terminal<Backend<std::io::Stderr>>,
     cancellation: tokio_util::sync::CancellationToken,
+    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
 }
 
 impl TerminalUI {
     pub fn new() -> Self {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             task: tokio::task::spawn(async {}),
             terminal: ratatui::Terminal::new(Backend::new(std::io::stderr())).unwrap(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            event_tx,
+            event_rx,
         }
     }
 
-    pub fn show(&self) -> anyhow::Result<()> {
+    pub fn show(&mut self) -> anyhow::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stderr(), EnterAlternateScreen, cursor::Hide)?;
         crossterm::execute!(std::io::stderr(), EnableMouseCapture)?;
@@ -171,7 +165,61 @@ impl TerminalUI {
         Ok(())
     }
 
-    fn start(&self) -> Result<()> {
+    fn start(&mut self) -> Result<()> {
+        // Render 60 times per second
+        let render_rate = tokio::time::Duration::from_secs_f64(1.0 / 60.0);
+        // Process 200 times per second
+        let process_rate = tokio::time::Duration::from_secs_f64(1.0 / 200.0);
+
+        // Stop any existing tasks
+        self.cancel();
+        self.cancellation = tokio_util::sync::CancellationToken::new();
+        let _cancellation_token = self.cancellation.clone();
+        let _event_tx = self.event_tx.clone();
+
+        self.task = tokio::spawn(async move {
+            let mut event_stream = crossterm::event::EventStream::new();
+            let mut process_interval = tokio::time::interval(process_rate);
+            let mut render_interval = tokio::time::interval(render_rate);
+            _event_tx.send(Event::Init).expect("failed to send init");
+
+            loop {
+                let process_tick = process_interval.tick();
+                let render_tick = render_interval.tick();
+                let crossterm_event = event_stream.next().fuse();
+
+                tokio::select! {
+                    _ = _cancellation_token.cancelled() => {
+                        break;
+                    }
+                    maybe_event = crossterm_event => {
+                        match maybe_event {
+                            Some(Ok(e)) => {
+                                match e {
+                                    crossterm::event::Event::FocusGained => _event_tx.send(Event::FocusGained).unwrap(),
+                                    crossterm::event::Event::FocusLost => _event_tx.send(Event::FocusLost).unwrap(),
+                                    crossterm::event::Event::Key(key) => _event_tx.send(Event::Key(key)).unwrap(),
+                                    crossterm::event::Event::Mouse(mouse) => _event_tx.send(Event::Mouse(mouse)).unwrap(),
+                                    crossterm::event::Event::Paste(p) => _event_tx.send(Event::Paste(p)).unwrap(),
+                                    crossterm::event::Event::Resize(x, y) => _event_tx.send(Event::Resize(x, y)).unwrap(),
+                                }
+                            }
+                            Some(Err(e)) => {
+                                _event_tx.send(Event::Error).unwrap();
+                            }
+                            None => {},
+                        }
+                    }
+                    _ = process_tick => {
+                        _event_tx.send(Event::Tick).unwrap();
+                    },
+                    _ = render_tick => {
+                        _event_tx.send(Event::Render).unwrap();
+                    },
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -193,7 +241,7 @@ impl TerminalUI {
     }
 
     pub async fn next(&mut self) -> Option<Event> {
-        None
+        self.event_rx.recv().await
     }
 
     pub fn cancel(&self) {
@@ -271,7 +319,64 @@ impl App {
     }
 
     pub async fn handle_event(&mut self, event: Event) -> Option<Action> {
-        None
+        match event {
+            Event::Init => {
+                tracing::info!("Initialized");
+                None
+            }
+            Event::FocusGained => {
+                tracing::info!("Focus Gained");
+                None
+            }
+            Event::FocusLost => {
+                tracing::info!("Focus Lost");
+                None
+            }
+            Event::Key(key) => {
+                tracing::info!("Key: {:?}", key);
+                match key.code {
+                    crossterm::event::KeyCode::Char('c')
+                        if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
+                    {
+                        Some(Action::Quit)
+                    }
+                    crossterm::event::KeyCode::Char(c) => {
+                        tracing::info!("Char: {}", c);
+                        None
+                    }
+                    crossterm::event::KeyCode::Backspace => None,
+                    crossterm::event::KeyCode::Enter => None,
+                    // Exit on ESC
+                    crossterm::event::KeyCode::Esc => Some(Action::Quit),
+                    // Exit on Ctrl+C
+                    _ => None,
+                }
+            }
+            Event::Mouse(mouse) => {
+                tracing::info!("Mouse: {:?}", mouse);
+                None
+            }
+            Event::Paste(p) => {
+                tracing::info!("Paste: {:?}", p);
+                None
+            }
+            Event::Resize(x, y) => {
+                tracing::info!("Resize: {}, {}", x, y);
+                None
+            }
+            Event::Tick => {
+                tracing::info!("Tick");
+                None
+            }
+            Event::Render => {
+                tracing::info!("Render");
+                None
+            }
+            Event::Error => {
+                tracing::error!("Error");
+                None
+            }
+        }
     }
 
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
@@ -297,7 +402,12 @@ impl App {
     }
 
     pub async fn update(&mut self, action: Action) -> Option<Action> {
-        None
+        match action {
+            Action::Quit => {
+                self.should_quit = true;
+                None
+            }
+        }
     }
 }
 struct LogWriter {
