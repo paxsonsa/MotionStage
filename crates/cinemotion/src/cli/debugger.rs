@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Local};
 use clap::Args;
 use crossterm::{
     cursor,
@@ -8,18 +9,24 @@ use crossterm::{
 use futures::{FutureExt, SinkExt, StreamExt};
 use ratatui::{
     backend::CrosstermBackend as Backend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout},
-    style::{self, Stylize},
+    style::{self, Style, Stylize},
     text::{self, Text, ToLine, ToText},
-    widgets::{Block, Borders, List, ListItem, Padding, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Widget},
     Terminal,
 };
 use std::{
+    collections::HashMap,
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing::{
+    field::{Field, Visit},
+    Subscriber,
+};
+use tracing_subscriber::{fmt, prelude::*, registry::LookupSpan, EnvFilter};
 
 use cinemotion_core::protocol;
 
@@ -38,6 +45,10 @@ static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7788";
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
         // TODO: Setup Log Messaging
+        // Create a ring buffer for the log messages and output that filters the
+        // view to the height of the list view, potentially we should make a custom widget to
+        // handle this. This buffer needs to be hooks up to tracing and to the App message output.
+        // TODO: Add another area for storing the scene graph.
         // TODO: Configure debugger and setup server task.
         // TODO: Button to start and top motion/recording
         crossterm::execute!(
@@ -69,8 +80,17 @@ impl DebuggerCmd {
                 .into(),
             }
         })?;
+        const LOG_CAPACITY: usize = 10000;
+        let log_buffer = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
+        let collector_layer = LogCollector {
+            buffer: Arc::clone(&log_buffer),
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(collector_layer);
+        tracing::subscriber::set_global_default(subscriber)?;
 
-        let mut app = App::default();
+        let mut app = App::new(Arc::clone(&log_buffer));
         app.run().await?;
 
         Ok(0)
@@ -211,6 +231,7 @@ impl TerminalUI {
                         }
                     }
                     _ = process_tick => {
+                        tracing::info!("Hello, World");
                         _event_tx.send(Event::Tick).unwrap();
                     },
                     _ = render_tick => {
@@ -283,15 +304,16 @@ impl Drop for TerminalUI {
 
 struct App {
     should_quit: bool,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self { should_quit: false }
-    }
+    log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
 }
 
 impl App {
+    fn new(log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>) -> Self {
+        Self {
+            should_quit: false,
+            log_buffer,
+        }
+    }
     async fn run(&mut self) -> anyhow::Result<()> {
         let mut tui = TerminalUI::new();
         tui.show()?;
@@ -380,16 +402,13 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let size = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)].as_ref())
-            .split(size);
-
+        let [log_area, input_area] =
+            Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(frame.area());
         // Log window
-        let log_list =
-            List::new(["hello, world."]).block(Block::default().title("Log").borders(Borders::ALL));
-        frame.render_widget(log_list, chunks[0]);
+        let log_widget = LogWidget {
+            buffer: Arc::clone(&self.log_buffer),
+        };
+        frame.render_widget(log_widget, log_area);
 
         // Input field
         let input_paragraph = Paragraph::new("").block(
@@ -398,7 +417,7 @@ impl App {
                 .borders(Borders::ALL)
                 .padding(Padding::left(1)),
         );
-        frame.render_widget(input_paragraph, chunks[1]);
+        frame.render_widget(input_paragraph, input_area);
     }
 
     pub async fn update(&mut self, action: Action) -> Option<Action> {
@@ -410,20 +429,201 @@ impl App {
         }
     }
 }
-struct LogWriter {
-    log: Arc<Mutex<Vec<text::Line<'static>>>>,
+
+struct LogWidget {
+    buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
 }
 
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let log_line = String::from_utf8_lossy(buf).into_owned();
-        let mut logs = self.log.lock().unwrap();
-        logs.push(log_line.into());
-        Ok(buf.len())
+impl Widget for LogWidget {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut Buffer) {
+        let buffer = self.buffer.lock().unwrap();
+        let lines_to_render = area.height as usize;
+        let total_logs = buffer.size;
+        let mut logs_iter = buffer.iter().rev();
+
+        if total_logs > lines_to_render {
+            logs_iter.nth(total_logs - lines_to_render - 1);
+        }
+
+        for (i, event_data) in logs_iter.take(lines_to_render).enumerate() {
+            let fields_str = event_data
+                .fields
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let line = format!(
+                "[{}] [{}] {} {}",
+                event_data.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                event_data.level,
+                event_data.message.as_deref().unwrap_or(""),
+                if fields_str.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("{{{}}}", fields_str)
+                }
+            );
+
+            buf.set_string(
+                area.left(),
+                area.bottom() - 1 - i as u16,
+                line,
+                Style::default(),
+            );
+        }
+    }
+}
+
+struct RingBuffer<T> {
+    buffer: Vec<Option<T>>,
+    capacity: usize,
+    start: usize,
+    size: usize,
+}
+
+impl<T> RingBuffer<T> {
+    fn new(capacity: usize) -> Self {
+        let mut buffer: Vec<Option<T>> = Vec::with_capacity(1000);
+        for _ in 0..capacity {
+            buffer.push(None);
+        }
+        Self {
+            buffer,
+            capacity,
+            start: 0,
+            size: 0,
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn push(&mut self, item: T) {
+        if self.size < self.capacity {
+            let idx = (self.start + self.size) % self.capacity;
+            self.buffer[idx] = Some(item);
+            self.size += 1;
+        } else {
+            self.buffer[self.start] = Some(item);
+            self.start = (self.start + 1) % self.capacity;
+        }
+    }
+    fn iter(&self) -> RingBufferIter<T> {
+        RingBufferIter {
+            buffer: &self.buffer,
+            capacity: self.capacity,
+            start: self.start,
+            size: self.size,
+            index: 0,
+        }
+    }
+}
+
+struct RingBufferIter<'a, T> {
+    buffer: &'a [Option<T>],
+    capacity: usize,
+    start: usize,
+    size: usize,
+    index: usize,
+}
+
+impl<'a, T> Iterator for RingBufferIter<'a, T>
+where
+    T: 'a,
+{
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.size {
+            return None;
+        }
+        let pos = (self.start + self.index) % self.capacity;
+        self.index += 1;
+        self.buffer[pos].as_ref()
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for RingBufferIter<'a, T>
+where
+    T: 'a,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index >= self.size {
+            return None;
+        }
+        let pos = (self.start + self.size - 1 - self.index) % self.capacity;
+        self.index += 1;
+        self.buffer[pos].as_ref()
+    }
+}
+
+#[derive(Default)]
+struct EventVisitor {
+    fields: HashMap<String, String>,
+    message: Option<String>,
+}
+
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name().is_empty() {
+            self.message = Some(format!("{:?}", value));
+        } else {
+            self.fields
+                .insert(field.name().to_string(), format!("{:?}", value));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name().is_empty() {
+            self.message = Some(value.to_string());
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+struct LogEvent {
+    timestamp: DateTime<Local>,
+    level: tracing::Level,
+    message: Option<String>,
+    fields: HashMap<String, String>,
+}
+
+struct LogCollector {
+    buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
+}
+
+impl<S> tracing_subscriber::Layer<S> for LogCollector
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = EventVisitor::default();
+        event.record(&mut visitor);
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.push(LogEvent {
+            timestamp: Local::now(),
+            level: *event.metadata().level(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
     }
 }
 

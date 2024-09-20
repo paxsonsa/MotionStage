@@ -48,6 +48,7 @@ ratatui = "0.28.1"
 typed-builder = "0.20.0"
 tokio-util = "0.7.12"
 signal-hook = "0.3.17"
+chrono.workspace = true
 
 [dev-dependencies]
 paste = "1.0"
