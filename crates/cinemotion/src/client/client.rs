@@ -5,29 +5,30 @@ use thiserror::Error;
 
 use crate::actor::{self, ActorError, HandleExt};
 use crate::engine;
+use crate::error::Error as CrateError;
 use crate::perform_send_with_error_handling;
 use cinemotion_core::protocol;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Id(actor::Responder<Result<u32, ClientError>>),
+    Id(actor::Responder<Result<u32, CrateError>>),
     Init {
         assigned_id: u32,
-        response: actor::Responder<Result<(), ClientError>>,
+        response: actor::Responder<Result<(), CrateError>>,
     },
     Send {
         message: protocol::ServerMessage,
-        response: actor::Responder<Result<(), ClientError>>,
+        response: actor::Responder<Result<(), CrateError>>,
     },
-    State(actor::Responder<Result<State, ClientError>>),
+    State(actor::Responder<Result<State, CrateError>>),
 }
 
 impl Message {
-    pub fn id() -> (Self, actor::Response<Result<u32, ClientError>>) {
+    pub fn id() -> (Self, actor::Response<Result<u32, CrateError>>) {
         let (responder, response) = actor::Response::new();
         (Self::Id(responder), response)
     }
-    pub fn init(id: u32) -> (Self, actor::Response<Result<(), ClientError>>) {
+    pub fn init(id: u32) -> (Self, actor::Response<Result<(), CrateError>>) {
         let (responder, response) = actor::Response::new();
         (
             Self::Init {
@@ -40,7 +41,7 @@ impl Message {
 
     pub fn send(
         message: protocol::ServerMessage,
-    ) -> (Self, actor::Response<Result<(), ClientError>>) {
+    ) -> (Self, actor::Response<Result<(), CrateError>>) {
         let (responder, response) = actor::Response::new();
         (
             Self::Send {
@@ -51,7 +52,7 @@ impl Message {
         )
     }
 
-    pub fn state() -> (Self, actor::Response<Result<State, ClientError>>) {
+    pub fn state() -> (Self, actor::Response<Result<State, CrateError>>) {
         let (responder, response) = actor::Response::new();
         (Self::State(responder), response)
     }
@@ -104,7 +105,7 @@ impl ClientHandle {
     /// Returns the unique identifier for the client.
     ///
     /// This function is used to get the unique identifier (ID) for the client.
-    pub async fn id(&self) -> Result<u32, ClientError> {
+    pub async fn id(&self) -> Result<u32, CrateError> {
         perform_send_with_error_handling!(self, Message::id())
     }
 
@@ -113,7 +114,7 @@ impl ClientHandle {
     /// The client needs to initialize before it can respond to any messages
     /// and work with the engine runtime. This should be the first item after the client
     /// is created.
-    pub async fn initialize(&self, id: u32) -> Result<(), ClientError> {
+    pub async fn initialize(&self, id: u32) -> Result<(), CrateError> {
         perform_send_with_error_handling!(self, Message::init(id))
     }
 
@@ -121,13 +122,13 @@ impl ClientHandle {
     ///
     /// This function is responsible for transmitting messages to the client. If the message is successfully sent, it returns `Ok`, otherwise it returns an `Err`.
     ///
-    pub async fn send_message(&self, message: protocol::ServerMessage) -> Result<(), ClientError> {
+    pub async fn send_message(&self, message: protocol::ServerMessage) -> Result<(), CrateError> {
         tracing::debug!(?message, "sending message to client");
         perform_send_with_error_handling!(self, Message::send(message))
     }
 
     /// Returns the current state of the client.
-    pub async fn state(&self) -> Result<State, ClientError> {
+    pub async fn state(&self) -> Result<State, CrateError> {
         perform_send_with_error_handling!(self, Message::state())
     }
 }
@@ -143,13 +144,14 @@ impl actor::Handle for ClientHandle {
 impl actor::HandleExt for ClientHandle {}
 
 /// `Client` is a generic struct that represents a client in the system.
-pub struct Client<R, W, T, S, Engine, FnSend, FnReceive>
+pub struct Client<R, W, T, S, E, Engine, FnSend, FnReceive>
 where
     R: StreamExt<Item = T> + Unpin,
     W: SinkExt<S> + Unpin,
+    E: Into<CrateError> + 'static,
     Engine: engine::EngineResource,
     FnSend: FnMut(protocol::ServerMessage) -> S + Send + 'static,
-    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
+    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, E> + Send + 'static,
 {
     reader: R,
     writer: W,
@@ -159,13 +161,14 @@ where
     receive_fn: FnReceive,
 }
 
-impl<R, W, T, S, Engine, FnTo, FnFrom> Client<R, W, T, S, Engine, FnTo, FnFrom>
+impl<R, W, T, S, E, Engine, FnTo, FnFrom> Client<R, W, T, S, E, Engine, FnTo, FnFrom>
 where
     R: StreamExt<Item = T> + Unpin,
     W: SinkExt<S> + Unpin,
+    E: Into<CrateError> + 'static,
     Engine: engine::EngineResource,
     FnTo: FnMut(protocol::ServerMessage) -> S + Send + 'static,
-    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Send + 'static,
+    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, E> + Send + 'static,
 {
     /// Create a new client with the given reader and writer for communicating with the network layer.
     pub fn new(reader: R, writer: W, engine: Engine, send_fn: FnTo, receive_fn: FnFrom) -> Self {
@@ -190,7 +193,7 @@ where
     /// Initialize the client connection
     ///
     /// This should be called once the client's connection has been established.
-    pub async fn initialize(&mut self, id: u32) -> Result<(), ClientError> {
+    pub async fn initialize(&mut self, id: u32) -> Result<(), CrateError> {
         self.state.status = Status::Initializing(id);
         match self
             .send_message(
@@ -205,7 +208,7 @@ where
             Ok(_) => Ok(()),
             Err(err) => {
                 tracing::error!(?err, "failed to send init message it client");
-                Err(ClientError::SendError)
+                Err(ClientError::SendError.into())
             }
         }
     }
@@ -214,7 +217,7 @@ where
     ///
     /// No messages will be passed through, even if the client is still connected at the network
     /// level.
-    pub async fn disconnect(&mut self) -> Result<(), ClientError> {
+    pub async fn disconnect(&mut self) -> Result<(), CrateError> {
         tracing::debug!("disconnecting client");
         if let Err(err) = self.engine.remove_client(self.id().unwrap()).await {
             tracing::error!(?err, "failed to remove client from engine");
@@ -229,12 +232,12 @@ where
     pub async fn send_message(
         &mut self,
         message: protocol::ServerMessage,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), CrateError> {
         let message = (self.send_fn)(message);
         self.writer
             .send(message)
             .await
-            .map_err(|err| ClientError::SendError)?;
+            .map_err(|_| -> CrateError { ClientError::SendError.into() })?;
         Ok(())
     }
 
@@ -242,13 +245,13 @@ where
     ///
     /// This function is responsible for receiving messages from the client and processing them.
     /// The message is then passed to the engine for processing.
-    pub async fn receive_message(&mut self, message: T) -> Result<(), ClientError> {
+    pub async fn receive_message(&mut self, message: T) -> Result<(), CrateError> {
         let Some(id) = self.id() else {
-            return Err(ClientError::UndefinedState);
+            return Err(ClientError::UndefinedState.into());
         };
-        let message = (self.receive_fn)(message)?;
+        let message = (self.receive_fn)(message).map_err(Into::<CrateError>::into)?;
         let Some(message) = message.body else {
-            return Err(ClientError::BadMessage(format!("missing message body")));
+            return Err(ClientError::BadMessage(format!("missing message body")).into());
         };
         match message {
             protocol::client_message::Body::DeviceInitAck(_) => {
@@ -259,7 +262,7 @@ where
                     body: Some(protocol::server_message::Body::Pong(protocol::Pong {})),
                 })
                 .await
-                .map_err(|err| ClientError::SendError)?;
+                .map_err(|_| CrateError::ClientError(ClientError::SendError.into()))?;
                 self.engine
                     .apply(id, message)
                     .await
@@ -277,15 +280,17 @@ where
 }
 
 #[async_trait]
-impl<R, W, T, S, Engine, FnTo, FnFrom> actor::Actor for Client<R, W, T, S, Engine, FnTo, FnFrom>
+impl<R, W, T, S, E, Engine, FnTo, FnFrom> actor::Actor
+    for Client<R, W, T, S, E, Engine, FnTo, FnFrom>
 where
     T: Sync + Send,
     S: Sync + Send,
     R: StreamExt<Item = T> + Unpin + Send + Sync,
     W: SinkExt<S> + Unpin + Send + Sync,
+    E: Into<CrateError> + 'static,
     Engine: engine::EngineResource + Send + Send,
     FnTo: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
-    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
+    FnFrom: FnMut(T) -> Result<protocol::ClientMessage, E> + Sync + Send + 'static,
 {
     type Message = Message;
     type Handle = ClientHandle;
@@ -293,7 +298,11 @@ where
         match message {
             Message::Id(response) => match self.id() {
                 Some(id) => response.dispatch(Ok(id)).await,
-                None => response.dispatch(Err(ClientError::UndefinedState)).await,
+                None => {
+                    response
+                        .dispatch(Err(ClientError::UndefinedState.into()))
+                        .await
+                }
             },
             // Requesting to initialize the client
             Message::Init {
@@ -324,7 +333,7 @@ where
 
         if let Err(err) = self.receive_message(msg).await {
             tracing::error!(?err, "failed to receive message from client reader");
-            if let ClientError::Disconnected = err {
+            if let CrateError::ClientError(ClientError::Disconnected) = err {
                 if let Err(err) = self.disconnect().await {
                     tracing::error!(?err, "failed to disconnect client");
                 }
@@ -336,7 +345,7 @@ where
 }
 
 /// Spawn a new client with the given reader and writer for communicating with the network layer
-pub fn spawn<R, W, T, S, Engine, FnSend, FnReceive>(
+pub fn spawn<R, W, T, S, E, Engine, FnSend, FnReceive>(
     reader: R,
     writer: W,
     engine: Engine,
@@ -348,9 +357,10 @@ where
     S: Sync + Send + 'static,
     R: StreamExt<Item = T> + Unpin + Send + Sync + 'static,
     W: SinkExt<S> + Unpin + Send + Sync + 'static,
+    E: Into<CrateError> + 'static,
     Engine: engine::EngineResource + Send + 'static,
     FnSend: FnMut(protocol::ServerMessage) -> S + Sync + Send + 'static,
-    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, ClientError> + Sync + Send + 'static,
+    FnReceive: FnMut(T) -> Result<protocol::ClientMessage, E> + Sync + Send + 'static,
 {
     let model = Client::new(reader, writer, engine, send_fn, receive_fn);
     actor::spawn(model, move |sender| ClientHandle { sender })

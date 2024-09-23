@@ -35,7 +35,7 @@ impl From<u32> for DeviceId {
     }
 }
 
-#[derive(Component, Clone)]
+#[derive(Debug, Component, Clone)]
 pub struct Device {
     pub id: DeviceId,
     pub name: Name,

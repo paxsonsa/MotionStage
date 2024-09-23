@@ -68,7 +68,6 @@ impl Into<protocol::AttributeLink> for attributes::AttributeLink {
         }
     }
 }
-
 /// Implements the conversion from `protocol::AttributeValue` to `attributes::AttributeValue`.
 /// This conversion may fail, in which case an `error::Error` is returned.
 impl TryFrom<protocol::AttributeValue> for attributes::AttributeValue {
@@ -289,6 +288,107 @@ impl Into<protocol::DeviceState> for devices::Device {
         protocol::DeviceState {
             name: self.name.to_string(),
             attributes,
+        }
+    }
+}
+
+impl From<protocol::State> for state::StateTree {
+    fn from(proto_state: protocol::State) -> Self {
+        state::StateTree {
+            utime: proto_state.utime as u128,
+            session: proto_state
+                .session
+                .map(|s| s.into())
+                .expect("session state is missing."),
+            devices: proto_state
+                .devices
+                .into_iter()
+                .map(|(id, device)| {
+                    (
+                        id,
+                        devices::Device {
+                            id: id.clone().into(),
+                            name: device.name.into(),
+                            attributes: device
+                                .attributes
+                                .into_iter()
+                                .map(|attr| -> attributes::Attribute {
+                                    attr.try_into().expect("attribute conversion failed")
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+            scene: proto_state
+                .scene
+                .map(|s| s.into())
+                .expect("scene state is missing."),
+        }
+    }
+}
+
+impl Into<protocol::SessionState> for state::SessionState {
+    fn into(self) -> protocol::SessionState {
+        protocol::SessionState {
+            motion_enabled: self.motion_enabled,
+        }
+    }
+}
+
+impl From<protocol::SessionState> for state::SessionState {
+    fn from(proto_session: protocol::SessionState) -> Self {
+        state::SessionState {
+            motion_enabled: proto_session.motion_enabled,
+        }
+    }
+}
+
+impl From<protocol::SceneState> for state::SceneState {
+    fn from(proto_scene: protocol::SceneState) -> Self {
+        state::SceneState {
+            // TODO: Implement SceneInfo conversion
+            info: scene::SceneInfo {
+                name: "Default".into(),
+            },
+            objects: proto_scene
+                .objects
+                .into_iter()
+                .map(|obj| obj.into())
+                .collect(),
+        }
+    }
+}
+
+impl From<protocol::SceneObjectState> for scene::SceneObject {
+    fn from(proto_obj: protocol::SceneObjectState) -> Self {
+        scene::SceneObject {
+            name: proto_obj.name.into(),
+            attributes: proto_obj
+                .attributes
+                .into_iter()
+                .map(|attr| -> Result<attributes::Attribute, error::Error> { attr.try_into() })
+                .take_while(Result::is_ok)
+                .map(Result::unwrap)
+                .map(|attr| (attr.name().clone(), attr))
+                .collect(),
+            links: proto_obj
+                .links
+                .into_iter()
+                .map(|link| -> Result<attributes::AttributeLink, error::Error> { link.try_into() })
+                .take_while(Result::is_ok)
+                .map(Result::unwrap)
+                .map(|link| (link.attribute().clone().into(), link.into()))
+                .collect::<HashMap<name::Name, attributes::AttributeLink>>(),
+        }
+    }
+}
+
+impl From<protocol::ServerMessage> for state::StateTree {
+    fn from(proto_msg: protocol::ServerMessage) -> Self {
+        match proto_msg.body {
+            Some(protocol::server_message::Body::State(state)) => state.into(),
+            _ => panic!("Invalid ServerMessage body"),
         }
     }
 }

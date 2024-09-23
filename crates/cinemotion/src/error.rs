@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("actor error occured: {0}")]
     ActorError(#[from] crate::actor::ActorError),
@@ -9,7 +9,7 @@ pub enum Error {
     ClientError(#[from] crate::client::ClientError),
 
     #[error("connection error occured: {0}")]
-    ConnectionError(#[from] tokio_tungstenite::tungstenite::Error),
+    ConnectionError(String),
 }
 
 pub type Result<T> = std::result::Result<T, self::Error>;

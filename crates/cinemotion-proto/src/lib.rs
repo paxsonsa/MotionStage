@@ -70,6 +70,28 @@ macro_rules! impl_from_client_body {
     };
 }
 
+macro_rules! impl_into_client_message {
+    ($type:ident) => {
+        impl Into<ClientMessage> for $type {
+            fn into(self) -> ClientMessage {
+                ClientMessage {
+                    body: Some(client_message::Body::$type(self)),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_from_server_body {
+    ($type:ident) => {
+        impl From<$type> for server_message::Body {
+            fn from(message: $type) -> Self {
+                server_message::Body::$type(message)
+            }
+        }
+    };
+}
+
 macro_rules! impl_into_server_message {
     ($type:ident) => {
         impl From<$type> for ServerMessage {
@@ -82,7 +104,12 @@ macro_rules! impl_into_server_message {
     };
 }
 impl_into_server_message!(Error);
+impl_from_server_body!(Error);
 impl_into_server_message!(Ping);
+impl_from_server_body!(Ping);
 impl_into_server_message!(Pong);
+impl_from_server_body!(Pong);
 impl_into_server_message!(DeviceInit);
+impl_from_server_body!(DeviceInit);
 impl_from_client_body!(DeviceInitAck);
+impl_into_client_message!(DeviceInitAck);

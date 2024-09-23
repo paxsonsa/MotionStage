@@ -51,6 +51,16 @@ impl Into<HashMap<Name, Attribute>> for AttributeMap {
     }
 }
 
+impl FromIterator<Attribute> for AttributeMap {
+    fn from_iter<T: IntoIterator<Item = Attribute>>(iter: T) -> Self {
+        let mut map = HashMap::new();
+        for attr in iter {
+            map.insert(attr.name.clone(), attr);
+        }
+        map.into()
+    }
+}
+
 #[derive(Clone, Component)]
 pub struct AttributeLinkMap(HashMap<Name, AttributeLink>);
 

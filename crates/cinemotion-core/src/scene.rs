@@ -5,7 +5,7 @@ use std::{collections::HashMap, ops::Deref};
 #[path = "scene_test.rs"]
 mod scene_test;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SceneInfo {
     pub name: Name,
 }
@@ -33,7 +33,7 @@ impl From<u32> for ObjectId {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SceneObject {
     pub name: Name,
     pub attributes: HashMap<Name, Attribute>,

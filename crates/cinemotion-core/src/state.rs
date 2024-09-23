@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crate::devices::Device;
 use crate::scene::{SceneInfo, SceneObject};
 use crate::world::World;
-use crate::{devices, globals, protocol, scene};
+use crate::{devices, globals, scene};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct StateTree {
     /// The time this state was generated
     pub utime: u128,
@@ -45,20 +45,12 @@ impl StateTree {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SessionState {
-    motion_enabled: bool,
+    pub motion_enabled: bool,
 }
 
-impl Into<protocol::SessionState> for SessionState {
-    fn into(self) -> protocol::SessionState {
-        protocol::SessionState {
-            motion_enabled: self.motion_enabled,
-        }
-    }
-}
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SceneState {
     pub info: scene::SceneInfo,
     pub objects: Vec<SceneObject>,

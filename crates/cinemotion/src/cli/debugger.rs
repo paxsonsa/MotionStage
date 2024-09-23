@@ -28,7 +28,7 @@ use tracing::{
 };
 use tracing_subscriber::{fmt, prelude::*, registry::LookupSpan, EnvFilter};
 
-use cinemotion_core::protocol;
+use cinemotion::protocol;
 
 #[derive(Args)]
 pub struct DebuggerCmd {
@@ -40,17 +40,13 @@ pub struct DebuggerCmd {
     objects_spec_path: Option<PathBuf>,
 }
 
-static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7788";
+static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7878";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
-        // TODO: Setup Log Messaging
-        // Create a ring buffer for the log messages and output that filters the
-        // view to the height of the list view, potentially we should make a custom widget to
-        // handle this. This buffer needs to be hooks up to tracing and to the App message output.
-        // TODO: Add another area for storing the scene graph.
         // TODO: Configure debugger and setup server task.
         // TODO: Button to start and top motion/recording
+        // TODO: Add another area for storing the scene graph.
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
@@ -90,27 +86,10 @@ impl DebuggerCmd {
             .with(collector_layer);
         tracing::subscriber::set_global_default(subscriber)?;
 
-        let mut app = App::new(Arc::clone(&log_buffer));
+        let mut app = App::new(address, device_spec, Arc::clone(&log_buffer));
         app.run().await?;
 
         Ok(0)
-        // Create shared screen state and log holder
-        // let log = vec![];
-        // let log = Arc::new(Mutex::new(log));
-        // let log_for_tracing = Arc::clone(&log);
-        // let screen_state = Arc::new(Screen {
-        //     app: Arc::new(Mutex::new(App::default())),
-        //     log,
-        // });
-        //
-        // // Set up tracing subscriber with custom log writer
-        // let subscriber = tracing_subscriber::registry()
-        //     .with(tracing_subscriber::EnvFilter::new("info"))
-        //     .with(fmt::Layer::new().with_writer(Box::new(move || LogWriter {
-        //         log: Arc::clone(&log_for_tracing),
-        //     })));
-        // tracing::subscriber::set_global_default(subscriber)?;
-
         // let conn = cinemotion::connect(address.clone()).await?;
         // let runtime = cinemotion::Runtime::<_>::builder()
         //     .name("cinemotion-debugger".to_string())
@@ -142,6 +121,7 @@ pub enum Event {
 }
 
 pub enum Action {
+    AckInit(u32),
     Quit,
 }
 
@@ -186,10 +166,10 @@ impl TerminalUI {
     }
 
     fn start(&mut self) -> Result<()> {
-        // Render 60 times per second
-        let render_rate = tokio::time::Duration::from_secs_f64(1.0 / 60.0);
+        // Render 5 times per second
+        let render_rate = tokio::time::Duration::from_secs_f64(1.0 / 5.0);
         // Process 200 times per second
-        let process_rate = tokio::time::Duration::from_secs_f64(1.0 / 200.0);
+        let process_rate = tokio::time::Duration::from_secs_f64(1.0 / 5.0);
 
         // Stop any existing tasks
         self.cancel();
@@ -231,7 +211,6 @@ impl TerminalUI {
                         }
                     }
                     _ = process_tick => {
-                        tracing::info!("Hello, World");
                         _event_tx.send(Event::Tick).unwrap();
                     },
                     _ = render_tick => {
@@ -303,32 +282,53 @@ impl Drop for TerminalUI {
 }
 
 struct App {
+    address: String,
+    device: protocol::DeviceSpec,
     should_quit: bool,
     log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
 }
 
 impl App {
-    fn new(log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>) -> Self {
+    fn new(
+        address: String,
+        device: protocol::DeviceSpec,
+        log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
+    ) -> Self {
         Self {
+            address,
+            device,
             should_quit: false,
             log_buffer,
         }
     }
     async fn run(&mut self) -> anyhow::Result<()> {
+        tracing::info!("initializing runtime.");
+        let connection = cinemotion::connect(self.address.clone()).await?;
+        let config = cinemotion::Config::builder()
+            .with_name("cinemotion-default".to_string())
+            .with_connection(connection)
+            .build();
+        let mut runtime = cinemotion::runtime(config).start().await;
+
         let mut tui = TerminalUI::new();
         tui.show()?;
 
         loop {
-            tui.draw(|f| {
-                self.render(f);
-            })?;
-
-            if let Some(event) = tui.next().await {
-                let mut maybe_action = self.handle_event(event).await;
-                while let Some(action) = maybe_action {
-                    maybe_action = self.update(action).await;
-                }
-            };
+            tokio::select! {
+                Some(event) = tui.next() => {
+                    let mut maybe_action = self.handle_event(&mut tui, event).await;
+                    while let Some(action) = maybe_action {
+                        maybe_action = self.update(&mut runtime, action).await;
+                    }
+                },
+                Some(event) = runtime.next() => {
+                    tracing::info!("runtime message: {:?}", event);
+                    let mut maybe_action = self.handle_runtime_event(event).await;
+                    while let Some(action) = maybe_action {
+                        maybe_action = self.update(&mut runtime, action).await;
+                    }
+                },
+            }
 
             if self.should_quit {
                 break;
@@ -340,7 +340,7 @@ impl App {
         Ok(())
     }
 
-    pub async fn handle_event(&mut self, event: Event) -> Option<Action> {
+    pub async fn handle_event(&mut self, tui: &mut TerminalUI, event: Event) -> Option<Action> {
         match event {
             Event::Init => {
                 tracing::info!("Initialized");
@@ -355,8 +355,8 @@ impl App {
                 None
             }
             Event::Key(key) => {
-                tracing::info!("Key: {:?}", key);
                 match key.code {
+                    // Exit on Ctrl+C
                     crossterm::event::KeyCode::Char('c')
                         if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
                     {
@@ -364,13 +364,13 @@ impl App {
                     }
                     crossterm::event::KeyCode::Char(c) => {
                         tracing::info!("Char: {}", c);
+
                         None
                     }
                     crossterm::event::KeyCode::Backspace => None,
                     crossterm::event::KeyCode::Enter => None,
                     // Exit on ESC
                     crossterm::event::KeyCode::Esc => Some(Action::Quit),
-                    // Exit on Ctrl+C
                     _ => None,
                 }
             }
@@ -386,12 +386,13 @@ impl App {
                 tracing::info!("Resize: {}, {}", x, y);
                 None
             }
-            Event::Tick => {
-                tracing::info!("Tick");
-                None
-            }
+            Event::Tick => None,
             Event::Render => {
-                tracing::info!("Render");
+                tui.draw(|f| {
+                    self.render(f);
+                })
+                .expect("render should not fail to process");
+
                 None
             }
             Event::Error => {
@@ -401,7 +402,17 @@ impl App {
         }
     }
 
-    pub fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+    async fn handle_runtime_event(&mut self, event: cinemotion::RuntimeEvent) -> Option<Action> {
+        match event {
+            cinemotion::RuntimeEvent::DeviceInit { version, id } => Some(Action::AckInit(id)),
+            cinemotion::RuntimeEvent::StateChange(state) => {
+                tracing::info!(?state, "state update");
+                None
+            }
+        }
+    }
+
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let [log_area, input_area] =
             Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(frame.area());
         // Log window
@@ -420,8 +431,16 @@ impl App {
         frame.render_widget(input_paragraph, input_area);
     }
 
-    pub async fn update(&mut self, action: Action) -> Option<Action> {
+    async fn update(
+        &mut self,
+        runtime: &mut cinemotion::Runtime<cinemotion::Running>,
+        action: Action,
+    ) -> Option<Action> {
         match action {
+            Action::AckInit(_) => {
+                runtime.init(self.device.clone()).await;
+                None
+            }
             Action::Quit => {
                 self.should_quit = true;
                 None
@@ -439,10 +458,10 @@ impl Widget for LogWidget {
         let buffer = self.buffer.lock().unwrap();
         let lines_to_render = area.height as usize;
         let total_logs = buffer.size;
-        let mut logs_iter = buffer.iter().rev();
+        let mut logs_iter = buffer.iter();
 
         if total_logs > lines_to_render {
-            logs_iter.nth(total_logs - lines_to_render - 1);
+            logs_iter.nth(total_logs - lines_to_render);
         }
 
         for (i, event_data) in logs_iter.take(lines_to_render).enumerate() {
@@ -465,12 +484,7 @@ impl Widget for LogWidget {
                 }
             );
 
-            buf.set_string(
-                area.left(),
-                area.bottom() - 1 - i as u16,
-                line,
-                Style::default(),
-            );
+            buf.set_string(area.left(), area.top() + i as u16, line, Style::default());
         }
     }
 }

@@ -1,76 +1,84 @@
-use crate::actor::{spawn, Actor, ActorError, Event, Handle, Sender, Signal};
-use async_trait::async_trait;
-use futures::stream::{SplitSink, SplitStream};
-use futures::StreamExt;
-use tokio_tungstenite::{tungstenite, MaybeTlsStream, WebSocketStream};
-use tracing;
+pub use crate::websocket::{connect, Connection};
+pub use cinemotion_core::protocol;
 
-#[derive(Debug)]
-pub struct Connection {
-    pub(crate) reader: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
-    pub(crate) writer: futures::stream::SplitSink<
-        WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-        tungstenite::Message,
-    >,
-}
-
-pub async fn connect(address: String) -> Result<Connection, crate::Error> {
-    let (ws, _) = tokio_tungstenite::connect_async(address)
-        .await
-        .map_err(|err| {
-            tracing::error!(?err, "Failed to connect to server.");
-            crate::Error::ConnectionError(err)
-        })?;
-    let (ws_writer, ws_reader) = ws.split();
-    Ok(Connection {
-        reader: ws_reader,
-        writer: ws_writer,
-    })
-}
+pub struct Running;
+pub struct Stopped;
 
 #[derive(typed_builder::TypedBuilder)]
-pub struct Runtime<Handler>
-where
-    Handler: FnMut(Message) -> std::pin::Pin<Box<dyn futures::Future<Output = Option<()>> + Send>>
-        + Send
-        + 'static,
-{
-    name: String,
-    connection: Connection,
-    runtime_fn: Box<Handler>,
+#[builder(field_defaults(setter(prefix = "with_")))]
+pub struct Config {
+    pub name: String,
+    pub connection: Connection,
 }
 
-impl<Handler> Runtime<Handler>
-where
-    Handler: FnMut(Message) -> std::pin::Pin<Box<dyn futures::Future<Output = Option<()>> + Send>>
-        + Send
-        + 'static,
-{
-    pub async fn start(mut self) -> RuntimeHandle {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // Receive messages from the network connection
-                    msg = self.connection.reader.next() => {
+#[derive(Debug)]
+pub enum RuntimeEvent {
+    DeviceInit { version: u32, id: u32 },
+    StateChange(cinemotion_core::state::StateTree),
+}
 
-                    },
-                    // Receive messages from the runtime handle.
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {}
-                            None => {
-                                // TODO: Shutdown the service
-                                return;
-                            }
-                        }
+pub struct Runtime<State> {
+    id: u32,
+    config: Config,
+    handle: tokio::task::JoinHandle<()>,
+    _state: std::marker::PhantomData<State>,
+}
 
-                    }
+pub fn runtime(config: Config) -> Runtime<Stopped> {
+    Runtime::<Stopped> {
+        id: 0,
+        config,
+        handle: tokio::task::spawn(async {}),
+        _state: std::marker::PhantomData,
+    }
+}
+
+impl<Stopped> Runtime<Stopped> {
+    pub async fn start(self) -> Runtime<Running> {
+        let handle = tokio::task::spawn(async move {});
+        Runtime::<Running> {
+            id: 0,
+            config: self.config,
+            handle,
+            _state: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Running> Runtime<Running> {
+    pub async fn init(&mut self, device_spec: protocol::DeviceSpec) {
+        self.config
+            .connection
+            .write(
+                protocol::DeviceInitAck {
+                    device_spec: Some(device_spec),
+                }
+                .into(),
+            )
+            .await
+            .expect("failed to send message");
+    }
+
+    pub async fn next(&mut self) -> Option<RuntimeEvent> {
+        self.config.connection.next().await.and_then(|msg| {
+            let Some(body) = msg.body else {
+                return None;
+            };
+            match body {
+                protocol::server_message::Body::Error(err) => None,
+                protocol::server_message::Body::Ping(_) => None,
+                protocol::server_message::Body::Pong(_) => None,
+                protocol::server_message::Body::DeviceInit(init) => {
+                    Some(RuntimeEvent::DeviceInit {
+                        version: init.version,
+                        id: init.id,
+                    })
+                }
+                protocol::server_message::Body::State(state) => {
+                    Some(RuntimeEvent::StateChange(state.into()))
                 }
             }
-        });
-
-        RuntimeHandle { tx }
+        })
     }
 }
 
@@ -84,56 +92,4 @@ pub enum Message {
     Log(String),
     Command(String),
     // Add more message types as needed
-}
-
-struct CinemotionActor {
-    sender: Sender<Message>,
-}
-
-impl CinemotionActor {
-    pub fn new(sender: Sender<Message>) -> Self {
-        Self { sender }
-    }
-}
-
-#[async_trait]
-impl Actor for CinemotionActor {
-    type Handle = Cinemotion;
-    type Message = Message;
-
-    async fn handle_message(&mut self, message: Self::Message) -> Option<Signal> {
-        match message {
-            Message::Log(log) => {
-                tracing::info!("Log: {}", log);
-            }
-            Message::Command(cmd) => {
-                tracing::info!("Command: {}", cmd);
-                // Handle command
-            }
-        }
-        None
-    }
-}
-
-/// TODO: The cinemotion client needs to have an interface that matches the basic actions we expect
-/// to take for the cinemotion interface for Python.
-
-#[derive(Clone)]
-pub struct Cinemotion {
-    sender: Sender<Message>,
-}
-
-#[async_trait]
-impl Handle for Cinemotion {
-    type Message = Message;
-
-    fn sender(&self) -> Sender<Self::Message> {
-        self.sender.clone()
-    }
-}
-
-impl Cinemotion {
-    pub fn new(sender: Sender<Message>) -> Self {
-        Self { sender }
-    }
 }
