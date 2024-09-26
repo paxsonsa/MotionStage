@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::{DateTime, Local};
 use clap::Args;
 use crossterm::{
@@ -6,15 +6,13 @@ use crossterm::{
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     backend::CrosstermBackend as Backend,
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout},
-    style::{self, Style, Stylize},
-    text::{self, Text, ToLine, ToText},
-    widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Widget},
-    Terminal,
+    layout::{Constraint, Layout},
+    style::Style,
+    widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 use std::{
     collections::HashMap,
@@ -26,7 +24,7 @@ use tracing::{
     field::{Field, Visit},
     Subscriber,
 };
-use tracing_subscriber::{fmt, prelude::*, registry::LookupSpan, EnvFilter};
+use tracing_subscriber::{prelude::*, registry::LookupSpan, EnvFilter};
 
 use cinemotion::protocol;
 
@@ -86,20 +84,6 @@ impl DebuggerCmd {
         app.run().await?;
 
         Ok(0)
-        // let conn = cinemotion::connect(address.clone()).await?;
-        // let runtime = cinemotion::Runtime::<_>::builder()
-        //     .name("cinemotion-debugger".to_string())
-        //     .connection(conn)
-        //     .runtime_fn(Box::new(|message| {
-        //         Box::pin(async move {
-        //             None
-        //         })
-        //             as std::pin::Pin<Box<dyn future::Future<Output = Option<()>> + Send>>
-        //     }))
-        //     .build();
-        //
-        // let runtime_handle = runtime.start().await;
-        //
     }
 }
 
@@ -214,7 +198,7 @@ impl TerminalUI {
                                     crossterm::event::Event::Resize(x, y) => _event_tx.send(Event::Resize(x, y)).unwrap(),
                                 }
                             }
-                            Some(Err(e)) => {
+                            Some(Err(_)) => {
                                 _event_tx.send(Event::Error).unwrap();
                             }
                             None => {},
@@ -413,7 +397,7 @@ impl App {
 
     async fn handle_runtime_event(&mut self, event: cinemotion::RuntimeEvent) -> Option<Action> {
         match event {
-            cinemotion::RuntimeEvent::DeviceInit { version, id } => Some(Action::AckInit(id)),
+            cinemotion::RuntimeEvent::DeviceInit { version: _, id } => Some(Action::AckInit(id)),
             cinemotion::RuntimeEvent::StateChange(state) => {
                 tracing::info!(?state, "state update");
                 None
@@ -446,8 +430,8 @@ impl App {
         action: Action,
     ) -> Option<Action> {
         match action {
-            Action::AckInit(_) => {
-                runtime.init(self.device.clone()).await;
+            Action::AckInit(id) => {
+                runtime.init(id, self.device.clone()).await;
                 None
             }
             Action::Quit => {
@@ -664,16 +648,6 @@ where
         }
         None => Ok(default_fn()),
     }
-}
-
-fn convert_message(
-    body: cinemotion_proto::client_message::Body,
-) -> tokio_tungstenite::tungstenite::Message {
-    let msg = cinemotion_proto::ClientMessage { body: Some(body) };
-    let data: bytes::Bytes = msg
-        .try_into()
-        .expect("failed to generate bytes for protocol message");
-    tokio_tungstenite::tungstenite::Message::binary(data)
 }
 
 pub fn init_panic_hook() {

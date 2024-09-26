@@ -1,5 +1,3 @@
-use thiserror::Error;
-
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("connection error occured: {0}")]

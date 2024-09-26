@@ -1,5 +1,6 @@
 use super::*;
 use cinemotion_core::name;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_motion_mode() {

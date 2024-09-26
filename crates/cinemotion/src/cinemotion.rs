@@ -46,7 +46,8 @@ impl<Stopped> Runtime<Stopped> {
 }
 
 impl<Running> Runtime<Running> {
-    pub async fn init(&mut self, device_spec: protocol::DeviceSpec) {
+    pub async fn init(&mut self, id: u32, device_spec: protocol::DeviceSpec) {
+        self.id = id;
         self.config
             .connection
             .write(protocol::ClientMessage {

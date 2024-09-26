@@ -1,4 +1,3 @@
-#![feature(decl_macro)]
 use bevy_ecs::prelude::*;
 use derive_more::Display;
 use std::{ops::Deref, sync::Arc};

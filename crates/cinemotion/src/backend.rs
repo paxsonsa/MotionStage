@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use cinemotion_core::devices;
 use cinemotion_core::error::*;
 use cinemotion_core::globals;
@@ -12,6 +10,7 @@ use cinemotion_core::state::*;
 #[path = "backend_test.rs"]
 mod backend_test;
 
+#[allow(async_fn_in_trait)]
 pub trait Backend {
     async fn reserve_device_id(&mut self) -> u32;
     async fn apply(&mut self, client: u32, message: protocol::client_message::Body) -> Result<()>;
