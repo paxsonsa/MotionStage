@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod cinemotion;
 pub mod client;
 pub mod engine;

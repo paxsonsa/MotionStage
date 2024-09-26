@@ -1,3 +1,4 @@
+use crate::backend;
 use crate::client::ConnectionHandle;
 use cinemotion_core as core;
 use core::protocol;
@@ -12,13 +13,19 @@ pub enum EngineEvent {
     Error(EngineError),
 }
 
-pub struct Engine {
+pub struct Engine<Backend>
+where
+    Backend: backend::Backend,
+{
     interval: tokio::time::Interval,
-    inner: core::session::Session,
+    inner: Box<Backend>,
     device_id_table: HashMap<u32, u32>,
 }
 
-impl Engine {
+impl<Backend> Engine<Backend>
+where
+    Backend: backend::Backend,
+{
     pub async fn apply<Client: ConnectionHandle>(
         &mut self,
         client: &mut Box<Client>,
@@ -93,9 +100,12 @@ pub enum EngineError {
 }
 
 /// Spawns a new EngineActor and returns its handle.
-pub fn spawn() -> Engine {
+pub fn spawn<Backend>(backend: Backend) -> Engine<Backend>
+where
+    Backend: backend::Backend,
+{
     Engine {
-        inner: core::session::Session::new(),
+        inner: Box::new(backend),
         interval: tokio::time::interval(tokio::time::Duration::from_secs_f64(1.0 / 120.0)),
         device_id_table: Default::default(),
     }

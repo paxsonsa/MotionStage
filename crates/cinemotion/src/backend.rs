@@ -1,27 +1,34 @@
 use std::collections::HashMap;
 
-use crate::devices;
-use crate::error::*;
-use crate::globals;
-use crate::prelude::*;
-use crate::protocol;
-use crate::protocol::client_message::Body as ClientBody;
-use crate::state::*;
+use cinemotion_core::devices;
+use cinemotion_core::error::*;
+use cinemotion_core::globals;
+use cinemotion_core::prelude::*;
+use cinemotion_core::protocol;
+use cinemotion_core::protocol::client_message::Body as ClientBody;
+use cinemotion_core::state::*;
 
 #[cfg(test)]
-#[path = "session_test.rs"]
-mod session_test;
+#[path = "backend_test.rs"]
+mod backend_test;
 
-pub struct Session {
+pub trait Backend {
+    async fn reserve_device_id(&mut self) -> u32;
+    async fn apply(&mut self, client: u32, message: protocol::client_message::Body) -> Result<()>;
+    async fn update(&mut self) -> Result<StateTree>;
+    async fn remove_client(&mut self, client: u32) -> Result<()>;
+}
+
+pub struct DefaultBackend {
     world: World,
 }
 
-impl Session {
+impl DefaultBackend {
     pub fn new() -> Self {
         let mut world = world::new();
         scene::system::init(&mut world);
 
-        Session {
+        DefaultBackend {
             world: world::new(),
         }
     }
@@ -29,24 +36,28 @@ impl Session {
     pub fn get_world_mut(&mut self) -> &mut World {
         &mut self.world
     }
+}
 
+impl Default for DefaultBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Backend for DefaultBackend {
     /// Remove the client entity
-    pub async fn remove_client(&mut self, client: u32) -> Result<()> {
+    async fn remove_client(&mut self, client: u32) -> Result<()> {
         scene::system::remove_device_links(&mut self.world, client.clone())?;
         devices::system::remove_device_by_id(&mut self.world, client.into());
         Ok(())
     }
 
     /// Reserve a engine entity and return the ID.
-    pub async fn reserve_device_id(&mut self) -> u32 {
+    async fn reserve_device_id(&mut self) -> u32 {
         world::reserve_entity(&mut self.world)
     }
 
-    pub async fn apply(
-        &mut self,
-        client: u32,
-        message: protocol::client_message::Body,
-    ) -> Result<()> {
+    async fn apply(&mut self, client: u32, message: protocol::client_message::Body) -> Result<()> {
         tracing::trace!(client, ?message, "applying message to session");
         match message {
             ClientBody::MotionSetMode(model) => {
@@ -67,7 +78,7 @@ impl Session {
         }
     }
 
-    pub async fn update(&mut self) -> Result<StateTree> {
+    async fn update(&mut self) -> Result<StateTree> {
         let world = &mut self.world;
         scene::system::update(world)?;
         let state = StateTree::new(&mut self.world);

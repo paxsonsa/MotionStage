@@ -1,10 +1,8 @@
 mod attributes;
 pub mod devices;
-mod error;
-pub mod session;
-#[macro_use]
+pub mod error;
+pub mod globals;
 pub mod name;
-mod globals;
 pub mod prelude;
 mod protocol_ext;
 pub mod scene;

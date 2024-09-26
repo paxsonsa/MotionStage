@@ -190,7 +190,7 @@ pub mod system {
         }
     }
 
-    pub(crate) fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
+    pub fn get<'a>(world: &'a mut World, id: &DeviceId) -> Option<DeviceEntityRef> {
         let entity = Entity::from_raw(**id);
         let Some(entity_ref) = world.get_entity(entity) else {
             return None;
@@ -202,7 +202,7 @@ pub mod system {
         return Some(DeviceEntityRef { entity });
     }
 
-    pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {
+    pub fn get_all<'a>(world: &'a mut World) -> Vec<DeviceEntityRef> {
         world
             .query::<(&DeviceEntity, Entity)>()
             .iter(&world)
@@ -210,7 +210,7 @@ pub mod system {
             .collect::<Vec<_>>()
     }
 
-    pub(crate) fn try_add_device(world: &mut World, device: Device) -> Result<DeviceId> {
+    pub fn try_add_device(world: &mut World, device: Device) -> Result<DeviceId> {
         if globals::system::is_motion_enabled(world) {
             return Err(Error::InvalidState(
                 "cannot add device while in motion".into(),
@@ -231,14 +231,14 @@ pub mod system {
         Ok(add_device(world, device))
     }
 
-    pub(crate) fn add_device(world: &mut World, device: Device) -> DeviceId {
+    pub fn add_device(world: &mut World, device: Device) -> DeviceId {
         let entity = Entity::from_raw(*device.id);
         let mut entity = world.get_entity_mut(entity).unwrap();
         entity.insert((DeviceEntity, device.id, device.name, device.attributes));
         entity.id().index().into()
     }
 
-    pub(crate) fn try_set_device(world: &mut World, device: Device) -> Result<DeviceId> {
+    pub fn try_set_device(world: &mut World, device: Device) -> Result<DeviceId> {
         // We cannot update device instances while in motion
         if globals::system::is_motion_enabled(world) {
             return Err(Error::InvalidState(
@@ -259,7 +259,7 @@ pub mod system {
         Ok(device_id)
     }
 
-    pub(crate) fn remove_device_by_id(world: &mut World, device_id: DeviceId) -> Option<DeviceId> {
+    pub fn remove_device_by_id(world: &mut World, device_id: DeviceId) -> Option<DeviceId> {
         let entity = Entity::from_raw(*device_id);
         match world.despawn(entity) {
             true => Some(device_id),
@@ -267,7 +267,7 @@ pub mod system {
         }
     }
 
-    pub(crate) fn try_apply_samples(
+    pub fn try_apply_samples(
         world: &mut World,
         device_id: DeviceId,
         samples: Vec<AttributeSample>,

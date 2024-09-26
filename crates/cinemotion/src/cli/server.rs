@@ -5,6 +5,7 @@ use cinemotion::{
     client::ConnectionHandle,
     engine::{self, EngineEvent},
     websocket::{self, ServerEvent},
+    backend,
 };
 use clap::Args;
 use tokio::net::TcpListener;
@@ -22,7 +23,7 @@ impl ServerCmd {
             .server_bind_address
             .unwrap_or("0.0.0.0:7878".parse().unwrap());
 
-        let mut engine = engine::spawn();
+        let mut engine = engine::spawn(backend::DefaultBackend::new());
         let listener = TcpListener::bind(address).await?;
 
         // Need to clone the handles to move into the closure

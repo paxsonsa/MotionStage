@@ -196,10 +196,7 @@ pub mod system {
         Ok(())
     }
 
-    pub(crate) fn get_by_id<'a>(
-        world: &'a mut World,
-        id: &ObjectId,
-    ) -> Option<SceneObjectEntityRef> {
+    pub fn get_by_id<'a>(world: &'a mut World, id: &ObjectId) -> Option<SceneObjectEntityRef> {
         let entity = Entity::from_raw(**id);
         let Some(entity_ref) = world.get_entity(entity) else {
             return None;
@@ -212,10 +209,7 @@ pub mod system {
         Some(SceneObjectEntityRef { entity })
     }
 
-    pub(crate) fn get_by_name<'a>(
-        world: &'a mut World,
-        name: &Name,
-    ) -> Option<SceneObjectEntityRef> {
+    pub fn get_by_name<'a>(world: &'a mut World, name: &Name) -> Option<SceneObjectEntityRef> {
         let mut query = world.query::<(&SceneObjectEntity, &Name, Entity)>();
         for (_, other_name, entity) in query.iter(&world).collect::<Vec<_>>() {
             if name == other_name {
@@ -225,7 +219,7 @@ pub mod system {
         return None;
     }
 
-    pub(crate) fn get_all<'a>(world: &'a mut World) -> Vec<SceneObjectEntityRef> {
+    pub fn get_all<'a>(world: &'a mut World) -> Vec<SceneObjectEntityRef> {
         world
             .query::<(&SceneObjectEntity, Entity)>()
             .iter(&world)
