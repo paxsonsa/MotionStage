@@ -9,19 +9,19 @@ use crate::protocol::client_message::Body as ClientBody;
 use crate::state::*;
 
 #[cfg(test)]
-#[path = "engine_test.rs"]
-mod engine_test;
+#[path = "session_test.rs"]
+mod session_test;
 
-pub struct Engine {
+pub struct Session {
     world: World,
 }
 
-impl Engine {
+impl Session {
     pub fn new() -> Self {
         let mut world = world::new();
         scene::system::init(&mut world);
 
-        Engine {
+        Session {
             world: world::new(),
         }
     }
@@ -38,7 +38,7 @@ impl Engine {
     }
 
     /// Reserve a engine entity and return the ID.
-    pub async fn reserve_client(&mut self) -> u32 {
+    pub async fn reserve_device_id(&mut self) -> u32 {
         world::reserve_entity(&mut self.world)
     }
 
@@ -47,6 +47,7 @@ impl Engine {
         client: u32,
         message: protocol::client_message::Body,
     ) -> Result<()> {
+        tracing::trace!(client, ?message, "applying message to session");
         match message {
             ClientBody::MotionSetMode(model) => {
                 globals::system::set_motion_mode(&mut self.world, model.enabled);

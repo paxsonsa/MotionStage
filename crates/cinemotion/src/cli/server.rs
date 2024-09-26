@@ -1,11 +1,13 @@
-use anyhow::Result;
-use cinemotion::engine::EngineResource;
-use clap::Args;
-use futures::SinkExt;
-use futures::StreamExt;
-use tokio::net::TcpListener;
+use std::collections::HashMap;
 
-use cinemotion::{actor::Handle, client, engine, websocket, Error};
+use anyhow::Result;
+use cinemotion::{
+    client::ConnectionHandle,
+    engine::{self, EngineEvent},
+    websocket::{self, ServerEvent},
+};
+use clap::Args;
+use tokio::net::TcpListener;
 
 /// Start the cinemotion broker services.
 #[derive(Args)]
@@ -24,36 +26,40 @@ impl ServerCmd {
         let listener = TcpListener::bind(address).await?;
 
         // Need to clone the handles to move into the closure
-        let engine_handle = engine.clone();
-
-        let mut websocket_server = websocket::server(listener, move |ws_stream| {
-            // Need to clone the engine handle and client coordinator handle to move into the async
-            // block
-            let engine_handle = engine_handle.clone();
-            async move {
-                let (writer, reader) = ws_stream.split();
-                let mut client = client::spawn(
-                    reader,
-                    writer,
-                    engine_handle.clone(),
-                    websocket::receive_message,
-                    websocket::convert_message,
-                );
-
-                if let Err(err) = engine_handle.add_client(client.clone()).await {
-                    tracing::error!(?err, "failed to add new client.");
-                    client.stop().await;
-                    return Err(err.into());
-                }
-                Ok(())
-            }
-        })?;
+        let mut server = websocket::serve(listener);
+        let mut clients: HashMap<u32, Box<websocket::WebsocketHandle>> = Default::default();
 
         loop {
             tokio::select! {
+                Some(event) = server.next() => match event {
+                    ServerEvent::ConnectionEstablished(client) => {
+                        let client_id = client.id();
+                        clients.insert(client_id, client);
+                        engine.register_client(clients.get_mut(&client_id).unwrap()).await;
+                    },
+                    ServerEvent::ConnectionFailed => {
+                        tracing::error!("Connection failed");
+                    },
+                    ServerEvent::ConnectionClosed{ connection_id } => {
+                        let client = clients.get_mut(&connection_id).expect("missing client for closing the connection");
+                        engine.remove_client(&client).await?;
+                    },
+                    ServerEvent::Message { connection_id, message } => {
+                        let client = clients.get_mut(&connection_id).expect("missing client for closing the connection");
+                        engine.apply(client, message).await?;
+                    },
+                },
+                Some(event) = engine.next() => match event {
+                    EngineEvent::Tick(state) => {
+                        server.broadcast(state.into()).await?;
+                    },
+                    EngineEvent::Error(err) => {
+                        tracing::error!("Engine error: {:?}", err);
+                    },
+                },
                 _ = tokio::signal::ctrl_c() => {
-                    websocket_server.stop().await;
-                    engine.stop().await;
+                    engine.shutdown().await;
+                    server.shutdown().await;
                     break;
                 }
             }

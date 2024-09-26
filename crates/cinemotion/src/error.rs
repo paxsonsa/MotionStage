@@ -5,9 +5,6 @@ pub enum Error {
     #[error("actor error occured: {0}")]
     ActorError(#[from] crate::actor::ActorError),
 
-    #[error("client error occured: {0}")]
-    ClientError(#[from] crate::client::ClientError),
-
     #[error("connection error occured: {0}")]
     ConnectionError(String),
 }

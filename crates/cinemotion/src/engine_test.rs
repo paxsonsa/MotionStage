@@ -4,7 +4,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_engine_add_client() {
-    let engine = core::engine::Engine::new();
+    let engine = core::session::Session::new();
     let mut engine = EngineActor {
         clients: HashMap::new(),
         inner: engine,
@@ -42,7 +42,7 @@ async fn test_engine_add_client() {
 
 #[tokio::test]
 async fn test_engine_remove_client() {
-    let engine = core::engine::Engine::new();
+    let engine = core::session::Session::new();
     let mut engine = EngineActor {
         clients: HashMap::new(),
         inner: engine,
@@ -63,7 +63,7 @@ async fn test_engine_remove_client() {
 
 #[tokio::test]
 async fn test_engine_apply() {
-    let engine = core::engine::Engine::new();
+    let engine = core::session::Session::new();
     let mut engine = EngineActor {
         clients: HashMap::new(),
         inner: engine,

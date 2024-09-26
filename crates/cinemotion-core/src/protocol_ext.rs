@@ -200,7 +200,31 @@ impl TryFrom<Option<protocol::AttributeValue>> for attributes::AttributeValue {
 
 impl Into<protocol::AttributeValue> for attributes::AttributeValue {
     fn into(self) -> protocol::AttributeValue {
-        todo!()
+        match self {
+            attributes::AttributeValue::Float(value) => protocol::AttributeValue {
+                value: Some(protocol::attribute_value::Value::Float(value)),
+            },
+            attributes::AttributeValue::Vec3(vec3) => protocol::AttributeValue {
+                value: Some(protocol::attribute_value::Value::Vec3(protocol::Vec3 {
+                    x: vec3.x,
+                    y: vec3.y,
+                    z: vec3.z,
+                })),
+            },
+            attributes::AttributeValue::Vec4(vec4) => protocol::AttributeValue {
+                value: Some(protocol::attribute_value::Value::Vec4(protocol::Vec4 {
+                    x: vec4.x,
+                    y: vec4.y,
+                    z: vec4.z,
+                    w: vec4.w,
+                })),
+            },
+            attributes::AttributeValue::Matrix44(m) => protocol::AttributeValue {
+                value: Some(protocol::attribute_value::Value::Matrix44(
+                    protocol::Matrix44 { values: m.into() },
+                )),
+            },
+        }
     }
 }
 

@@ -1,112 +1,229 @@
-use crate::actor;
-use crate::client::ClientError;
+use crate::client::ConnectionHandle;
 use crate::error;
 use anyhow::Result;
-use async_trait::async_trait;
-use derive_more::Display;
 use futures::stream::{SplitSink, SplitStream};
 use futures::StreamExt;
 use futures::{Future, SinkExt};
+use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{tungstenite, MaybeTlsStream, WebSocketStream};
 
-use cinemotion_core::devices;
 use cinemotion_core::protocol;
 
-#[derive(Clone, Debug)]
-pub enum Message {
-    Stop {
-        respond_to: tokio::sync::mpsc::Sender<()>,
+pub enum ServerEvent {
+    ConnectionEstablished(Box<WebsocketHandle>),
+    ConnectionFailed,
+    ConnectionClosed {
+        connection_id: u32,
+    },
+    Message {
+        connection_id: u32,
+        message: protocol::ClientMessage,
     },
 }
 
-#[derive(Display, Debug)]
-enum ActorSignal {
-    Stop,
+pub enum ClientEvent {
+    ConnectionFailed {
+        connection_id: u32,
+    },
+    ClientMessage {
+        connection_id: u32,
+        message: tungstenite::Message,
+    },
+    ServerMessage {
+        target_id: u32,
+        message: protocol::ServerMessage,
+    },
 }
 
-/// The websocket server actor.
-#[derive(Debug)]
-struct WebSocket<F, R>
-where
-    R: Future<Output = Result<()>> + Send + 'static,
-    F: FnMut(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> R
-        + Send
-        + Sync
-        + 'static,
-{
+pub struct WebsocketServer {
+    next_connection_id: u32,
+    connections: HashMap<u32, Websocket>,
     listener: TcpListener,
-    on_connection: F,
+    sender: tokio::sync::mpsc::Sender<ClientEvent>,
+    receiver: tokio::sync::mpsc::Receiver<ClientEvent>,
 }
 
-#[async_trait]
-impl<F, R> actor::Actor for WebSocket<F, R>
-where
-    R: Future<Output = Result<()>> + Send + 'static,
-    F: FnMut(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> R
-        + Send
-        + Sync
-        + 'static,
-{
-    type Message = Message;
-    type Handle = WebSocketHandle;
+impl WebsocketServer {
+    pub async fn next(&mut self) -> Option<ServerEvent> {
+        tokio::select! {
+            result = self.listener.accept() => match result {
+                Ok((stream, addr)) => {
+                    tracing::info!(?addr, "opened connection, attempting to establish websocket connection.");
 
-    async fn tick(&mut self) -> Option<actor::Signal> {
-        tracing::info!("starting websocket server actor.");
-        loop {
-            tokio::select! {
-                result = self.listener.accept() => match result {
-                    Ok((stream, addr)) => {
-                        tracing::info!(?addr, "opened connection, attempting to establish websocket connection.");
+                    match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws_stream) => {
+                            tracing::info!(?addr, "established websocket connection");
+                            Some(ServerEvent::ConnectionEstablished(self.new_connection(ws_stream)))
+                        },
+                        Err(err) => {
+                            tracing::error!(?addr, ?err, "failed to establish websocket connection, closing connection");
+                            Some(ServerEvent::ConnectionFailed)
+                        },
 
-                        match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws_stream) => {
-                                tracing::info!(?addr, "established websocket connection");
-                                if let Err(err) = (self.on_connection)(ws_stream).await {
-                                    tracing::error!(?addr, ?err, "failed to establish websocket connection, closing connection");
-                                }
+                    }
+                },
+                Err(err) => {
+                    tracing::error!("failed to accept connection: error={err}");
+                    None
+                }
+            },
+            Some(event) = self.receiver.recv() => {
+                match event {
+                    ClientEvent::ConnectionFailed { connection_id } => {
+                        tracing::error!(?connection_id, "connection failed");
+                        self.connections.remove(&connection_id);
+                        Some(ServerEvent::ConnectionClosed { connection_id })
+                    },
+                    ClientEvent::ClientMessage{ connection_id, message } => {
+                        if !message.is_binary() {
+                            tracing::warn!("received non-binary message, ignoring");
+                            return None;
+                        }
+
+                        let data = bytes::Bytes::from(message.into_data());
+                        let Ok(message) = data.try_into() else {
+                            tracing::error!("failed to deserialize message from websocket");
+                            return None
+                        };
+                        Some(ServerEvent::Message{ connection_id , message })
+                    },
+                    ClientEvent::ServerMessage{ target_id, message } => {
+                        let Some(connection) = self.connections.get_mut(&target_id) else {
+                            tracing::error!(?target_id, "failed to find connection for message");
+                            return None;
+                        };
+
+                        if let Err(err) = connection.send(message).await {
+                            tracing::error!(?err, "failed to send message to connection");
+                            return None;
+                        }
+                        None
+                    },
+                }
+            }
+        }
+    }
+
+    pub async fn broadcast(&mut self, message: protocol::ServerMessage) -> Result<()> {
+        for connection in self.connections.values_mut() {
+            if let Err(err) = connection.send(message.clone()).await {
+                tracing::error!(?err, "failed to send message to connection");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(self) {
+        for (_, connection) in self.connections {
+            connection.stop().await;
+        }
+    }
+
+    fn new_connection(
+        &mut self,
+        stream: WebSocketStream<tokio::net::TcpStream>,
+    ) -> Box<WebsocketHandle> {
+        let (writer, mut reader) = stream.split();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let id = self.next_connection_id;
+
+        let message_channel = self.sender.clone();
+        let connection_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let cancellation = connection_cancellation;
+            loop {
+                tokio::select! {
+                    Some(message) = reader.next() => {
+                        tracing::info!(?id, ?message, "received message");
+
+                        match message {
+                            Ok(message) => {
+                                message_channel.send(ClientEvent::ClientMessage{ connection_id: id, message}).await.unwrap();
                             },
                             Err(err) => {
-                                tracing::error!(?addr, ?err, "failed to establish websocket connection, closing connection");
-                            },
-
+                                tracing::error!(?id, ?err, "failed to read message from connection");
+                                message_channel.send(ClientEvent::ConnectionFailed{ connection_id: id}).await.unwrap();
+                                break;
+                            }
                         }
                     },
-                    Err(err) => tracing::error!("failed to accept connection: error={err}")
-                },
+                    _ = cancellation.cancelled() => {
+                        break;
+                    }
+
+                }
             }
-        }
-    }
-    async fn handle_message(&mut self, message: Message) -> Option<actor::Signal> {
-        match message {
-            Message::Stop { respond_to } => {
-                respond_to.send(()).await.unwrap();
-                return Some(actor::Signal::Stop);
-            }
-        }
+        });
+
+        let connection = Websocket {
+            id: self.next_connection_id,
+            task,
+            cancellation,
+            writer,
+        };
+        let handle = WebsocketHandle {
+            id: self.next_connection_id,
+            sender: self.sender.clone(),
+        };
+        self.connections.insert(self.next_connection_id, connection);
+        self.next_connection_id += 1;
+        Box::new(handle)
     }
 }
 
-#[derive(Clone)]
-pub struct WebSocketHandle {
-    sender: actor::Sender<Message>,
+pub struct Websocket {
+    id: u32,
+    task: tokio::task::JoinHandle<()>,
+    cancellation: tokio_util::sync::CancellationToken,
+    writer: SplitSink<WebSocketStream<tokio::net::TcpStream>, tungstenite::Message>,
 }
 
-#[async_trait]
-impl actor::Handle for WebSocketHandle {
-    type Message = Message;
-    fn sender(&self) -> actor::Sender<Message> {
-        self.sender.clone()
+impl Websocket {
+    pub async fn stop(self) {
+        self.cancellation.cancel();
+        self.task.await.unwrap();
     }
 
-    /// Stop the weovsocket server.
-    ///
-    /// This will stop the websocket server, all active connections will be closed.
-    /// This will return once the server has been stopped.
-    async fn stop(&mut self) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        self.sender.send(Message::Stop { respond_to: tx }).unwrap();
-        rx.recv().await;
+    pub async fn send(&mut self, message: protocol::ServerMessage) -> Result<(), error::Error> {
+        let message = convert_message(message);
+        self.writer
+            .send(message)
+            .await
+            .map_err(|err| crate::Error::ConnectionError(err.to_string()))?;
+        Ok(())
+    }
+}
+
+pub struct WebsocketHandle {
+    id: u32,
+    sender: tokio::sync::mpsc::Sender<ClientEvent>,
+}
+
+impl ConnectionHandle for WebsocketHandle {
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    async fn send(&mut self, message: protocol::ServerMessage) {
+        self.sender
+            .send(ClientEvent::ServerMessage {
+                target_id: self.id,
+                message,
+            })
+            .await
+            .expect("failed to queue initialization message");
+    }
+}
+
+pub fn serve(listener: TcpListener) -> WebsocketServer {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    WebsocketServer {
+        next_connection_id: 1,
+        connections: HashMap::new(),
+        listener,
+        sender: tx,
+        receiver: rx,
     }
 }
 
@@ -145,7 +262,11 @@ impl Connection {
             })
     }
 
-    pub async fn write(&mut self, message: protocol::ClientMessage) -> Result<(), error::Error> {
+    pub async fn write<M>(&mut self, message: M) -> Result<(), error::Error>
+    where
+        M: std::fmt::Debug + TryInto<bytes::Bytes>,
+        <M as TryInto<bytes::Bytes>>::Error: std::fmt::Debug,
+    {
         let message = convert_message(message);
         self.writer
             .send(message)
@@ -167,61 +288,6 @@ pub async fn connect(address: String) -> Result<Connection, crate::Error> {
         reader: ws_reader,
         writer: ws_writer,
     })
-}
-
-/// Spawn a new websocket server and return a handler to it.
-///
-/// Once the last handle is dropped, the actor will be terminated.
-pub fn server<F, R>(tcp_listener: TcpListener, on_connection: F) -> Result<WebSocketHandle>
-where
-    R: Future<Output = Result<()>> + Send + 'static,
-    F: FnMut(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> R
-        + Send
-        + Sync
-        + 'static,
-{
-    tracing::info!("spawning websocket server actor");
-    let actor = WebSocket {
-        listener: tcp_listener,
-        on_connection,
-    };
-
-    let handle = actor::spawn(actor, |sender| WebSocketHandle { sender });
-    Ok(handle)
-}
-
-pub fn receive_message<T>(
-    msg: Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
-) -> Result<T, error::Error>
-where
-    T: std::convert::TryFrom<bytes::Bytes>,
-{
-    match msg {
-        Ok(msg) => {
-            tracing::debug!("received message: {:?}", msg);
-            if !msg.is_binary() {
-                tracing::warn!("received non-binary message, ignoring");
-                return Err(ClientError::BadMessage(format!("received non-binary message")).into());
-            }
-
-            let data = bytes::Bytes::from(msg.into_data());
-            let Ok(message) = data.try_into() else {
-                tracing::error!("failed to deserialize message from websocket");
-                return Err(ClientError::BadMessage(format!(
-                    "failed to convert message to local type"
-                ))
-                .into());
-            };
-            Ok(message)
-        }
-        Err(err) => {
-            tracing::error!(
-                ?err,
-                "failed to read message from websocket, closing connection."
-            );
-            Err(ClientError::Disconnected.into())
-        }
-    }
 }
 
 pub fn convert_message<M>(msg: M) -> tokio_tungstenite::tungstenite::Message

@@ -49,12 +49,13 @@ impl<Running> Runtime<Running> {
     pub async fn init(&mut self, device_spec: protocol::DeviceSpec) {
         self.config
             .connection
-            .write(
-                protocol::DeviceInitAck {
-                    device_spec: Some(device_spec),
-                }
-                .into(),
-            )
+            .write(protocol::ClientMessage {
+                body: Some(protocol::client_message::Body::DeviceInitAck(
+                    protocol::DeviceInitAck {
+                        device_spec: Some(device_spec),
+                    },
+                )),
+            })
             .await
             .expect("failed to send message");
     }

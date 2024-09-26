@@ -44,9 +44,14 @@ static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7878";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
-        // TODO: Configure debugger and setup server task.
+        // FIXME: Redesign Server to be next() based.
         // TODO: Button to start and top motion/recording
+        // TODO: Add Ping/Pong measurement for latency testing.
         // TODO: Add another area for storing the scene graph.
+        // TODO: Investigate the next()/write() style of instead of actors for client layer, it
+        // might reduce generic complexity.
+        // TODO: Make sure that we are not leaking the 'core' into the cinemotion API.
+        // TODO: Add Sin wave testing.
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
@@ -76,16 +81,8 @@ impl DebuggerCmd {
                 .into(),
             }
         })?;
-        const LOG_CAPACITY: usize = 10000;
-        let log_buffer = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
-        let collector_layer = LogCollector {
-            buffer: Arc::clone(&log_buffer),
-        };
-        let subscriber = tracing_subscriber::registry()
-            .with(EnvFilter::new("info"))
-            .with(collector_layer);
-        tracing::subscriber::set_global_default(subscriber)?;
 
+        let log_buffer = init_logging()?;
         let mut app = App::new(address, device_spec, Arc::clone(&log_buffer));
         app.run().await?;
 
@@ -105,6 +102,19 @@ impl DebuggerCmd {
         // let runtime_handle = runtime.start().await;
         //
     }
+}
+
+fn init_logging() -> Result<Arc<Mutex<RingBuffer<LogEvent>>>, anyhow::Error> {
+    const LOG_CAPACITY: usize = 10000;
+    let log_buffer = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
+    let collector_layer = LogCollector {
+        buffer: Arc::clone(&log_buffer),
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::new("info"))
+        .with(collector_layer);
+    tracing::subscriber::set_global_default(subscriber)?;
+    Ok(log_buffer)
 }
 
 pub enum Event {
@@ -146,6 +156,7 @@ impl TerminalUI {
     }
 
     pub fn show(&mut self) -> anyhow::Result<()> {
+        init_panic_hook();
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stderr(), EnterAlternateScreen, cursor::Hide)?;
         crossterm::execute!(std::io::stderr(), EnableMouseCapture)?;
@@ -309,7 +320,6 @@ impl App {
             .with_connection(connection)
             .build();
         let mut runtime = cinemotion::runtime(config).start().await;
-
         let mut tui = TerminalUI::new();
         tui.show()?;
 
@@ -665,4 +675,19 @@ fn convert_message(
         .try_into()
         .expect("failed to generate bytes for protocol message");
     tokio_tungstenite::tungstenite::Message::binary(data)
+}
+
+pub fn init_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // intentionally ignore errors here since we're already in a panic
+        let _ = restore_tui();
+        original_hook(panic_info);
+    }));
+}
+
+pub fn restore_tui() -> std::io::Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    Ok(())
 }

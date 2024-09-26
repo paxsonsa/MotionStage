@@ -3,7 +3,7 @@ use crate::name;
 
 #[tokio::test]
 async fn test_motion_mode() {
-    let mut engine = Engine::new();
+    let mut engine = Session::new();
     let message =
         protocol::client_message::Body::MotionSetMode(protocol::MotionSetMode { enabled: true });
     engine.apply(1, message).await.unwrap();
@@ -16,8 +16,8 @@ async fn test_motion_mode() {
 
 #[tokio::test]
 async fn test_device_init() {
-    let mut engine = Engine::new();
-    let id = engine.reserve_client().await;
+    let mut engine = Session::new();
+    let id = engine.reserve_device_id().await;
     let message = protocol::client_message::Body::DeviceInitAck(protocol::DeviceInitAck {
         device_spec: Some(protocol::DeviceSpec {
             name: "test".to_string(),
@@ -30,7 +30,7 @@ async fn test_device_init() {
 
 #[tokio::test]
 async fn test_device_init_with_empty_spec() {
-    let mut engine = Engine::new();
+    let mut engine = Session::new();
     let message = protocol::client_message::Body::DeviceInitAck(protocol::DeviceInitAck {
         device_spec: None,
     });
@@ -39,7 +39,7 @@ async fn test_device_init_with_empty_spec() {
 
 #[tokio::test]
 async fn test_scene_creation_object() {
-    let mut engine = Engine::new();
+    let mut engine = Session::new();
     let message = protocol::client_message::Body::SceneCreateObject(protocol::SceneCreateObject {
         spec: Some(protocol::SceneObjectSpec {
             name: "test".to_string(),
@@ -98,8 +98,8 @@ async fn test_scene_creation_object() {
 
 #[tokio::test]
 async fn test_standard_integration() {
-    let mut engine = Engine::new();
-    let id = engine.reserve_client().await;
+    let mut engine = Session::new();
+    let id = engine.reserve_device_id().await;
     let message = protocol::client_message::Body::DeviceInitAck(protocol::DeviceInitAck {
         device_spec: Some(protocol::DeviceSpec {
             name: "DeviceA".to_string(),

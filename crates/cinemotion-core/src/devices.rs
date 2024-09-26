@@ -220,7 +220,11 @@ pub mod system {
         let entity = Entity::from_raw(*device.id);
         let Some(_) = world.get_entity(entity) else {
             return Err(Error::NotFound(
-                "did not find reserved entity to apply device to.".into(),
+                format!(
+                    "did not find reserved entity to apply device to. id={}",
+                    *device.id
+                )
+                .into(),
             ));
         };
 

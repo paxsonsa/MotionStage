@@ -457,3 +457,9 @@ impl From<Vec<f64>> for Matrix44 {
         matrix
     }
 }
+
+impl Into<Vec<f64>> for Matrix44 {
+    fn into(self) -> Vec<f64> {
+        self.data.to_vec()
+    }
+}
