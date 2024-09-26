@@ -42,6 +42,7 @@ static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7878";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
+        // Test Engine Endpoints.
         // TODO: Button to start and top motion/recording
         // TODO: Add Ping/Pong measurement for latency testing.
         // TODO: Add another area for storing the scene graph.
