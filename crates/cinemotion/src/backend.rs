@@ -13,9 +13,13 @@ mod backend_test;
 #[allow(async_fn_in_trait)]
 pub trait Backend {
     async fn reserve_device_id(&mut self) -> u32;
-    async fn apply(&mut self, client: u32, message: protocol::client_message::Body) -> Result<()>;
+    async fn apply(
+        &mut self,
+        device_id: u32,
+        message: protocol::client_message::Body,
+    ) -> Result<()>;
     async fn update(&mut self) -> Result<StateTree>;
-    async fn remove_client(&mut self, client: u32) -> Result<()>;
+    async fn despawn_device_by_id(&mut self, id: u32) -> Result<()>;
 }
 
 pub struct DefaultBackend {
@@ -44,10 +48,10 @@ impl Default for DefaultBackend {
 }
 
 impl Backend for DefaultBackend {
-    /// Remove the client entity
-    async fn remove_client(&mut self, client: u32) -> Result<()> {
-        scene::system::remove_device_links(&mut self.world, client.clone())?;
-        devices::system::remove_device_by_id(&mut self.world, client.into());
+    /// Removdespawn_device_by_idntity
+    async fn despawn_device_by_id(&mut self, device_id: u32) -> Result<()> {
+        scene::system::remove_device_links(&mut self.world, device_id.clone())?;
+        devices::system::remove_device_by_id(&mut self.world, device_id.into());
         Ok(())
     }
 

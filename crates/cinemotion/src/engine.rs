@@ -8,11 +8,15 @@ use std::collections::HashMap;
 #[path = "engine_test.rs"]
 mod engine_test;
 
+/// Represents events that can occur in the engine.
 pub enum EngineEvent {
+    /// Event that occurs on each tick, containing the current state tree.
     Tick(core::state::StateTree),
+    /// Event that occurs when an error happens in the engine.
     Error(EngineError),
 }
 
+/// The main engine struct that manages the core logic and state.
 pub struct Engine<Backend>
 where
     Backend: backend::Backend,
@@ -26,24 +30,33 @@ impl<Backend> Engine<Backend>
 where
     Backend: backend::Backend,
 {
-    pub async fn apply<Client: ConnectionHandle>(
+    /// Applies a connection message to the engine.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection` - The connection sending the message.
+    /// * `message` - The message to apply.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure.
+    pub async fn apply<Connection: ConnectionHandle>(
         &mut self,
-        client: &mut Box<Client>,
+        connection: &mut Box<Connection>,
         message: protocol::ClientMessage,
     ) -> Result<(), EngineError> {
-        let Some(device_id) = self.device_id_table.get(&client.id()) else {
+        let Some(device_id) = self.device_id_table.get(&connection.id()) else {
             tracing::warn!(
-                "failed to apply client message, no enity id mapped, is the client initialized?"
+                "failed to apply conn message, no entity id mapped, is the conn initialized?"
             );
             return Ok(());
         };
-        let body = message.body.expect("client body missing");
+        let body = message.body.expect("conn body missing");
 
         {
             let span = tracing::span!(tracing::Level::INFO, "Engine::apply", device_id, ?body);
             let _guard = span.enter();
             tracing::trace!("applying message: {:?}", body);
-            // TODO: Handle Errors.
             self.inner
                 .apply(*device_id, body)
                 .await
@@ -52,6 +65,11 @@ where
         Ok(())
     }
 
+    /// Retrieves the next event from the engine.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the next `EngineEvent`.
     pub async fn next(&mut self) -> Option<EngineEvent> {
         tokio::select! {
             _ = self.interval.tick() => {
@@ -61,33 +79,56 @@ where
         }
     }
 
-    pub async fn register_client<Client: ConnectionHandle>(&mut self, client: &mut Box<Client>) {
-        let client_id = client.id();
+    /// Registers a new connection with the engine.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection` - The connection to register.
+    pub async fn registered_connection<Connection: ConnectionHandle>(
+        &mut self,
+        conn: &mut Box<Connection>,
+    ) {
+        let conn_id = conn.id();
         let id = self.inner.reserve_device_id().await;
-        self.device_id_table.insert(client.id(), id);
+        self.device_id_table.insert(conn.id(), id);
         let message = protocol::ServerMessage {
             body: Some(protocol::server_message::Body::DeviceInit(
                 protocol::DeviceInit { version: 1, id },
             )),
         };
-        client.send(message).await;
-        tracing::info!(id, client_id, "registered connection");
+        conn.send(message).await;
+        tracing::info!(id, conn_id, "registered connection");
     }
 
-    pub async fn remove_client<Client: ConnectionHandle>(
+    /// Notifies the engine the connection was closed.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection` - The connection to the was closed.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure.
+    pub async fn closed_connection<Conn: ConnectionHandle>(
         &mut self,
-        client: &Box<Client>,
+        conn: &Box<Conn>,
     ) -> Result<(), EngineError> {
-        let Some(id) = self.device_id_table.remove(&client.id()) else {
+        let Some(id) = self.device_id_table.remove(&conn.id()) else {
             return Ok(());
         };
-        self.inner.remove_client(id).await;
+        self.inner
+            .despawn_device_by_id(id)
+            .await
+            .expect("should not fail to remove conn from backend.");
         Ok(())
     }
 
+    /// Shuts down the engine, removing all conns.
     pub async fn shutdown(&mut self) {
         for id in self.device_id_table.values() {
-            self.inner.remove_client(*id).await;
+            if let Err(err) = self.inner.despawn_device_by_id(*id).await {
+                tracing::error!("failed to remove connection while shutting down: {:?}", err);
+            }
         }
     }
 }
@@ -95,11 +136,20 @@ where
 /// Errors that can occur in the Engine.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum EngineError {
+    /// Error indicating that the engine has failed fatally.
     #[error("engine is fatally failed")]
     EngineFailed,
 }
 
-/// Spawns a new EngineActor and returns its handle.
+/// Spawns a new Engine and returns its handle.
+///
+/// # Arguments
+///
+/// * `backend` - The backend to use for the engine.
+///
+/// # Returns
+///
+/// A new `Engine` instance.
 pub fn spawn<Backend>(backend: Backend) -> Engine<Backend>
 where
     Backend: backend::Backend,

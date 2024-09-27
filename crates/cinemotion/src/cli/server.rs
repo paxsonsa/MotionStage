@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use cinemotion::{
+    backend,
     client::ConnectionHandle,
     engine::{self, EngineEvent},
     websocket::{self, ServerEvent},
-    backend,
 };
 use clap::Args;
 use tokio::net::TcpListener;
@@ -36,14 +36,14 @@ impl ServerCmd {
                     ServerEvent::ConnectionEstablished(client) => {
                         let client_id = client.id();
                         clients.insert(client_id, client);
-                        engine.register_client(clients.get_mut(&client_id).unwrap()).await;
+                        engine.registered_connection(clients.get_mut(&client_id).unwrap()).await;
                     },
                     ServerEvent::ConnectionFailed => {
                         tracing::error!("Connection failed");
                     },
                     ServerEvent::ConnectionClosed{ connection_id } => {
                         let client = clients.get_mut(&connection_id).expect("missing client for closing the connection");
-                        engine.remove_client(&client).await?;
+                        engine.closed_connection(&client).await?;
                     },
                     ServerEvent::Message { connection_id, message } => {
                         let client = clients.get_mut(&connection_id).expect("missing client for closing the connection");

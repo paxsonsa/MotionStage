@@ -11,21 +11,22 @@ impl backend::Backend for DummyBackend {
 
     async fn apply(
         &mut self,
-        client: u32,
-        message: protocol::client_message::Body,
+        _device_id: u32,
+        _message: protocol::client_message::Body,
     ) -> core::prelude::Result<()> {
         Ok(())
     }
 
     async fn update(&mut self) -> core::prelude::Result<core::state::StateTree> {
-        todo!()
+        panic!("not implemented")
     }
 
-    async fn remove_client(&mut self, client: u32) -> core::prelude::Result<()> {
-        todo!()
+    async fn despawn_device_by_id(&mut self, _client: u32) -> core::prelude::Result<()> {
+        Ok(())
     }
 }
 
+#[derive(Clone)]
 struct MockConnection {
     id: u32,
     messages: Arc<Mutex<Vec<protocol::ServerMessage>>>,
@@ -40,16 +41,15 @@ impl ConnectionHandle for MockConnection {
     }
 }
 #[tokio::test]
-async fn test_new_connection_creation() {
+async fn test_connection_register_remove() {
     let dummy_backend = DummyBackend {};
     let mut engine = spawn(dummy_backend);
     let messages = Arc::new(Mutex::new(vec![]));
-    engine
-        .register_client(&mut Box::new(MockConnection {
-            id: 22,
-            messages: messages.clone(),
-        }))
-        .await;
+    let connection = Box::new(MockConnection {
+        id: 22,
+        messages: messages.clone(),
+    });
+    engine.registered_connection(&mut connection.clone()).await;
 
     let msgs = messages.lock().unwrap();
     assert_eq!(msgs.len(), 1, "expected one message to be sent");
@@ -64,4 +64,14 @@ async fn test_new_connection_creation() {
         .expect("expected DeviceInit message")
         .id;
     assert_eq!(device_id, 33, "expected device id to be 33");
+
+    engine
+        .closed_connection(&connection)
+        .await
+        .expect("remove client should not fail");
+
+    assert!(
+        engine.device_id_table.contains_key(&connection.id()) == false,
+        "device should be removed from the table."
+    );
 }
