@@ -12,7 +12,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout},
     style::Style,
-    widgets::{Block, Borders, Padding, Paragraph, Widget},
+    widgets::{Block, Borders, Padding, Paragraph, StatefulWidget, Widget},
 };
 use std::{
     collections::HashMap,
@@ -25,6 +25,7 @@ use tracing::{
     Subscriber,
 };
 use tracing_subscriber::{prelude::*, registry::LookupSpan, EnvFilter};
+use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use cinemotion::protocol;
 
@@ -42,10 +43,9 @@ static DEFAULT_ADDRESS: &str = "ws://0.0.0.0:7878";
 
 impl DebuggerCmd {
     pub async fn run(&self) -> Result<i32> {
-        // Test Engine Endpoints.
+        // TODO: Add another area for storing the scene graph.
         // TODO: Button to start and top motion/recording
         // TODO: Add Ping/Pong measurement for latency testing.
-        // TODO: Add another area for storing the scene graph.
         // TODO: Investigate the next()/write() style of instead of actors for client layer, it
         // might reduce generic complexity.
         // TODO: Make sure that we are not leaking the 'core' into the cinemotion API.
@@ -119,7 +119,7 @@ pub enum Action {
     Quit,
 }
 
-struct TerminalUI {
+struct Terminal {
     task: tokio::task::JoinHandle<()>,
     terminal: ratatui::Terminal<Backend<std::io::Stderr>>,
     cancellation: tokio_util::sync::CancellationToken,
@@ -127,7 +127,7 @@ struct TerminalUI {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
 }
 
-impl TerminalUI {
+impl Terminal {
     pub fn new() -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -256,7 +256,7 @@ impl TerminalUI {
     }
 }
 
-impl Deref for TerminalUI {
+impl Deref for Terminal {
     type Target = ratatui::Terminal<Backend<std::io::Stderr>>;
 
     fn deref(&self) -> &Self::Target {
@@ -264,13 +264,13 @@ impl Deref for TerminalUI {
     }
 }
 
-impl DerefMut for TerminalUI {
+impl DerefMut for Terminal {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.terminal
     }
 }
 
-impl Drop for TerminalUI {
+impl Drop for Terminal {
     fn drop(&mut self) {
         self.stop().unwrap();
     }
@@ -281,6 +281,7 @@ struct App {
     device: protocol::DeviceSpec,
     should_quit: bool,
     log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
+    scene_tree_state: TreeState<u32>,
 }
 
 impl App {
@@ -294,6 +295,7 @@ impl App {
             device,
             should_quit: false,
             log_buffer,
+            scene_tree_state: Default::default(),
         }
     }
     async fn run(&mut self) -> anyhow::Result<()> {
@@ -304,7 +306,7 @@ impl App {
             .with_connection(connection)
             .build();
         let mut runtime = cinemotion::runtime(config).start().await;
-        let mut tui = TerminalUI::new();
+        let mut tui = Terminal::new();
         tui.show()?;
 
         loop {
@@ -334,7 +336,7 @@ impl App {
         Ok(())
     }
 
-    pub async fn handle_event(&mut self, tui: &mut TerminalUI, event: Event) -> Option<Action> {
+    pub async fn handle_event(&mut self, tui: &mut Terminal, event: Event) -> Option<Action> {
         match event {
             Event::Init => {
                 tracing::info!("Initialized");
@@ -407,13 +409,25 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let [log_area, input_area] =
+        let [top_area, input_area] =
             Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(frame.area());
+
+        let [log_area, scene_graph_area] =
+            Layout::horizontal([Constraint::Percentage(75), Constraint::Min(10)]).areas(top_area);
         // Log window
         let log_widget = LogWidget {
             buffer: Arc::clone(&self.log_buffer),
         };
+
         frame.render_widget(log_widget, log_area);
+
+        // Scene Graph Window
+        let scene_graph_widget = SceneGraphWidget::new();
+        frame.render_stateful_widget(
+            scene_graph_widget,
+            scene_graph_area,
+            &mut self.scene_tree_state,
+        );
 
         // Input field
         let input_paragraph = Paragraph::new("").block(
@@ -443,14 +457,37 @@ impl App {
     }
 }
 
+struct SceneGraphWidget<'t> {
+    items: Vec<TreeItem<'t, u32>>,
+}
+
+impl<'t> SceneGraphWidget<'t> {
+    pub fn new() -> Self {
+        let item = TreeItem::new_leaf(0, "leaf");
+        Self { items: vec![item] }
+    }
+}
+
+impl<'t> StatefulWidget for SceneGraphWidget<'t> {
+    type State = TreeState<u32>;
+    fn render(self, area: ratatui::prelude::Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let tree = Tree::new(&self.items).expect("tree did not render");
+        StatefulWidget::render(tree, area, buf, state);
+    }
+}
+
 struct LogWidget {
     buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
 }
 
 impl Widget for LogWidget {
     fn render(self, area: ratatui::layout::Rect, buf: &mut Buffer) {
+        let border = Block::default().borders(Borders::ALL).title("Logs");
+        let bordered_area = border.inner(area);
+        border.render(area, buf);
+
         let buffer = self.buffer.lock().unwrap();
-        let lines_to_render = area.height as usize;
+        let lines_to_render = bordered_area.height as usize;
         let total_logs = buffer.size;
         let mut logs_iter = buffer.iter();
 
@@ -458,7 +495,10 @@ impl Widget for LogWidget {
             logs_iter.nth(total_logs - lines_to_render);
         }
 
-        for (i, event_data) in logs_iter.take(lines_to_render).enumerate() {
+        let max_width = bordered_area.width as usize;
+        let mut current_line = 0;
+
+        for event_data in logs_iter.take(lines_to_render) {
             let fields_str = event_data
                 .fields
                 .iter()
@@ -478,7 +518,19 @@ impl Widget for LogWidget {
                 }
             );
 
-            buf.set_string(area.left(), area.top() + i as u16, line, Style::default());
+            for chunk in line.chars().collect::<Vec<_>>().chunks(max_width) {
+                if current_line >= lines_to_render {
+                    break;
+                }
+                let chunk_str: String = chunk.iter().collect();
+                buf.set_string(
+                    bordered_area.left(),
+                    bordered_area.top() + current_line as u16,
+                    chunk_str,
+                    Style::default(),
+                );
+                current_line += 1;
+            }
         }
     }
 }

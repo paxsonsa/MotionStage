@@ -579,6 +579,7 @@ dependencies = [
  "tracing-test",
  "trait-variant",
  "tui",
+ "tui-tree-widget",
  "typed-builder",
  "warp",
  "webrtc",
@@ -3303,6 +3304,16 @@ dependencies = [
  "cassowary",
  "crossterm 0.25.0",
  "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "tui-tree-widget"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df0b54061d997162f225bed5d2147574af0648480214759a000e33f6cea0017a"
+dependencies = [
+ "ratatui",
  "unicode-width",
 ]
 
