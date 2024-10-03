@@ -135,7 +135,7 @@ impl WebsocketServer {
             loop {
                 tokio::select! {
                     Some(message) = reader.next() => {
-                        tracing::info!(?id, ?message, "received message");
+                        tracing::trace!(?id, ?message, "received message");
 
                         match message {
                             Ok(message) => {
@@ -247,7 +247,7 @@ impl Connection {
                     tracing::error!("failed to read message from websocket");
                     return None;
                 };
-                tracing::info!("received message: {:?}", msg);
+                tracing::trace!("received message: {:?}", msg);
                 if !msg.is_binary() {
                     tracing::warn!("received non-binary message, ignoring");
                     return None;

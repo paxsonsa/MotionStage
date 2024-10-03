@@ -116,6 +116,8 @@ pub enum Event {
 
 pub enum Action {
     AckInit(u32),
+    UpdateSceneGraph(cinemotion_core::state::StateTree),
+    Render,
     Quit,
 }
 
@@ -164,7 +166,7 @@ impl Terminal {
         // Render 5 times per second
         let render_rate = tokio::time::Duration::from_secs_f64(1.0 / 5.0);
         // Process 200 times per second
-        let process_rate = tokio::time::Duration::from_secs_f64(1.0 / 5.0);
+        let process_rate = tokio::time::Duration::from_secs_f64(1.0 / 200.0);
 
         // Stop any existing tasks
         self.cancel();
@@ -276,15 +278,16 @@ impl Drop for Terminal {
     }
 }
 
-struct App {
+struct App<'a> {
     address: String,
     device: protocol::DeviceSpec,
     should_quit: bool,
     log_buffer: Arc<Mutex<RingBuffer<LogEvent>>>,
     scene_tree_state: TreeState<u32>,
+    scene_graph: TreeItem<'a, u32>,
 }
 
-impl App {
+impl<'a> App<'a> {
     fn new(
         address: String,
         device: protocol::DeviceSpec,
@@ -296,6 +299,7 @@ impl App {
             should_quit: false,
             log_buffer,
             scene_tree_state: Default::default(),
+            scene_graph: TreeItem::new(0, ".", vec![]).expect("scene graph item failed to create"),
         }
     }
     async fn run(&mut self) -> anyhow::Result<()> {
@@ -314,14 +318,13 @@ impl App {
                 Some(event) = tui.next() => {
                     let mut maybe_action = self.handle_event(&mut tui, event).await;
                     while let Some(action) = maybe_action {
-                        maybe_action = self.update(&mut runtime, action).await;
+                        maybe_action = self.update(&mut tui, &mut runtime, action).await;
                     }
                 },
                 Some(event) = runtime.next() => {
-                    tracing::info!("runtime message: {:?}", event);
                     let mut maybe_action = self.handle_runtime_event(event).await;
                     while let Some(action) = maybe_action {
-                        maybe_action = self.update(&mut runtime, action).await;
+                        maybe_action = self.update(&mut tui, &mut runtime, action).await;
                     }
                 },
             }
@@ -383,14 +386,7 @@ impl App {
                 None
             }
             Event::Tick => None,
-            Event::Render => {
-                tui.draw(|f| {
-                    self.render(f);
-                })
-                .expect("render should not fail to process");
-
-                None
-            }
+            Event::Render => Some(Action::Render),
             Event::Error => {
                 tracing::error!("Error");
                 None
@@ -401,10 +397,7 @@ impl App {
     async fn handle_runtime_event(&mut self, event: cinemotion::RuntimeEvent) -> Option<Action> {
         match event {
             cinemotion::RuntimeEvent::DeviceInit { version: _, id } => Some(Action::AckInit(id)),
-            cinemotion::RuntimeEvent::StateChange(state) => {
-                tracing::info!(?state, "state update");
-                None
-            }
+            cinemotion::RuntimeEvent::StateChange(state) => Some(Action::UpdateSceneGraph(state)),
         }
     }
 
@@ -422,7 +415,9 @@ impl App {
         frame.render_widget(log_widget, log_area);
 
         // Scene Graph Window
-        let scene_graph_widget = SceneGraphWidget::new();
+        tracing::info!("scene state open: {:?}", self.scene_tree_state.opened());
+        tracing::info!("scene graph: {:?}", self.scene_graph);
+        let scene_graph_widget = SceneGraphWidget::new(self.scene_graph.clone());
         frame.render_stateful_widget(
             scene_graph_widget,
             scene_graph_area,
@@ -441,12 +436,51 @@ impl App {
 
     async fn update(
         &mut self,
+        tui: &mut Terminal,
         runtime: &mut cinemotion::Runtime<cinemotion::Running>,
         action: Action,
     ) -> Option<Action> {
         match action {
             Action::AckInit(id) => {
                 runtime.init(id, self.device.clone()).await;
+                None
+            }
+            Action::UpdateSceneGraph(state_tree) => {
+                let mut index: u32 = 0;
+                let mut scene_graph =
+                    TreeItem::new(index, ".", vec![]).expect("scene graph item failed to create");
+                self.scene_tree_state.open(vec![index]);
+                index += 1;
+
+                for (_id, device) in state_tree.devices.into_iter() {
+                    let name = device.name;
+                    let attributes = device.attributes;
+                    let mut device_item = TreeItem::new(index, name.to_string(), vec![])
+                        .expect("device item failed to create");
+                    self.scene_tree_state.open(vec![index]);
+                    index += 1;
+                    for (name, attr) in attributes.iter() {
+                        // TODO: Render Attribute.
+                        let attribute_item = TreeItem::new_leaf(index, name.to_string());
+                        device_item
+                            .add_child(attribute_item)
+                            .expect("failed to add attribute item to scene graph");
+                        self.scene_tree_state.open(vec![index]);
+                        index += 1;
+                    }
+                    scene_graph
+                        .add_child(device_item)
+                        .expect("failed to add device to scene graph");
+                }
+                self.scene_graph = scene_graph;
+
+                Some(Action::Render)
+            }
+            Action::Render => {
+                tui.draw(|f| {
+                    self.render(f);
+                })
+                .expect("render should not fail to process");
                 None
             }
             Action::Quit => {
@@ -462,14 +496,15 @@ struct SceneGraphWidget<'t> {
 }
 
 impl<'t> SceneGraphWidget<'t> {
-    pub fn new() -> Self {
-        let item = TreeItem::new_leaf(0, "leaf");
+    pub fn new(scene_graph: TreeItem<'t, u32>) -> Self {
+        let item = scene_graph;
         Self { items: vec![item] }
     }
 }
 
 impl<'t> StatefulWidget for SceneGraphWidget<'t> {
     type State = TreeState<u32>;
+
     fn render(self, area: ratatui::prelude::Rect, buf: &mut Buffer, state: &mut Self::State) {
         let tree = Tree::new(&self.items).expect("tree did not render");
         StatefulWidget::render(tree, area, buf, state);
