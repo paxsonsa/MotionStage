@@ -6,7 +6,7 @@ use crate::world::World;
 use crate::{devices, globals, scene};
 
 #[derive(Debug, Clone)]
-pub struct StateTree {
+pub struct GlobalState {
     /// The time this state was generated
     pub utime: u128,
     /// The current session state
@@ -19,7 +19,7 @@ pub struct StateTree {
     pub scene: SceneState,
 }
 
-impl StateTree {
+impl GlobalState {
     pub fn new(world: &mut World) -> Self {
         let utime = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -36,11 +36,22 @@ impl StateTree {
 
         let scene = SceneState::new(world);
 
-        StateTree {
+        GlobalState {
             utime,
             session,
             devices,
             scene,
+        }
+    }
+}
+
+impl Default for GlobalState {
+    fn default() -> Self {
+        Self {
+            utime: Default::default(),
+            session: Default::default(),
+            devices: Default::default(),
+            scene: Default::default(),
         }
     }
 }
@@ -50,10 +61,27 @@ pub struct SessionState {
     pub motion_enabled: bool,
 }
 
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            motion_enabled: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SceneState {
     pub info: scene::SceneInfo,
     pub objects: Vec<SceneObject>,
+}
+
+impl Default for SceneState {
+    fn default() -> Self {
+        Self {
+            info: Default::default(),
+            objects: Default::default(),
+        }
+    }
 }
 
 impl SceneState {

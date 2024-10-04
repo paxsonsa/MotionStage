@@ -17,7 +17,7 @@ impl backend::Backend for DummyBackend {
         Ok(())
     }
 
-    async fn update(&mut self) -> core::prelude::Result<core::state::StateTree> {
+    async fn update(&mut self) -> core::prelude::Result<core::state::GlobalState> {
         panic!("not implemented")
     }
 

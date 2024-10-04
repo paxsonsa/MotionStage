@@ -10,6 +10,14 @@ pub struct SceneInfo {
     pub name: Name,
 }
 
+impl Default for SceneInfo {
+    fn default() -> Self {
+        Self {
+            name: name!("Default Scene"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectId(u32);
 

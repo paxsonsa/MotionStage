@@ -14,7 +14,7 @@ pub struct Config {
 #[derive(Debug)]
 pub enum RuntimeEvent {
     DeviceInit { version: u32, id: u32 },
-    StateChange(cinemotion_core::state::StateTree),
+    StateChange(cinemotion_core::state::GlobalState),
 }
 
 pub struct Runtime<State> {

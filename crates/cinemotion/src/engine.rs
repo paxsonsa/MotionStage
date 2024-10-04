@@ -11,7 +11,7 @@ mod engine_test;
 /// Represents events that can occur in the engine.
 pub enum EngineEvent {
     /// Event that occurs on each tick, containing the current state tree.
-    Tick(core::state::StateTree),
+    Tick(core::state::GlobalState),
     /// Event that occurs when an error happens in the engine.
     Error(EngineError),
 }

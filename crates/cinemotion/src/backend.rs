@@ -18,7 +18,7 @@ pub trait Backend {
         device_id: u32,
         message: protocol::client_message::Body,
     ) -> Result<()>;
-    async fn update(&mut self) -> Result<StateTree>;
+    async fn update(&mut self) -> Result<GlobalState>;
     async fn despawn_device_by_id(&mut self, id: u32) -> Result<()>;
 }
 
@@ -81,10 +81,10 @@ impl Backend for DefaultBackend {
         }
     }
 
-    async fn update(&mut self) -> Result<StateTree> {
+    async fn update(&mut self) -> Result<GlobalState> {
         let world = &mut self.world;
         scene::system::update(world)?;
-        let state = StateTree::new(&mut self.world);
+        let state = GlobalState::new(&mut self.world);
         Ok(state)
     }
 }

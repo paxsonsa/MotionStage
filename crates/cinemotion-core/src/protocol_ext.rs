@@ -6,8 +6,8 @@ use name::Name;
 
 /// Implements the `From` trait for converting a `state::StateTree`
 /// into a `protocol::ServerMessage`.
-impl From<state::StateTree> for protocol::ServerMessage {
-    fn from(value: state::StateTree) -> Self {
+impl From<state::GlobalState> for protocol::ServerMessage {
+    fn from(value: state::GlobalState) -> Self {
         protocol::ServerMessage {
             body: Some(protocol::server_message::Body::State(value.into())),
         }
@@ -16,8 +16,8 @@ impl From<state::StateTree> for protocol::ServerMessage {
 
 /// Implements the `From` trait for converting a `state::StateTree`
 /// into a `protocol::State`.
-impl From<state::StateTree> for protocol::State {
-    fn from(value: state::StateTree) -> Self {
+impl From<state::GlobalState> for protocol::State {
+    fn from(value: state::GlobalState) -> Self {
         protocol::State {
             utime: value.utime as u64,
             session: Some(value.session.into()),
@@ -316,9 +316,9 @@ impl Into<protocol::DeviceState> for devices::Device {
     }
 }
 
-impl From<protocol::State> for state::StateTree {
+impl From<protocol::State> for state::GlobalState {
     fn from(proto_state: protocol::State) -> Self {
-        state::StateTree {
+        state::GlobalState {
             utime: proto_state.utime as u128,
             session: proto_state
                 .session
@@ -408,7 +408,7 @@ impl From<protocol::SceneObjectState> for scene::SceneObject {
     }
 }
 
-impl From<protocol::ServerMessage> for state::StateTree {
+impl From<protocol::ServerMessage> for state::GlobalState {
     fn from(proto_msg: protocol::ServerMessage) -> Self {
         match proto_msg.body {
             Some(protocol::server_message::Body::State(state)) => state.into(),
