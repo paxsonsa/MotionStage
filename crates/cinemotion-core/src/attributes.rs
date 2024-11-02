@@ -1,6 +1,9 @@
 use crate::prelude::*;
 
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use bevy_ecs::prelude::Component;
 use std::{
@@ -432,6 +435,18 @@ impl Matrix44 {
         if x < 4 && y < 4 {
             self.data[y * 4 + x] = value;
         }
+    }
+
+    /// Iterate over the rows in the matrix.
+    pub fn iter_rows<'a>(&'a self) -> impl Iterator<Item = [f64; 4]> + 'a {
+        (0..4).map(move |i| {
+            [
+                self.data[i * 4],
+                self.data[i * 4 + 1],
+                self.data[i * 4 + 2],
+                self.data[i * 4 + 3],
+            ]
+        })
     }
 }
 

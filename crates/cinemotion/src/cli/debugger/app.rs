@@ -23,7 +23,7 @@ pub struct App {
     should_quit: bool,
     scene_state: cinemotion_core::state::GlobalState,
     log_buffer: Arc<Mutex<log_view::RingBuffer<log_view::LogEvent>>>,
-    scene_tree_state: TreeState<u32>,
+    scene_tree_state: TreeState<String>,
 }
 
 impl App {
@@ -158,7 +158,8 @@ impl App {
         frame.render_widget(log_widget, log_area);
 
         // Scene Graph Window
-        let scene_graph_widget = scene_tree::SceneGraphWidget::new(&self.scene_state);
+        let scene_graph_widget =
+            scene_tree::SceneGraphWidget::build(&self.scene_state, &mut self.scene_tree_state);
         frame.render_stateful_widget(
             scene_graph_widget,
             scene_graph_area,
@@ -186,48 +187,8 @@ impl App {
                 runtime.init(id, self.device.clone()).await;
                 None
             }
-            Action::UpdateState(state_tree) => {
-                let mut index: u32 = 0;
-                let mut scene_graph = TreeItem::new(index, "Scene State", vec![])
-                    .expect("scene graph item failed to create");
-                let mut opened = vec![index];
-                self.scene_tree_state.open(opened.clone());
-                index += 1;
-
-                let mut devices = TreeItem::new(index, "devices".to_string(), vec![])
-                    .expect("failed to create tree item");
-                opened.push(index);
-                self.scene_tree_state.open(opened.clone());
-                index += 1;
-
-                for (_id, device) in state_tree.devices.into_iter() {
-                    let name = device.name;
-                    let attributes = device.attributes;
-                    let mut device_item = TreeItem::new(index, name.to_string(), vec![])
-                        .expect("device item failed to create");
-                    opened.push(index);
-                    self.scene_tree_state.open(opened.clone());
-                    index += 1;
-                    for (name, attr) in attributes.iter() {
-                        // TODO: Render Attribute.
-                        let attribute_item = TreeItem::new_leaf(index, name.to_string());
-                        device_item
-                            .add_child(attribute_item)
-                            .expect("failed to add attribute item to scene graph");
-                        opened.push(index);
-                        self.scene_tree_state.open(opened.to_vec());
-                        index += 1;
-                    }
-                    devices
-                        .add_child(device_item)
-                        .expect("failed to add device to scene graph");
-                }
-                scene_graph.add_child(devices).expect("failed to add child");
-
-                // tracing::info!(?opened, "opening");
-                self.scene_graph = scene_graph;
-                // self.scene_tree_state.open(opened);
-
+            Action::UpdateState(state) => {
+                self.scene_state = state;
                 Some(Action::Render)
             }
             Action::Render => {
