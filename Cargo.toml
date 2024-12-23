@@ -14,7 +14,6 @@ async-trait = "0.1.75"
 bytes = "1.6"
 chrono = "0.4.24"
 cinemotion = { path = "crates/cinemotion" }
-cinemotion-proto = { path = "crates/cinemotion-proto" }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3.30"
 get_if_addrs = "0.5"
