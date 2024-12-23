@@ -1,60 +1,58 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 
-mod start;
+mod server;
 
-/// A server for receiving and processing streamed motion data.
+/// A tool for running, debugging and testing a cinemotion server.
 #[derive(Parser)]
-#[clap(about, author)]
+#[clap(about, author, version)]
 struct Opt {
-    /// Make output more verbose
+    /// Make the output more verbose.
     #[clap(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
 
-    /// Make output less verbose
-    ///
-    /// This flag takes precedence over the --verbose flag
-    #[clap(short, long, global = true, action = ArgAction::Count)]
-    quiet: u8,
-
-    /// The subcommand to run
+    /// The subcommand to run.
     #[clap(subcommand)]
-    command: Command,
+    subcommand: Command,
 }
 
+/// Subcommands for the CLI
 #[derive(clap::Subcommand)]
 enum Command {
     /// Print the version information.
     Version,
-    // Start the cinemotion broker service
-    Start(start::StartCmd),
+    /// Start a standalone cinemotion server.
+    Server(server::ServerCmd),
 }
 
 impl Command {
-    pub fn run(&self) -> Result<i32> {
+    pub fn run(&self, opts: &Opt) -> Result<i32> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .context("Failed to establish async runtime")?;
-        rt.block_on(self.run_async())
+            .context("Failed to create tokio runtime")?;
+
+        actix::System::with_tokio_rt(|| rt).block_on(async { self.run_async(opts).await })
     }
 
-    pub async fn run_async(&self) -> Result<i32> {
+    async fn run_async(&self, opts: &Opt) -> Result<i32> {
         match self {
-            Self::Version => {
-                println!("cinemotion: {}", cinemotion::VERSION);
+            Command::Version => {
+                println!("cinemotion {}", env!("CARGO_PKG_VERSION"));
                 Ok(0)
             }
-            Self::Start(cmd) => cmd.run().await,
+            Command::Server(cmd) => {
+                configure_logging(i32::from(opts.verbose));
+                cmd.run().await
+            }
         }
     }
 }
 
 fn main() -> Result<()> {
     let opts = Opt::parse();
-    configure_logging(i32::from(opts.verbose) - i32::from(opts.quiet));
-    let code = opts.command.run()?;
-    std::process::exit(code);
+    let result = opts.subcommand.run(&opts)?;
+    std::process::exit(result);
 }
 
 pub fn configure_logging(verbosity: i32) {

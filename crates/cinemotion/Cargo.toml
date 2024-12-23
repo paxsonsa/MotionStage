@@ -8,7 +8,7 @@ license.workspace = true
 
 [[bin]]
 name = "cinemotion"
-path = "src/cli/cinemotion.rs"
+path = "src/cli/main.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -19,7 +19,6 @@ arc-swap.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
-cinemotion-proto.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -37,6 +36,11 @@ rustls.workspace = true
 rcgen.workspace = true
 hostname.workspace = true
 get_if_addrs.workspace = true
+actix = "0.13.5"
+actix-web = "4.9.0"
+actix-ws = "0.3.0"
+typed-builder = "0.20.0"
+env_logger = "0.11.6"
 
 [dev-dependencies]
 paste = "1.0"
