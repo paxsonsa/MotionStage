@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "maturin>=1.7,<2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cinemotion-sdk"
+version = "0.1.0"
+description = "CineMotion Python SDK"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cinemotion_sdk*", "blender_adapter*"]
+
+[tool.maturin]
+manifest-path = "../crates/cinemotion-sdk-python/Cargo.toml"
+module-name = "cinemotion_sdk_rust"
+python-source = "."
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

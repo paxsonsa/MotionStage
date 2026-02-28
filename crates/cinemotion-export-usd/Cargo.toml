@@ -1,0 +1,13 @@
+[package]
+name = "cinemotion-export-usd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cinemotion-recording.workspace = true
+cinemotion-core.workspace = true
+
+[dev-dependencies]
+cinemotion-protocol.workspace = true
+uuid.workspace = true
