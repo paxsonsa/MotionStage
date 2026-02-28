@@ -570,11 +570,14 @@ name = "cinemotion-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cinemotion-core",
+ "cinemotion-protocol",
  "cinemotion-server",
  "clap",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

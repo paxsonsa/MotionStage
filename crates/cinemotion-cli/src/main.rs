@@ -1,6 +1,8 @@
 use anyhow::Result;
 use cinemotion_server::{ServerConfig, ServerHandle};
 use clap::{Parser, Subcommand};
+mod simulate;
+use simulate::SimulateArgs;
 
 #[derive(Parser)]
 #[command(author, version, about = "CineMotion command line interface")]
@@ -12,6 +14,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    Simulate(SimulateArgs),
     Version,
 }
 
@@ -33,6 +36,9 @@ async fn main() -> Result<()> {
 
             tokio::signal::ctrl_c().await?;
             server.stop().await?;
+        }
+        Command::Simulate(args) => {
+            simulate::run(args).await?;
         }
         Command::Version => {
             println!("cinemotion-cli {}", env!("CARGO_PKG_VERSION"));
