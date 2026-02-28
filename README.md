@@ -42,6 +42,13 @@ Hardening gates: [`docs/hardening.md`](/Users/apaxson/work/projects/cinemotion/d
 ```bash
 cargo test
 cargo run -p cinemotion-cli -- serve
+cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
 python -m pip install -e ./python
 python -m pytest -q python/tests
 ```
+
+`simulate` starts a demo motion source with a mapped `vec3` sine wave and an interactive shell:
+- `start` / `stop`
+- `record start [path]` / `record stop`
+- `amp <value>` / `freq <value>`
+- `status`
