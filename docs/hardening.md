@@ -44,4 +44,4 @@ Operators should route tracing to their observability backend and create dashboa
 
 - Rust compile + tests: `cargo build --verbose`, `cargo test --verbose`.
 - Python package tests: `python -m pip install -e ./python` followed by `python -m pytest -q python/tests`.
-- Native extension gate: `maturin build --manifest-path crates/cinemotion-sdk-python/Cargo.toml` and import smoke test for `cinemotion_sdk_rust`.
+- Native extension gate: `maturin build --manifest-path crates/cinemotion-sdk-python/Cargo.toml --features extension-module` and import smoke test for `cinemotion_sdk_rust`.

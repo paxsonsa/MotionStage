@@ -24,6 +24,7 @@ manifest-path = "../crates/cinemotion-sdk-python/Cargo.toml"
 module-name = "cinemotion_sdk_rust"
 python-source = "."
 bindings = "pyo3"
+features = ["extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

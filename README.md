@@ -1,54 +1,87 @@
 # CineMotion v1
 
-CineMotion is a sidecar, server-authoritative runtime for virtual camera and motion workflows.
+CineMotion is a server-authoritative runtime for virtual camera and motion workflows.
 
-## Implemented baseline
+## Get Started Fast
 
-- Headless Bevy ECS-backed runtime core (`cinemotion-core`)
-- Session + handshake model (`cinemotion-server`)
-- Runtime lifecycle ownership with sidecar start/stop, QUIC accept loop, discovery, and scheduler loops (`cinemotion-server`)
-- Mapping lease/lock policy with recording freeze rules (`cinemotion-core`)
-- Component-mask transform engine for scalar/vector attribute routing (`cinemotion-core`)
-- QUIC/WebRTC-oriented protocol and transport contracts (`cinemotion-protocol`, `cinemotion-media`)
-- QUIC transport implementation with control streams + motion datagrams (`cinemotion-transport-quic`)
-- Server-owned WebRTC peer session path with SDP/ICE handling (`cinemotion-server`, `cinemotion-webrtc`)
-- HDR10 video descriptor model + SDR fallback negotiation (`cinemotion-media`)
-- Native `.cmtrk` recording format with `CMTRK2` markers + `CMTRK1` backward compatibility (`cinemotion-recording`)
-- Deterministic USD/CHAN exporters (`cinemotion-export-usd`, `cinemotion-export-chan`)
-- CLI skeleton (`cinemotion-cli`)
-- Test harness (`cinemotion-testkit`)
-- Python strict OOP delegate SDK + optional Rust bridge (`python/cinemotion_sdk`, `cinemotion-sdk-python`)
+### Fastest path (single command, interactive demo)
 
-## Workspace layout
+This path gets you to a working motion stream and recording in minutes.
 
-- `/crates/cinemotion-protocol`
-- `/crates/cinemotion-core`
-- `/crates/cinemotion-server`
-- `/crates/cinemotion-discovery`
-- `/crates/cinemotion-media`
-- `/crates/cinemotion-transport-quic`
-- `/crates/cinemotion-recording`
-- `/crates/cinemotion-export-usd`
-- `/crates/cinemotion-export-chan`
-- `/crates/cinemotion-cli`
-- `/crates/cinemotion-testkit`
-- `/python/cinemotion_sdk`
+```bash
+cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+```
 
-Implementation tracker: [`docs/tasks.md`](/Users/apaxson/work/projects/cinemotion/docs/tasks.md)
-Hardening gates: [`docs/hardening.md`](/Users/apaxson/work/projects/cinemotion/docs/hardening.md)
+Then in the `cinemotion-sim>` prompt:
 
-## Run
+```text
+start
+record start recordings/demo.cmtrk
+status
+record stop
+quit
+```
+
+What you get:
+- A local CineMotion runtime
+- A demo scene and mapping (`demo.position` -> camera `position`)
+- Live `vec3` motion samples
+- A `.cmtrk` recording you can export with the DCC integrator crates
+
+### Server-only path (for real device clients)
+
+```bash
+cargo run -p cinemotion-cli -- serve
+```
+
+This starts the runtime, QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
+
+## How It Works (90 seconds)
+
+1. A device discovers and connects to CineMotion over QUIC.
+2. The control handshake negotiates protocol/features and creates a session.
+3. The server owns scene state, mapping rules, and runtime mode (`Idle`, `Live`, `Recording`).
+4. Motion sources send datagrams with attribute updates.
+5. CineMotion applies mapping transforms and filters, then publishes snapshots.
+6. In recording mode, CineMotion writes `.cmtrk` (`CMTRK2`) with frame and marker events.
+7. DCC integrators export recordings to deterministic USD or CHAN text output.
+
+## Documentation
+
+- [Design and Architecture](docs/design-architecture.md)
+- [Concepts and Workflow](docs/concepts-workflow.md)
+- [DCC Integrators](docs/dcc-integrators.md)
+- [Device Integrators](docs/device-integrators.md)
+- [Protocol Overview](docs/protocol.md)
+- [Hardening Gates](docs/hardening.md)
+- [Completion Matrix](docs/tasks.md)
+
+### Integrator Quick Paths
+
+- DCC integrators: follow [DCC Integrators](docs/dcc-integrators.md) `Build + Test Path (Matrix)` to generate a fixture recording, validate adapter contracts, and assert deterministic USD/CHAN output.
+- Device integrators: follow [Device Integrators](docs/device-integrators.md) `Build + Test Path (Matrix)` and start with `Dry Run A` before hardware bring-up.
+
+## Workspace Layout
+
+- `crates/cinemotion-core`: runtime scene/mapping/mode model and transform/filter engine
+- `crates/cinemotion-server`: authoritative server lifecycle, session state machine, scheduling, recording
+- `crates/cinemotion-protocol`: wire contracts, roles/features, control messages, version negotiation
+- `crates/cinemotion-transport-quic`: QUIC transport, control streams, motion datagrams
+- `crates/cinemotion-discovery`: mDNS advertisement/browser (`_cinemotion._udp.local`)
+- `crates/cinemotion-media`: video descriptor model, HDR10/SDR negotiation, signaling queue
+- `crates/cinemotion-webrtc`: server-owned WebRTC peer/session helpers
+- `crates/cinemotion-recording`: `.cmtrk` read/write/index support (`CMTRK1` + `CMTRK2`)
+- `crates/cinemotion-export-usd`: deterministic USD text exporter
+- `crates/cinemotion-export-chan`: deterministic CHAN exporter
+- `crates/cinemotion-cli`: `serve` and `simulate` workflows
+- `crates/cinemotion-testkit`: integration harness and soak helpers
+- `python/cinemotion_sdk`: strict OOP delegate SDK and optional native Rust bridge
+- `python/blender_adapter`: reference Blender delegate adapter
+
+## Validation
 
 ```bash
 cargo test
-cargo run -p cinemotion-cli -- serve
-cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
 python -m pip install -e ./python
 python -m pytest -q python/tests
 ```
-
-`simulate` starts a demo motion source with a mapped `vec3` sine wave and an interactive shell:
-- `start` / `stop`
-- `record start [path]` / `record stop`
-- `amp <value>` / `freq <value>`
-- `status`
