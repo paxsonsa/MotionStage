@@ -2,3 +2,6 @@
 
 .vscode/
 .DS_Store
+python/.venv/
+python/.pytest_cache/
+python/**/__pycache__/

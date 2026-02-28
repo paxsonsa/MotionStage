@@ -1,15 +1,111 @@
-# CineMotion: Device Motion Streaming Framework
-In the age of AR/VR, Virtual Production, and Computer Graphics, translating motion from the real world into the computer world is becoming a great tool for creative workflows. 
-Unfortunately, existing motion capture systems are pricey, integrations to existing software you use may no exist and you may want to transmit motion from multiple devices and systems.
+<p align="center">
+  <img src="docs/assets/motionstage-icon.svg" width="144" alt="MotionStage icon" />
+</p>
 
-CineMotion is a framework/protocol that:
-1) Helps embed motion streaming from devices in DCC application more easily.
-2) A protocol allowing for multiple devices to stream motion data together.
-3) Help integrators by avoiding worrying about the networking connectivity integration.
-4) Defines a network transport so new devices can easily integrate.
+# MotionStage
 
-# Benefits
-- Most 'motion streaming' integrations are application specific (e.g. just for Unreal, Maya etc). CineMotion is DCC agnostic.
-- No device/Application lock in: Many existing motion streaming tools require you to pay for an app or some hardware. CineMotion does not, it allows you to integrate your own device/software to stream data.
-- Simple API for implementing python integrations (the norm in VFX/Games tools) or use the rust, c++, or swift bindings.
+<p align="center">
+  <strong>Server-authoritative runtime for virtual camera and motion workflows.</strong>
+</p>
 
+<p align="center">
+  <a href="https://github.com/paxsonsa/motionstage/actions/workflows/rust.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/paxsonsa/motionstage/rust.yml?label=ci&logo=github" /></a>
+  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-0ea5e9" />
+  <img alt="Rust 2021" src="https://img.shields.io/badge/rust-2021-000000?logo=rust" />
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-16a34a" />
+</p>
+
+## What MotionStage Is
+
+MotionStage provides a deterministic motion runtime where the server owns scene state, mapping, and recording behavior. It is designed for:
+
+- virtual camera ingest from devices over QUIC
+- real-time mapping and filter pipelines for scene attributes
+- deterministic `.cmtrk` capture and export to USD/CHAN
+- integration across Rust crates and Python-based DCC adapters
+
+## Why MotionStage Exists
+
+Virtual production tooling is often expensive, fragmented, or built for large studios. MotionStage exists to make the same core workflow available to everyday artists, small teams, and indie creators.
+
+The goal is practical access:
+
+- capture and stream motion without studio-scale infrastructure
+- keep data portable with open, deterministic recording and export paths
+- let artists connect familiar DCC tools through clear SDK and adapter contracts
+- make iterative VP workflows reproducible on normal development hardware
+
+MotionStage focuses on the runtime layer so creators can spend less time wiring systems together and more time making shots.
+
+## Get Started
+
+### Interactive demo (fastest path)
+
+```bash
+cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+```
+
+Then in `motionstage-sim>`:
+
+```text
+start
+record start recordings/demo.cmtrk
+status
+record stop
+quit
+```
+
+This gives you a local runtime, live motion samples, and a recording exportable by integrator crates.
+
+### Server mode (for real clients)
+
+```bash
+cargo run -p motionstage-cli -- serve
+```
+
+This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
+
+## Runtime Flow
+
+1. Device discovers and connects over QUIC.
+2. Control handshake negotiates versions/features and opens a session.
+3. Server applies mapping transforms and filters to incoming attributes.
+4. Runtime publishes snapshots for downstream systems.
+5. Recording mode persists `.cmtrk` (`CMTRK2`) events.
+6. Export crates produce deterministic USD or CHAN output.
+
+## Docs
+
+- [Design and Architecture](docs/design-architecture.md)
+- [Concepts and Workflow](docs/concepts-workflow.md)
+- [DCC Integrators](docs/dcc-integrators.md)
+- [Device Integrators](docs/device-integrators.md)
+- [Protocol Overview](docs/protocol.md)
+- [Hardening Gates](docs/hardening.md)
+- [Completion Matrix](docs/tasks.md)
+
+## Workspace Layout
+
+- `crates/motionstage-core`: scene/mapping/mode model, transform/filter engine
+- `crates/motionstage-server`: authoritative lifecycle, sessions, scheduling, recording
+- `crates/motionstage-protocol`: wire contracts, role/features, control negotiation
+- `crates/motionstage-transport-quic`: QUIC transport, control streams, motion datagrams
+- `crates/motionstage-discovery`: mDNS advertisement/browser (`_motionstage._udp.local`)
+- `crates/motionstage-media`: video descriptor model and signaling queue
+- `crates/motionstage-webrtc`: server-owned WebRTC helpers
+- `crates/motionstage-recording`: `.cmtrk` read/write/index (`CMTRK1` + `CMTRK2`)
+- `crates/motionstage-export-usd`: deterministic USD text exporter
+- `crates/motionstage-export-chan`: deterministic CHAN exporter
+- `crates/motionstage-cli`: `serve` and `simulate` workflows
+- `crates/motionstage-testkit`: integration harness and soak helpers
+- `python/motionstage_sdk`: strict OOP delegate SDK and optional native Rust bridge
+- `python/blender_adapter`: reference Blender delegate adapter
+
+## Validate
+
+```bash
+cargo test --workspace
+python -m pip install -e ./python
+python -m pytest -q python/tests
+```

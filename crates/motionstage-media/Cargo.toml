@@ -1,0 +1,15 @@
+[package]
+name = "motionstage-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
+motionstage-protocol.workspace = true
+
+[dev-dependencies]

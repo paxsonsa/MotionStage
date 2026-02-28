@@ -1,0 +1,22 @@
+[package]
+name = "motionstage-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+motionstage-protocol.workspace = true
+motionstage-core.workspace = true
+motionstage-media.workspace = true
+motionstage-recording.workspace = true
+motionstage-discovery.workspace = true
+motionstage-transport-quic.workspace = true
+motionstage-webrtc.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
