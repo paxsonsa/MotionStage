@@ -8,6 +8,10 @@ license.workspace = true
 name = "cinemotion_sdk_rust"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 pyo3.workspace = true
 tokio.workspace = true
