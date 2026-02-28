@@ -1,0 +1,16 @@
+[package]
+name = "motionstage-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+uuid.workspace = true
+indexmap.workspace = true
+bevy_ecs.workspace = true
+motionstage-protocol.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

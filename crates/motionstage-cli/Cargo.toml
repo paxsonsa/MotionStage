@@ -1,0 +1,20 @@
+[package]
+name = "motionstage-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "motionstage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+motionstage-server.workspace = true
+motionstage-core.workspace = true
+motionstage-protocol.workspace = true
+uuid.workspace = true

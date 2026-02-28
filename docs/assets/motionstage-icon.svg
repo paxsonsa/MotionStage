@@ -1,0 +1,40 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">MotionStage icon</title>
+  <desc id="desc">A warm-toned stage with a virtual production wall, a captured performer, and streaming motion paths.</desc>
+
+  <rect x="32" y="32" width="448" height="448" rx="92" fill="#F3E5D0"/>
+  <rect x="56" y="56" width="400" height="400" rx="72" stroke="#2A241E" stroke-width="4"/>
+
+  <rect x="92" y="108" width="328" height="246" rx="40" fill="#E9D6BC" stroke="#2A241E" stroke-width="8"/>
+  <rect x="122" y="140" width="268" height="164" rx="18" fill="#D7BFA1" stroke="#2A241E" stroke-width="6"/>
+
+  <path d="M188 140V304" stroke="#B59B7A" stroke-width="4"/>
+  <path d="M256 140V304" stroke="#B59B7A" stroke-width="4"/>
+  <path d="M324 140V304" stroke="#B59B7A" stroke-width="4"/>
+  <path d="M122 194H390" stroke="#B59B7A" stroke-width="4"/>
+  <path d="M122 250H390" stroke="#B59B7A" stroke-width="4"/>
+
+  <path d="M86 332H426L452 390H60L86 332Z" fill="#C4673A"/>
+  <path d="M104 332H408L420 354H92L104 332Z" fill="#D9824F"/>
+  <path d="M104 332H408" stroke="#2A241E" stroke-width="5" stroke-linecap="round"/>
+
+  <circle cx="256" cy="208" r="14" fill="#2A241E"/>
+  <path d="M256 226V276" stroke="#2A241E" stroke-width="8" stroke-linecap="round"/>
+  <path d="M226 246L286 246" stroke="#2A241E" stroke-width="8" stroke-linecap="round"/>
+  <path d="M256 276L230 308" stroke="#2A241E" stroke-width="8" stroke-linecap="round"/>
+  <path d="M256 276L282 308" stroke="#2A241E" stroke-width="8" stroke-linecap="round"/>
+
+  <circle cx="226" cy="246" r="7" fill="#E4A13A" stroke="#2A241E" stroke-width="3"/>
+  <circle cx="286" cy="246" r="7" fill="#E4A13A" stroke="#2A241E" stroke-width="3"/>
+  <circle cx="256" cy="276" r="7" fill="#E4A13A" stroke="#2A241E" stroke-width="3"/>
+  <circle cx="230" cy="308" r="7" fill="#E4A13A" stroke="#2A241E" stroke-width="3"/>
+  <circle cx="282" cy="308" r="7" fill="#E4A13A" stroke="#2A241E" stroke-width="3"/>
+  <circle cx="256" cy="208" r="20" stroke="#C4673A" stroke-width="4" stroke-dasharray="8 6"/>
+
+  <path d="M108 366C165 332 202 344 242 312C289 273 334 279 396 234" stroke="#7E3F2A" stroke-width="11" stroke-linecap="round"/>
+  <path d="M118 388C184 356 222 364 268 338C313 313 343 316 382 294" stroke="#E4A13A" stroke-width="8" stroke-linecap="round"/>
+
+  <circle cx="108" cy="366" r="11" fill="#7E3F2A"/>
+  <circle cx="242" cy="312" r="11" fill="#B65332"/>
+  <circle cx="396" cy="234" r="11" fill="#E4A13A"/>
+</svg>

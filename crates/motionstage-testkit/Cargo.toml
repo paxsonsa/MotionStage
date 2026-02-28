@@ -1,0 +1,12 @@
+[package]
+name = "motionstage-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+motionstage-server.workspace = true
+motionstage-protocol.workspace = true
+motionstage-core.workspace = true
+uuid.workspace = true
+tokio.workspace = true

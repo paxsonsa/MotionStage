@@ -2,23 +2,23 @@
 
 ## Goal
 
-Device integrators connect cameras, trackers, controllers, or companion apps to CineMotion’s server-authoritative runtime.
+Device integrators connect cameras, trackers, controllers, or companion apps to MotionStage’s server-authoritative runtime.
 
 ## Build + Test Path (Matrix)
 
 | Phase | Goal | Commands | Pass Criteria |
 |---|---|---|---|
-| P1 | Validate runtime and protocol baseline | `cargo test -p cinemotion-server -p cinemotion-transport-quic -p cinemotion-testkit` | Handshake, signaling, ingest, and soak tests pass |
-| P2 | Dry run with built-in simulated device | `cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120` then `start`, `status`, `record start recordings/device-dryrun.cmtrk`, `record stop`, `quit` | Motion counters increase and recording is generated |
-| P3 | Loopback transport dry run (real QUIC path) | `cargo test -p cinemotion-server quic_runtime_accepts_session_and_ingests_motion -- --nocapture` and `cargo test -p cinemotion-server quic_control_routes_and_drains_video_signals -- --nocapture` | QUIC control + datagram path passes end-to-end |
-| P4 | Bring up your real device client | Point your client at `cargo run -p cinemotion-cli -- serve` endpoint | Client reaches `Active` session state and motion updates apply |
+| P1 | Validate runtime and protocol baseline | `cargo test -p motionstage-server -p motionstage-transport-quic -p motionstage-testkit` | Handshake, signaling, ingest, and soak tests pass |
+| P2 | Dry run with built-in simulated device | `cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120` then `start`, `status`, `record start recordings/device-dryrun.cmtrk`, `record stop`, `quit` | Motion counters increase and recording is generated |
+| P3 | Loopback transport dry run (real QUIC path) | `cargo test -p motionstage-server quic_runtime_accepts_session_and_ingests_motion -- --nocapture` and `cargo test -p motionstage-server quic_control_routes_and_drains_video_signals -- --nocapture` | QUIC control + datagram path passes end-to-end |
+| P4 | Bring up your real device client | Point your client at `cargo run -p motionstage-cli -- serve` endpoint | Client reaches `Active` session state and motion updates apply |
 
 ## Quickest Path to First Device Integration
 
 Use the local simulator first to validate your expected cadence and mapping behavior:
 
 ```bash
-cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
 ```
 
 Then switch to `serve` and replace the simulated client with your device-side client implementation.
@@ -36,7 +36,7 @@ Use these before real hardware bring-up.
 Command:
 
 ```bash
-cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
 ```
 
 Smoke commands:
@@ -57,13 +57,13 @@ quit
 Commands:
 
 ```bash
-cargo test -p cinemotion-server quic_runtime_accepts_session_and_ingests_motion -- --nocapture
-cargo test -p cinemotion-server quic_control_routes_and_drains_video_signals -- --nocapture
+cargo test -p motionstage-server quic_runtime_accepts_session_and_ingests_motion -- --nocapture
+cargo test -p motionstage-server quic_control_routes_and_drains_video_signals -- --nocapture
 ```
 
 ## Transport Contract
 
-- Discovery: mDNS `_cinemotion._udp.local.`
+- Discovery: mDNS `_motionstage._udp.local.`
 - Transport: QUIC
 - Control channel: bi-directional stream (`ControlMessage`)
 - Motion channel: QUIC datagrams (`MotionDatagram`)

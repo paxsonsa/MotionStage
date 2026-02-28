@@ -1,0 +1,16 @@
+[package]
+name = "motionstage-recording"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+uuid.workspace = true
+motionstage-core.workspace = true
+motionstage-protocol.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"

@@ -2,7 +2,7 @@
 
 ## Goal
 
-DCC integrators consume CineMotion recordings or runtime callbacks and map them into scene-authoring tools.
+DCC integrators consume MotionStage recordings or runtime callbacks and map them into scene-authoring tools.
 
 This repo provides two integration surfaces:
 - Offline export surface (USD/CHAN from `.cmtrk`)
@@ -13,7 +13,7 @@ This repo provides two integration surfaces:
 1. Generate a recording:
 
 ```bash
-cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788
+cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788
 ```
 
 At prompt:
@@ -32,8 +32,8 @@ There is currently no dedicated export CLI command in this repository; export is
 
 | Phase | Goal | Commands | Pass Criteria |
 |---|---|---|---|
-| P1 | Validate local toolchain | `cargo test -p cinemotion-recording -p cinemotion-export-usd -p cinemotion-export-chan` | Recording/export crates pass locally |
-| P2 | Generate deterministic fixture recording | `cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120` then `start`, `record start recordings/integration.cmtrk`, `record stop`, `quit` | `recordings/integration.cmtrk` exists and has non-zero frames |
+| P1 | Validate local toolchain | `cargo test -p motionstage-recording -p motionstage-export-usd -p motionstage-export-chan` | Recording/export crates pass locally |
+| P2 | Generate deterministic fixture recording | `cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120` then `start`, `record start recordings/integration.cmtrk`, `record stop`, `quit` | `recordings/integration.cmtrk` exists and has non-zero frames |
 | P3 | Validate Python integration surface | `python -m pip install -e ./python` and `python -m pytest -q python/tests/test_server.py python/tests/test_blender_adapter.py python/tests/test_video.py` | Delegate and video endpoint contracts pass |
 | P4 | Validate exporter determinism in your adapter | Use the snippet below in your integration tests | Two consecutive exports are identical for the same input |
 
@@ -41,18 +41,18 @@ There is currently no dedicated export CLI command in this repository; export is
 
 ### Recording input
 
-Use `cinemotion-recording::read_recording(path)` to load a `.cmtrk` file.
+Use `motionstage-recording::read_recording(path)` to load a `.cmtrk` file.
 
 - Supports `CMTRK2` (markers + frames)
 - Supports `CMTRK1` read compatibility
 
 ### USD export
 
-`cinemotion-export-usd::export(&recording)` returns deterministic USD text (`#usda 1.0`) for the input recording.
+`motionstage-export-usd::export(&recording)` returns deterministic USD text (`#usda 1.0`) for the input recording.
 
 ### CHAN export
 
-`cinemotion-export-chan::export(&recording)` returns deterministic channel text.
+`motionstage-export-chan::export(&recording)` returns deterministic channel text.
 
 - `Vec3f` is expanded into `.tx/.ty/.tz`
 - `Quatf` is expanded into `.qx/.qy/.qz/.qw`
@@ -60,12 +60,12 @@ Use `cinemotion-recording::read_recording(path)` to load a `.cmtrk` file.
 ### Minimal export adapter test pattern
 
 ```rust
-use cinemotion_recording::read_recording;
+use motionstage_recording::read_recording;
 
 fn export_both(path: &str) -> (String, String) {
     let recording = read_recording(path).expect("recording should load");
-    let usd = cinemotion_export_usd::export(&recording);
-    let chan = cinemotion_export_chan::export(&recording);
+    let usd = motionstage_export_usd::export(&recording);
+    let chan = motionstage_export_chan::export(&recording);
     (usd, chan)
 }
 
@@ -81,20 +81,20 @@ fn export_is_stable() {
 
 ## Live Python Integrators
 
-Python package: `python/cinemotion_sdk`
+Python package: `python/motionstage_sdk`
 
 ```bash
 python -m pip install -e ./python
 ```
 
 Key objects:
-- `CineServer`: runtime facade (fallback Python implementation + optional native Rust bridge)
+- `MotionStageServer`: runtime facade (fallback Python implementation + optional native Rust bridge)
 - `SceneUpdateDelegate`: callback contract for scene snapshots, attribute batches, mapping/mode/client/recording events
 - `VideoStreamEndpoint`: pull/push video endpoint abstraction for DCC host integration
 
 ## Blender Reference Adapter
 
-Reference module: `python/blender_adapter/cinemotion_blender_adapter.py`
+Reference module: `python/blender_adapter/motionstage_blender_adapter.py`
 
 - Implements `SceneUpdateDelegate`
 - Resolves Blender objects by name (`bpy.data.objects.get`)

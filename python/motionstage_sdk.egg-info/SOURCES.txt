@@ -1,0 +1,15 @@
+pyproject.toml
+blender_adapter/__init__.py
+blender_adapter/motionstage_blender_adapter.py
+motionstage_sdk/__init__.py
+motionstage_sdk/delegates.py
+motionstage_sdk/server.py
+motionstage_sdk/video.py
+motionstage_sdk.egg-info/PKG-INFO
+motionstage_sdk.egg-info/SOURCES.txt
+motionstage_sdk.egg-info/dependency_links.txt
+motionstage_sdk.egg-info/requires.txt
+motionstage_sdk.egg-info/top_level.txt
+tests/test_blender_adapter.py
+tests/test_server.py
+tests/test_video.py

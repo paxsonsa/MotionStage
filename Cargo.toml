@@ -1,18 +1,18 @@
 [workspace]
 members = [
-  "crates/cinemotion-protocol",
-  "crates/cinemotion-core",
-  "crates/cinemotion-server",
-  "crates/cinemotion-transport-quic",
-  "crates/cinemotion-webrtc",
-  "crates/cinemotion-discovery",
-  "crates/cinemotion-media",
-  "crates/cinemotion-recording",
-  "crates/cinemotion-export-usd",
-  "crates/cinemotion-export-chan",
-  "crates/cinemotion-sdk-python",
-  "crates/cinemotion-cli",
-  "crates/cinemotion-testkit",
+  "crates/motionstage-protocol",
+  "crates/motionstage-core",
+  "crates/motionstage-server",
+  "crates/motionstage-transport-quic",
+  "crates/motionstage-webrtc",
+  "crates/motionstage-discovery",
+  "crates/motionstage-media",
+  "crates/motionstage-recording",
+  "crates/motionstage-export-usd",
+  "crates/motionstage-export-chan",
+  "crates/motionstage-sdk-python",
+  "crates/motionstage-cli",
+  "crates/motionstage-testkit",
 ]
 resolver = "2"
 
@@ -45,15 +45,15 @@ rcgen = "0.13"
 mdns-sd = "0.13"
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
 webrtc = "0.11"
-cinemotion-protocol = { path = "crates/cinemotion-protocol" }
-cinemotion-core = { path = "crates/cinemotion-core" }
-cinemotion-server = { path = "crates/cinemotion-server" }
-cinemotion-discovery = { path = "crates/cinemotion-discovery" }
-cinemotion-media = { path = "crates/cinemotion-media" }
-cinemotion-recording = { path = "crates/cinemotion-recording" }
-cinemotion-export-usd = { path = "crates/cinemotion-export-usd" }
-cinemotion-export-chan = { path = "crates/cinemotion-export-chan" }
-cinemotion-sdk-python = { path = "crates/cinemotion-sdk-python" }
-cinemotion-testkit = { path = "crates/cinemotion-testkit" }
-cinemotion-transport-quic = { path = "crates/cinemotion-transport-quic" }
-cinemotion-webrtc = { path = "crates/cinemotion-webrtc" }
+motionstage-protocol = { path = "crates/motionstage-protocol" }
+motionstage-core = { path = "crates/motionstage-core" }
+motionstage-server = { path = "crates/motionstage-server" }
+motionstage-discovery = { path = "crates/motionstage-discovery" }
+motionstage-media = { path = "crates/motionstage-media" }
+motionstage-recording = { path = "crates/motionstage-recording" }
+motionstage-export-usd = { path = "crates/motionstage-export-usd" }
+motionstage-export-chan = { path = "crates/motionstage-export-chan" }
+motionstage-sdk-python = { path = "crates/motionstage-sdk-python" }
+motionstage-testkit = { path = "crates/motionstage-testkit" }
+motionstage-transport-quic = { path = "crates/motionstage-transport-quic" }
+motionstage-webrtc = { path = "crates/motionstage-webrtc" }

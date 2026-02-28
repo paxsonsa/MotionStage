@@ -1,4 +1,4 @@
-# CineMotion v1 Completion Matrix
+# MotionStage v1 Completion Matrix
 
 Status legend: `DONE`, `IN_PROGRESS`, `TODO`
 
@@ -18,6 +18,6 @@ Status legend: `DONE`, `IN_PROGRESS`, `TODO`
 - `cargo test -q`
 - `python3 -m pip install -e ./python`
 - `python3 -m pytest -q python/tests`
-- `python3 -m maturin build --manifest-path crates/cinemotion-sdk-python/Cargo.toml --features extension-module -o target/wheels`
+- `python3 -m maturin build --manifest-path crates/motionstage-sdk-python/Cargo.toml --features extension-module -o target/wheels`
 - `python3 -m pip install --force-reinstall target/wheels/*.whl`
-- `python3 -c "import cinemotion_sdk_rust"`
+- `python3 -c "import motionstage_sdk_rust"`

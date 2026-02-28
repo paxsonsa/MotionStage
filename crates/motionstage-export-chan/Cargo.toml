@@ -1,0 +1,13 @@
+[package]
+name = "motionstage-export-chan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+motionstage-recording.workspace = true
+motionstage-core.workspace = true
+
+[dev-dependencies]
+motionstage-protocol.workspace = true
+uuid.workspace = true

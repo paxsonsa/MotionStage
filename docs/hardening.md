@@ -1,12 +1,12 @@
-# CineMotion v1 Hardening Gates
+# MotionStage v1 Hardening Gates
 
 ## Performance Gates
 
 - Ingest target: `120 Hz` sustained per active motion source.
 - Publish target: `60 Hz` scene publication cadence.
 - Baseline soak tests:
-  - `cinemotion-testkit::soak_test_hits_motion_pipeline`
-  - `cinemotion-testkit::soak_test_reaches_120hz_ingest_target_window`
+  - `motionstage-testkit::soak_test_hits_motion_pipeline`
+  - `motionstage-testkit::soak_test_reaches_120hz_ingest_target_window`
 
 ## Metrics Contract
 
@@ -44,4 +44,4 @@ Operators should route tracing to their observability backend and create dashboa
 
 - Rust compile + tests: `cargo build --verbose`, `cargo test --verbose`.
 - Python package tests: `python -m pip install -e ./python` followed by `python -m pytest -q python/tests`.
-- Native extension gate: `maturin build --manifest-path crates/cinemotion-sdk-python/Cargo.toml --features extension-module` and import smoke test for `cinemotion_sdk_rust`.
+- Native extension gate: `maturin build --manifest-path crates/motionstage-sdk-python/Cargo.toml --features extension-module` and import smoke test for `motionstage_sdk_rust`.

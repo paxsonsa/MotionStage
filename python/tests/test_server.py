@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import cinemotion_sdk.server as server_module
-from cinemotion_sdk import CineServer, SceneUpdateDelegate
+import motionstage_sdk.server as server_module
+from motionstage_sdk import MotionStageServer, SceneUpdateDelegate
 
 
 class _Delegate(SceneUpdateDelegate):
@@ -28,7 +28,7 @@ class _Delegate(SceneUpdateDelegate):
 
 
 def test_server_delegate_and_fallback_runtime_calls():
-    server = CineServer(name="unit")
+    server = MotionStageServer(name="unit")
     delegate = _Delegate()
     server.bind_delegate(delegate)
 
@@ -53,7 +53,7 @@ def test_server_delegate_and_fallback_runtime_calls():
 def test_server_uses_native_bridge_when_present(monkeypatch):
     class _Native:
         def __init__(self, name: str | None = None):
-            self._name = name or "cinemotion"
+            self._name = name or "motionstage"
 
         def start(self) -> str:
             return "127.0.0.1:9999"
@@ -70,7 +70,7 @@ def test_server_uses_native_bridge_when_present(monkeypatch):
         def metrics(self) -> tuple[int, int, int, int, int, int, int]:
             return (1, 2, 3, 4, 5, 6, 7)
 
-    monkeypatch.setattr(server_module, "_NativeCineServer", _Native)
-    native_server = server_module.CineServer(name="native")
+    monkeypatch.setattr(server_module, "_NativeMotionStageServer", _Native)
+    native_server = server_module.MotionStageServer(name="native")
     assert native_server.start() == "127.0.0.1:9999"
     assert native_server.metrics() == (1, 2, 3, 4, 5, 6, 7)

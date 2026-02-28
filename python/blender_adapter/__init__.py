@@ -1,3 +1,3 @@
-from .cinemotion_blender_adapter import BlenderAdapter, register_blender_delegate
+from .motionstage_blender_adapter import BlenderAdapter, register_blender_delegate
 
 __all__ = ["BlenderAdapter", "register_blender_delegate"]

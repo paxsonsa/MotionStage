@@ -1,4 +1,4 @@
-# CineMotion v1 Protocol Overview
+# MotionStage v1 Protocol Overview
 
 ## Session states
 
@@ -13,7 +13,7 @@
 
 ## Handshake
 
-1. Client discovers `_cinemotion._udp.local` service.
+1. Client discovers `_motionstage._udp.local` service.
 2. Client opens QUIC transport.
 3. Server sends `ServerHello`.
 4. Client sends `ClientHello`.

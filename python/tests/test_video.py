@@ -1,4 +1,4 @@
-from cinemotion_sdk.video import (
+from motionstage_sdk.video import (
     ColorPrimaries,
     DynamicRange,
     FramePushSink,

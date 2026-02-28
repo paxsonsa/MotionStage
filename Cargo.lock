@@ -567,171 +567,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "cinemotion-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cinemotion-core",
- "cinemotion-protocol",
- "cinemotion-server",
- "clap",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-core"
-version = "0.1.0"
-dependencies = [
- "bevy_ecs",
- "cinemotion-protocol",
- "indexmap",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-discovery"
-version = "0.1.0"
-dependencies = [
- "cinemotion-protocol",
- "mdns-sd",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "cinemotion-export-chan"
-version = "0.1.0"
-dependencies = [
- "cinemotion-core",
- "cinemotion-protocol",
- "cinemotion-recording",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-export-usd"
-version = "0.1.0"
-dependencies = [
- "cinemotion-core",
- "cinemotion-protocol",
- "cinemotion-recording",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-media"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "cinemotion-protocol",
- "parking_lot",
- "serde",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-protocol"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "serde",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-recording"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "cinemotion-core",
- "cinemotion-protocol",
- "serde",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-sdk-python"
-version = "0.1.0"
-dependencies = [
- "cinemotion-core",
- "cinemotion-protocol",
- "cinemotion-server",
- "pyo3",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-server"
-version = "0.1.0"
-dependencies = [
- "cinemotion-core",
- "cinemotion-discovery",
- "cinemotion-media",
- "cinemotion-protocol",
- "cinemotion-recording",
- "cinemotion-transport-quic",
- "cinemotion-webrtc",
- "serde",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-testkit"
-version = "0.1.0"
-dependencies = [
- "cinemotion-core",
- "cinemotion-protocol",
- "cinemotion-server",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-transport-quic"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "bytes",
- "cinemotion-core",
- "cinemotion-protocol",
- "futures",
- "quinn",
- "rcgen",
- "rustls",
- "rustls-pki-types",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "cinemotion-webrtc"
-version = "0.1.0"
-dependencies = [
- "cinemotion-media",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "webrtc",
-]
-
-[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,6 +1648,171 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "motionstage-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "motionstage-core",
+ "motionstage-protocol",
+ "motionstage-server",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-core"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+ "indexmap",
+ "motionstage-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-discovery"
+version = "0.1.0"
+dependencies = [
+ "mdns-sd",
+ "motionstage-protocol",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "motionstage-export-chan"
+version = "0.1.0"
+dependencies = [
+ "motionstage-core",
+ "motionstage-protocol",
+ "motionstage-recording",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-export-usd"
+version = "0.1.0"
+dependencies = [
+ "motionstage-core",
+ "motionstage-protocol",
+ "motionstage-recording",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "motionstage-protocol",
+ "parking_lot",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-protocol"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-recording"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "motionstage-core",
+ "motionstage-protocol",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-sdk-python"
+version = "0.1.0"
+dependencies = [
+ "motionstage-core",
+ "motionstage-protocol",
+ "motionstage-server",
+ "pyo3",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-server"
+version = "0.1.0"
+dependencies = [
+ "motionstage-core",
+ "motionstage-discovery",
+ "motionstage-media",
+ "motionstage-protocol",
+ "motionstage-recording",
+ "motionstage-transport-quic",
+ "motionstage-webrtc",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-testkit"
+version = "0.1.0"
+dependencies = [
+ "motionstage-core",
+ "motionstage-protocol",
+ "motionstage-server",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-transport-quic"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "futures",
+ "motionstage-core",
+ "motionstage-protocol",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "motionstage-webrtc"
+version = "0.1.0"
+dependencies = [
+ "motionstage-media",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "webrtc",
 ]
 
 [[package]]

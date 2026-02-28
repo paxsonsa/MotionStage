@@ -24,7 +24,7 @@
 ## Quickstart Workflow (Fastest)
 
 ```bash
-cargo run -p cinemotion-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
 ```
 
 In interactive prompt:

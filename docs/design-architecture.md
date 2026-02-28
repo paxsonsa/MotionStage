@@ -10,16 +10,16 @@
 
 ## System Topology
 
-CineMotion is composed of small crates with clear ownership boundaries.
+MotionStage is composed of small crates with clear ownership boundaries.
 
-- `cinemotion-server`: orchestration and lifecycle owner
-- `cinemotion-core`: mode/scenes/mappings/update application
-- `cinemotion-protocol`: cross-transport protocol model
-- `cinemotion-transport-quic`: wire transport implementation
-- `cinemotion-media` + `cinemotion-webrtc`: video negotiation/signaling/session glue
-- `cinemotion-recording`: binary track format and index/read/write APIs
-- `cinemotion-export-usd` + `cinemotion-export-chan`: deterministic DCC outputs
-- `python/cinemotion_sdk`: OOP integrator API with optional native bridge
+- `motionstage-server`: orchestration and lifecycle owner
+- `motionstage-core`: mode/scenes/mappings/update application
+- `motionstage-protocol`: cross-transport protocol model
+- `motionstage-transport-quic`: wire transport implementation
+- `motionstage-media` + `motionstage-webrtc`: video negotiation/signaling/session glue
+- `motionstage-recording`: binary track format and index/read/write APIs
+- `motionstage-export-usd` + `motionstage-export-chan`: deterministic DCC outputs
+- `python/motionstage_sdk`: OOP integrator API with optional native bridge
 
 ## Runtime Ownership Model
 

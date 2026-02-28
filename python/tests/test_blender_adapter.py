@@ -1,5 +1,5 @@
-from blender_adapter.cinemotion_blender_adapter import BlenderAdapter, register_blender_delegate
-from cinemotion_sdk import CineServer
+from blender_adapter.motionstage_blender_adapter import BlenderAdapter, register_blender_delegate
+from motionstage_sdk import MotionStageServer
 
 
 class MockObject:
@@ -27,7 +27,7 @@ def test_attribute_batch_updates_mock_object_without_bpy():
 
 
 def test_register_delegate_wires_server_to_adapter():
-    server = CineServer(name="test")
+    server = MotionStageServer(name="test")
     adapter = BlenderAdapter()
     adapter.object_cache["camera"] = MockObject()
     register_blender_delegate(server, adapter)

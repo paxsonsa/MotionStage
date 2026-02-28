@@ -1,0 +1,11 @@
+[package]
+name = "motionstage-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+motionstage-protocol.workspace = true
+mdns-sd.workspace = true
+thiserror.workspace = true
