@@ -1,0 +1,17 @@
+[package]
+name = "cinemotion-sdk-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cinemotion_sdk_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3.workspace = true
+tokio.workspace = true
+cinemotion-server.workspace = true
+cinemotion-core.workspace = true
+cinemotion-protocol.workspace = true
+uuid.workspace = true

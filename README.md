@@ -1,15 +1,47 @@
-# CineMotion: Device Motion Streaming Framework
-In the age of AR/VR, Virtual Production, and Computer Graphics, translating motion from the real world into the computer world is becoming a great tool for creative workflows. 
-Unfortunately, existing motion capture systems are pricey, integrations to existing software you use may no exist and you may want to transmit motion from multiple devices and systems.
+# CineMotion v1
 
-CineMotion is a framework/protocol that:
-1) Helps embed motion streaming from devices in DCC application more easily.
-2) A protocol allowing for multiple devices to stream motion data together.
-3) Help integrators by avoiding worrying about the networking connectivity integration.
-4) Defines a network transport so new devices can easily integrate.
+CineMotion is a sidecar, server-authoritative runtime for virtual camera and motion workflows.
 
-# Benefits
-- Most 'motion streaming' integrations are application specific (e.g. just for Unreal, Maya etc). CineMotion is DCC agnostic.
-- No device/Application lock in: Many existing motion streaming tools require you to pay for an app or some hardware. CineMotion does not, it allows you to integrate your own device/software to stream data.
-- Simple API for implementing python integrations (the norm in VFX/Games tools) or use the rust, c++, or swift bindings.
+## Implemented baseline
 
+- Headless Bevy ECS-backed runtime core (`cinemotion-core`)
+- Session + handshake model (`cinemotion-server`)
+- Runtime lifecycle ownership with sidecar start/stop, QUIC accept loop, discovery, and scheduler loops (`cinemotion-server`)
+- Mapping lease/lock policy with recording freeze rules (`cinemotion-core`)
+- Component-mask transform engine for scalar/vector attribute routing (`cinemotion-core`)
+- QUIC/WebRTC-oriented protocol and transport contracts (`cinemotion-protocol`, `cinemotion-media`)
+- QUIC transport implementation with control streams + motion datagrams (`cinemotion-transport-quic`)
+- Server-owned WebRTC peer session path with SDP/ICE handling (`cinemotion-server`, `cinemotion-webrtc`)
+- HDR10 video descriptor model + SDR fallback negotiation (`cinemotion-media`)
+- Native `.cmtrk` recording format with `CMTRK2` markers + `CMTRK1` backward compatibility (`cinemotion-recording`)
+- Deterministic USD/CHAN exporters (`cinemotion-export-usd`, `cinemotion-export-chan`)
+- CLI skeleton (`cinemotion-cli`)
+- Test harness (`cinemotion-testkit`)
+- Python strict OOP delegate SDK + optional Rust bridge (`python/cinemotion_sdk`, `cinemotion-sdk-python`)
+
+## Workspace layout
+
+- `/crates/cinemotion-protocol`
+- `/crates/cinemotion-core`
+- `/crates/cinemotion-server`
+- `/crates/cinemotion-discovery`
+- `/crates/cinemotion-media`
+- `/crates/cinemotion-transport-quic`
+- `/crates/cinemotion-recording`
+- `/crates/cinemotion-export-usd`
+- `/crates/cinemotion-export-chan`
+- `/crates/cinemotion-cli`
+- `/crates/cinemotion-testkit`
+- `/python/cinemotion_sdk`
+
+Implementation tracker: [`docs/tasks.md`](/Users/apaxson/work/projects/cinemotion/docs/tasks.md)
+Hardening gates: [`docs/hardening.md`](/Users/apaxson/work/projects/cinemotion/docs/hardening.md)
+
+## Run
+
+```bash
+cargo test
+cargo run -p cinemotion-cli -- serve
+python -m pip install -e ./python
+python -m pytest -q python/tests
+```

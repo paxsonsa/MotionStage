@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use cinemotion::prelude as cinemotion;
 use clap::Args;
 
 /// Serve Subcommand Parser and Runner.
@@ -16,15 +17,16 @@ impl ServerCmd {
             )
         });
 
-        let runtime = cinemotion::rt::Runtime::new();
-        let server = cinemotion::server::Server::builder()
-            .with_bind_address(addr)
-            .build();
+        // Create the engine.
+        let engine = cinemotion::default_engine();
 
-        server
-            .run(runtime)
+        // Start a local runtime.
+        let runtime = cinemotion::Runtime::new(addr, engine);
+
+        runtime
+            .start()
             .await
-            .context("Server failed while running")?;
+            .context("runtime failed while running")?;
 
         Result::Ok(0)
     }

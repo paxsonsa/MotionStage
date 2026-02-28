@@ -1,0 +1,12 @@
+[package]
+name = "cinemotion-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cinemotion-server.workspace = true
+cinemotion-protocol.workspace = true
+cinemotion-core.workspace = true
+uuid.workspace = true
+tokio.workspace = true
