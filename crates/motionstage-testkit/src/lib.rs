@@ -27,6 +27,7 @@ impl TestHarness {
                 device_name: name.into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             })
             .await?;
         self.server.authenticate(device_id).await?;

@@ -8,4 +8,5 @@ license.workspace = true
 serde.workspace = true
 motionstage-protocol.workspace = true
 mdns-sd.workspace = true
+flume.workspace = true
 thiserror.workspace = true

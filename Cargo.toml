@@ -43,6 +43,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = "1.10"
 rcgen = "0.13"
 mdns-sd = "0.13"
+flume = "0.11"
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
 webrtc = "0.11"
 motionstage-protocol = { path = "crates/motionstage-protocol" }

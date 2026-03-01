@@ -3,11 +3,8 @@
 from .server import (
     MotionStageServer,
     MotionStageSession,
-    CineServer,
-    CineSession,
     MappingManager,
     RecordingController,
-    SceneRegistry,
     SecurityMode,
 )
 from .video import (
@@ -26,11 +23,8 @@ from .delegates import SceneUpdateDelegate
 __all__ = [
     "MotionStageServer",
     "MotionStageSession",
-    "CineServer",
-    "CineSession",
     "MappingManager",
     "RecordingController",
-    "SceneRegistry",
     "SecurityMode",
     "SceneUpdateDelegate",
     "MainThreadDispatcher",

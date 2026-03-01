@@ -17,4 +17,7 @@ tracing-subscriber.workspace = true
 motionstage-server.workspace = true
 motionstage-core.workspace = true
 motionstage-protocol.workspace = true
+motionstage-transport-quic.workspace = true
+motionstage-discovery.workspace = true
 uuid.workspace = true
+chrono = { version = "0.4", default-features = true, features = ["clock"] }

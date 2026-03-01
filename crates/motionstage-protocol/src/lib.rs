@@ -3,7 +3,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -40,6 +40,13 @@ pub enum Mode {
     Idle,
     Live,
     Recording,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BaselineAction {
+    ResetScene,
+    CommitScene,
+    CommitObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +116,7 @@ pub struct ClientHello {
     pub device_name: String,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
+    pub advertised_attributes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,11 +179,33 @@ pub enum ControlMessage {
     VideoSignal(SignalMessage),
     DrainSignals,
     SignalsBatch(Vec<SignalMessage>),
-    CreateVideoOffer { stream_id: String, track_id: String },
+    CreateVideoOffer {
+        stream_id: String,
+        track_id: String,
+    },
     VideoOffer(SdpMessage),
-    Error { code: RejectCode, reason: String },
+    Error {
+        code: RejectCode,
+        reason: String,
+    },
     Ping,
     Pong,
+    SetMode(Mode),
+    ModeState(Mode),
+    ResetSceneToBaseline {
+        scene_id: Option<Uuid>,
+    },
+    CommitSceneBaseline {
+        scene_id: Option<Uuid>,
+    },
+    CommitObjectBaseline {
+        scene_id: Option<Uuid>,
+        object_id: Uuid,
+    },
+    BaselineActionApplied {
+        action: BaselineAction,
+        changed_attributes: u32,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -265,6 +295,19 @@ mod tests {
             }),
         });
 
+        let encoded = bincode::serialize(&message).expect("control message serializes");
+        let decoded: ControlMessage =
+            bincode::deserialize(&encoded).expect("control message deserializes");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn control_message_supports_baseline_action_variants() {
+        let object_id = Uuid::now_v7();
+        let message = ControlMessage::CommitObjectBaseline {
+            scene_id: None,
+            object_id,
+        };
         let encoded = bincode::serialize(&message).expect("control message serializes");
         let decoded: ControlMessage =
             bincode::deserialize(&encoded).expect("control message deserializes");

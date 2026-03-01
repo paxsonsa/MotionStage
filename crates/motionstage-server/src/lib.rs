@@ -7,8 +7,8 @@ use std::{
 };
 
 use motionstage_core::{
-    AttributeUpdate, CoreError, LeaseConfig, MappingId, MappingRequest, RuntimeCore,
-    RuntimeSnapshot, Scene, SceneId,
+    AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId, MappingRequest, ObjectId,
+    RuntimeCore, RuntimeSnapshot, Scene, SceneId,
 };
 use motionstage_discovery::{DiscoveryAdvertisement, DiscoveryPublisher};
 use motionstage_media::{
@@ -16,10 +16,10 @@ use motionstage_media::{
     VideoStreamDescriptor,
 };
 use motionstage_protocol::{
-    negotiate_version, ClientHello, ClientRole, ControlMessage, Feature, Mode, ProtocolError,
-    ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SdpMessage,
-    SdpType, ServerHello, SessionState, SignalMessage, SignalPayload, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    negotiate_version, BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode,
+    ProtocolError, ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest,
+    RejectCode, SdpMessage, SdpType, ServerHello, SessionState, SignalMessage, SignalPayload,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_recording::{
     RecordedAttribute, RecordedFrame, RecordingManifest, RecordingMarker, RecordingWriter,
@@ -97,6 +97,7 @@ pub struct SessionInfo {
     pub session_id: Option<Uuid>,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
+    pub advertised_attributes: Vec<String>,
     pub state: SessionState,
 }
 
@@ -201,6 +202,34 @@ impl ServerState {
             return Err(ServerError::RegisterRejected(RegisterRejected {
                 code: RejectCode::CapacityExceeded,
                 reason: "session capacity exceeded".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn enforce_unique_device_name(
+        &self,
+        device_id: Uuid,
+        device_name: &str,
+    ) -> Result<(), ServerError> {
+        let normalized = device_name.trim();
+        if normalized.is_empty() {
+            return Err(ServerError::RegisterRejected(RegisterRejected {
+                code: RejectCode::RoleDenied,
+                reason: "device name must not be empty".into(),
+            }));
+        }
+
+        let conflict = self.sessions.values().any(|session| {
+            session.device_id != device_id
+                && session.state != SessionState::Closed
+                && session.session_id.is_some()
+                && session.device_name == normalized
+        });
+        if conflict {
+            return Err(ServerError::RegisterRejected(RegisterRejected {
+                code: RejectCode::RoleDenied,
+                reason: format!("device name '{normalized}' is already active"),
             }));
         }
         Ok(())
@@ -506,6 +535,7 @@ impl ServerHandle {
                 session_id: None,
                 roles: Vec::new(),
                 features: Vec::new(),
+                advertised_attributes: Vec::new(),
                 state: SessionState::Discovered,
             },
         );
@@ -553,6 +583,13 @@ impl ServerHandle {
                 reason: "client must declare at least one role".into(),
             }));
         }
+        if hello.roles.contains(&ClientRole::MotionSource) && hello.advertised_attributes.is_empty()
+        {
+            return Err(ServerError::RegisterRejected(RegisterRejected {
+                code: RejectCode::RoleDenied,
+                reason: "motion source must advertise at least one attribute".into(),
+            }));
+        }
 
         let session = state
             .sessions
@@ -560,6 +597,7 @@ impl ServerHandle {
             .ok_or(ServerError::SessionNotFound(hello.device_id))?;
         session.roles = hello.roles;
         session.features = hello.features;
+        session.advertised_attributes = hello.advertised_attributes;
         state.change_session_state(hello.device_id, SessionState::HelloExchanged)
     }
 
@@ -583,6 +621,16 @@ impl ServerHandle {
                 code,
                 reason: "auth failed".into(),
             }));
+        }
+
+        let device_name = state
+            .sessions
+            .get(&device_id)
+            .map(|session| session.device_name.clone())
+            .ok_or(ServerError::SessionNotFound(device_id))?;
+        if let Err(err) = state.enforce_unique_device_name(device_id, &device_name) {
+            state.metrics.rejected_sessions += 1;
+            return Err(err);
         }
 
         let session = state
@@ -665,6 +713,79 @@ impl ServerHandle {
                 });
         }
         Ok(())
+    }
+
+    fn resolve_scene_for_baseline(
+        state: &ServerState,
+        requested_scene: Option<SceneId>,
+    ) -> Result<SceneId, ServerError> {
+        if let Some(scene_id) = requested_scene {
+            return Ok(scene_id);
+        }
+        state
+            .runtime
+            .snapshot()
+            .active_scene
+            .ok_or_else(|| ServerError::Core(CoreError::MappingDenied("no active scene".into())))
+    }
+
+    pub async fn reset_scene_to_baseline(
+        &self,
+        scene_id: Option<SceneId>,
+    ) -> Result<u32, ServerError> {
+        let mut state = self.state.write().await;
+        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        state
+            .runtime
+            .reset_scene_to_baseline(resolved)
+            .map_err(ServerError::Core)
+    }
+
+    pub async fn commit_scene_baseline(
+        &self,
+        scene_id: Option<SceneId>,
+    ) -> Result<u32, ServerError> {
+        let mut state = self.state.write().await;
+        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        state
+            .runtime
+            .commit_scene_baseline(resolved)
+            .map_err(ServerError::Core)
+    }
+
+    pub async fn commit_object_baseline(
+        &self,
+        scene_id: Option<SceneId>,
+        object_id: ObjectId,
+    ) -> Result<u32, ServerError> {
+        let mut state = self.state.write().await;
+        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        state
+            .runtime
+            .commit_object_baseline(resolved, object_id)
+            .map_err(ServerError::Core)
+    }
+
+    pub async fn set_mode_control_allowlist(&self, _device_ids: Vec<Uuid>) {
+        // Role-based mode control is authoritative; allowlists are intentionally ignored.
+    }
+
+    pub async fn mode_control_allowlist(&self) -> Vec<Uuid> {
+        Vec::new()
+    }
+
+    pub async fn mode_control_allowed(&self, _device_id: Uuid) -> bool {
+        true
+    }
+
+    pub async fn mode(&self) -> Mode {
+        let state = self.state.read().await;
+        state.runtime.mode()
+    }
+
+    pub async fn runtime_snapshot(&self) -> RuntimeSnapshot {
+        let state = self.state.read().await;
+        state.runtime.snapshot()
     }
 
     pub async fn create_mapping(
@@ -783,6 +904,9 @@ impl ServerHandle {
         let maybe_recorded_frame = if state.active_recording.is_some() {
             let snapshot = state.runtime.snapshot();
             let mode = state.runtime.mode();
+            let active_scene = snapshot.active_scene.ok_or_else(|| {
+                ServerError::Core(CoreError::MappingDenied("no active scene".into()))
+            })?;
             let mut attrs = Vec::new();
             for update in &updates {
                 let mapping = snapshot
@@ -790,8 +914,13 @@ impl ServerHandle {
                     .values()
                     .find(|m| {
                         m.source_device == device_id
-                            && m.source_output == update.output_attribute
+                            && source_output_matches(
+                                &m.source_output,
+                                device_id,
+                                update.output_attribute.as_str(),
+                            )
                             && m.state == motionstage_core::MappingState::Active
+                            && m.target_scene == active_scene
                     })
                     .ok_or_else(|| {
                         ServerError::Core(CoreError::MappingDenied(format!(
@@ -800,10 +929,22 @@ impl ServerHandle {
                         )))
                     })?;
 
+                let resolved_value: AttributeValue = snapshot
+                    .scenes
+                    .get(&mapping.target_scene)
+                    .and_then(|scene| scene.objects.get(&mapping.target_object))
+                    .and_then(|object| object.attributes.get(&mapping.target_attribute))
+                    .map(|attribute| attribute.current_value.clone())
+                    .ok_or_else(|| {
+                        ServerError::Core(CoreError::AttributeNotFound(
+                            mapping.target_attribute.clone(),
+                        ))
+                    })?;
+
                 attrs.push(RecordedAttribute {
                     object_id: mapping.target_object,
                     attribute: mapping.target_attribute.clone(),
-                    value: update.value.clone(),
+                    value: resolved_value,
                 });
             }
 
@@ -1061,6 +1202,11 @@ impl ServerHandle {
         state.sessions.get(&device_id).cloned()
     }
 
+    pub async fn sessions(&self) -> Vec<SessionInfo> {
+        let state = self.state.read().await;
+        state.sessions.values().cloned().collect()
+    }
+
     pub async fn push_signaling_message(&self, message: SignalMessage) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let from = state
@@ -1234,8 +1380,118 @@ async fn handle_quic_peer(
                 match ctrl {
                     Ok(ControlMessage::Ping) => {
                         control.send(&ControlMessage::Pong).await.map_err(|err| ServerError::Runtime(err.to_string()))?;
+                        let active_mode = server.mode().await;
+                        control
+                            .send(&ControlMessage::ModeState(active_mode))
+                            .await
+                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
                     }
                     Ok(ControlMessage::Pong) => {}
+                    Ok(ControlMessage::SetMode(requested_mode)) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.set_mode(requested_mode).await {
+                            Ok(()) => {
+                                let active_mode = server.mode().await;
+                                control
+                                    .send(&ControlMessage::ModeState(active_mode))
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::ResetSceneToBaseline { scene_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to reset baseline".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.reset_scene_to_baseline(scene_id).await {
+                            Ok(changed_attributes) => {
+                                control
+                                    .send(&ControlMessage::BaselineActionApplied {
+                                        action: BaselineAction::ResetScene,
+                                        changed_attributes,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::CommitSceneBaseline { scene_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit scene baseline".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.commit_scene_baseline(scene_id).await {
+                            Ok(changed_attributes) => {
+                                control
+                                    .send(&ControlMessage::BaselineActionApplied {
+                                        action: BaselineAction::CommitScene,
+                                        changed_attributes,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::CommitObjectBaseline {
+                        scene_id,
+                        object_id,
+                    }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit object baseline".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.commit_object_baseline(scene_id, object_id).await {
+                            Ok(changed_attributes) => {
+                                control
+                                    .send(&ControlMessage::BaselineActionApplied {
+                                        action: BaselineAction::CommitObject,
+                                        changed_attributes,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Ok(ControlMessage::CreateVideoOffer { stream_id, track_id }) => {
                         match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
                             Ok(offer) => {
@@ -1305,6 +1561,8 @@ async fn handle_quic_peer(
                     }
                     Ok(ControlMessage::SignalsBatch(_))
                     | Ok(ControlMessage::VideoOffer(_))
+                    | Ok(ControlMessage::ModeState(_))
+                    | Ok(ControlMessage::BaselineActionApplied { .. })
                     | Ok(ControlMessage::Error { .. })
                     | Ok(ControlMessage::ServerHello(_))
                     | Ok(ControlMessage::ClientHello(_))
@@ -1317,6 +1575,7 @@ async fn handle_quic_peer(
                         }
                     }
                     Err(_) => {
+                        warn!(device_id = %client_hello.device_id, "control channel closed; ending session");
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         break;
                     }
@@ -1325,9 +1584,12 @@ async fn handle_quic_peer(
             datagram = peer.recv_motion_datagram() => {
                 match datagram {
                     Ok(frame) => {
-                        let _ = server.ingest_motion_datagram(frame).await;
+                        if let Err(err) = server.ingest_motion_datagram(frame).await {
+                            warn!(device_id = %client_hello.device_id, error = %err, "failed to ingest motion datagram");
+                        }
                     }
                     Err(_) => {
+                        warn!(device_id = %client_hello.device_id, "motion datagram channel closed; ending session");
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         break;
                     }
@@ -1361,6 +1623,24 @@ fn map_server_error_to_reject(err: &ServerError) -> RejectCode {
         }
         ServerError::Discovery(_) | ServerError::Runtime(_) => RejectCode::ServerBusy,
     }
+}
+
+fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
+    if mapping_output == update_output {
+        return true;
+    }
+    let prefix = format!("{device_id}.");
+    if let Some(stripped) = mapping_output.strip_prefix(&prefix) {
+        if stripped == update_output {
+            return true;
+        }
+    }
+    if let Some(stripped) = update_output.strip_prefix(&prefix) {
+        if mapping_output == stripped {
+            return true;
+        }
+    }
+    false
 }
 
 fn now_ns() -> u64 {
@@ -1407,21 +1687,25 @@ pub enum ServerError {
 mod tests {
     use std::net::SocketAddr;
 
-    use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
+    use motionstage_core::{
+        AttributeUpdate, AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject,
+    };
     use motionstage_media::{
         ColorPrimaries, DynamicRange, IceCandidate, SdpMessage, SdpType, SignalMessage,
         SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoStreamDescriptor,
     };
     use motionstage_protocol::{
-        ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest, SessionState,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest,
+        RejectCode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
-    use crate::{SecurityMode, ServerConfig, ServerHandle};
+    use crate::{SecurityMode, ServerConfig, ServerError, ServerHandle};
     use motionstage_recording::{read_recording, RecordingFormatVersion, RecordingMarker};
-    use motionstage_transport_quic::{AttributeUpdateFrame, ControlChannel, QuicClient, QuicPeer};
+    use motionstage_transport_quic::{
+        AttributeUpdateFrame, ControlChannel, MotionDatagram, QuicClient, QuicPeer,
+    };
     use motionstage_webrtc::WebRtcSession;
 
     async fn connect_active_quic_client(
@@ -1447,6 +1731,11 @@ mod tests {
                 device_name: format!("peer-{device_id}"),
                 roles: vec![role],
                 features: vec![feature],
+                advertised_attributes: if role == ClientRole::MotionSource {
+                    vec!["pose_pos".into()]
+                } else {
+                    Vec::new()
+                },
             }))
             .await
             .unwrap();
@@ -1480,6 +1769,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             })
             .await
             .unwrap();
@@ -1509,6 +1799,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             })
             .await
             .unwrap();
@@ -1525,6 +1816,60 @@ mod tests {
             .unwrap();
 
         assert_ne!(accepted_a.session_id, accepted_b.session_id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_device_name_is_rejected_on_register() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_a = Uuid::now_v7();
+        let device_b = Uuid::now_v7();
+
+        for device_id in [device_a, device_b] {
+            server.discovered(device_id, "ipad").await.unwrap();
+            server.transport_connected(device_id).await.unwrap();
+            server
+                .hello_exchanged(ClientHello {
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: PROTOCOL_MINOR,
+                    device_id,
+                    device_name: "ipad".into(),
+                    roles: vec![ClientRole::MotionSource],
+                    features: vec![Feature::Motion],
+                    advertised_attributes: vec!["pose_pos".into()],
+                })
+                .await
+                .unwrap();
+            server.authenticate(device_id).await.unwrap();
+        }
+
+        server
+            .register(
+                device_a,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = server
+            .register(
+                device_b,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ServerError::RegisterRejected(rejected) => {
+                assert_eq!(rejected.code, RejectCode::RoleDenied);
+                assert!(rejected.reason.contains("device name 'ipad'"));
+            }
+            other => panic!("expected register rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1613,6 +1958,7 @@ mod tests {
                 device_name: "controller".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             })
             .await
             .unwrap();
@@ -1691,6 +2037,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::VideoSink],
                 features: vec![Feature::Video],
+                advertised_attributes: Vec::new(),
             })
             .await
             .unwrap();
@@ -1745,6 +2092,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::VideoSink],
                 features: vec![Feature::Video],
+                advertised_attributes: Vec::new(),
             })
             .await
             .unwrap();
@@ -1793,6 +2141,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::VideoSink],
                 features: vec![Feature::Video],
+                advertised_attributes: Vec::new(),
             })
             .await
             .unwrap();
@@ -1820,20 +2169,25 @@ mod tests {
         let a = Uuid::now_v7();
         let b = Uuid::now_v7();
 
-        for (device, role, feature) in [
-            (a, ClientRole::VideoSink, Feature::Video),
-            (b, ClientRole::CameraController, Feature::Video),
+        for (device, name, role, feature) in [
+            (a, "peer-a", ClientRole::VideoSink, Feature::Video),
+            (b, "peer-b", ClientRole::CameraController, Feature::Video),
         ] {
-            server.discovered(device, "peer").await.unwrap();
+            server.discovered(device, name).await.unwrap();
             server.transport_connected(device).await.unwrap();
             server
                 .hello_exchanged(ClientHello {
                     protocol_major: PROTOCOL_MAJOR,
                     protocol_minor: PROTOCOL_MINOR,
                     device_id: device,
-                    device_name: "peer".into(),
+                    device_name: name.into(),
                     roles: vec![role],
                     features: vec![feature],
+                    advertised_attributes: if role == ClientRole::MotionSource {
+                        vec!["pose_pos".into()]
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .await
                 .unwrap();
@@ -1912,10 +2266,33 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             })
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("unsupported major"));
+    }
+
+    #[tokio::test]
+    async fn motion_source_must_advertise_attributes() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        server.discovered(device_id, "peer").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+
+        let err = server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "peer".into(),
+                roles: vec![ClientRole::MotionSource],
+                features: vec![Feature::Motion],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("must advertise at least one attribute"));
     }
 
     #[tokio::test]
@@ -1960,6 +2337,144 @@ mod tests {
                 assert!(!sdp.sdp.is_empty());
             }
             other => panic!("expected video offer response, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_role_can_set_mode_over_control() {
+        let device_id = Uuid::now_v7();
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::SetMode(Mode::Live))
+            .await
+            .unwrap();
+        match control.recv().await.unwrap() {
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            other => panic!("expected ModeState, got {other:?}"),
+        }
+
+        drop(peer);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_role_can_set_mode_without_allowlist() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let device_id = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::SetMode(Mode::Live))
+            .await
+            .unwrap();
+        match control.recv().await.unwrap() {
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            other => panic!("expected ModeState, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_role_can_reset_scene_baseline_over_control() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+
+        let mut attr = SceneAttribute::new("position", AttributeValue::Vec3f([10.0, 20.0, 30.0]));
+        attr.current_value = AttributeValue::Vec3f([11.0, 22.0, 33.0]);
+        let object = SceneObject::new("camera").with_attribute(attr);
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+
+        let runtime = server.start_quic_runtime().await.unwrap();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::ResetSceneToBaseline {
+                scene_id: Some(scene_id),
+            })
+            .await
+            .unwrap();
+        match control.recv().await.unwrap() {
+            ControlMessage::BaselineActionApplied {
+                action,
+                changed_attributes,
+            } => {
+                assert_eq!(action, BaselineAction::ResetScene);
+                assert_eq!(changed_attributes, 1);
+            }
+            other => panic!("expected BaselineActionApplied, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_operator_cannot_issue_baseline_control_actions() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        server
+            .load_scene(Scene::new("shot").with_object(object))
+            .await;
+
+        let runtime = server.start_quic_runtime().await.unwrap();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::VideoSink,
+            Feature::Video,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::CommitSceneBaseline { scene_id: None })
+            .await
+            .unwrap();
+        match control.recv().await.unwrap() {
+            ControlMessage::Error { code, .. } => assert_eq!(code, RejectCode::RoleDenied),
+            other => panic!("expected protocol error, got {other:?}"),
         }
 
         runtime.shutdown().await.unwrap();
@@ -2086,6 +2601,7 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
+                advertised_attributes: vec!["pose_pos".into()],
             }))
             .await
             .unwrap();
@@ -2116,5 +2632,128 @@ mod tests {
         assert!(metrics.motion_datagrams >= 1);
         assert!(metrics.motion_updates >= 1);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingest_motion_datagram_matches_qualified_and_unqualified_source_outputs() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("runtime").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+
+        let qualified_mapping_id = server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: format!("{device_id}.pose_pos"),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        server.set_mode(Mode::Live).await.unwrap();
+
+        server
+            .ingest_motion_datagram(MotionDatagram {
+                device_id,
+                timestamp_ns: 10,
+                updates: vec![AttributeUpdateFrame {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]).into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(server.tick_count().await > 0);
+
+        server.remove_mapping(qualified_mapping_id).await.unwrap();
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        server
+            .ingest_motion_datagram(MotionDatagram {
+                device_id,
+                timestamp_ns: 11,
+                updates: vec![AttributeUpdateFrame {
+                    output_attribute: format!("{device_id}.pose_pos"),
+                    value: AttributeValue::Vec3f([2.0, 3.0, 4.0]).into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(server.tick_count().await > 0);
+    }
+
+    #[tokio::test]
+    async fn recording_persists_resolved_runtime_values_after_relative_composition() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([10.0, 20.0, 30.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        server.start_recording(tmp.path(), 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        server.stop_recording().await.unwrap();
+
+        let recording = read_recording(tmp.path()).unwrap();
+        assert_eq!(recording.frames.len(), 1);
+        assert_eq!(recording.frames[0].attributes.len(), 1);
+        assert_eq!(
+            recording.frames[0].attributes[0].value,
+            AttributeValue::Vec3f([11.0, 22.0, 33.0])
+        );
     }
 }

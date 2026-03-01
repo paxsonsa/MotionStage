@@ -19,7 +19,7 @@ MotionStage is composed of small crates with clear ownership boundaries.
 - `motionstage-media` + `motionstage-webrtc`: video negotiation/signaling/session glue
 - `motionstage-recording`: binary track format and index/read/write APIs
 - `motionstage-export-usd` + `motionstage-export-chan`: deterministic DCC outputs
-- `python/motionstage_sdk`: OOP integrator API with optional native bridge
+- `python/motionstage_sdk`: OOP integrator API backed by the native bridge
 
 ## Runtime Ownership Model
 
@@ -65,12 +65,26 @@ The core runtime enforces:
 
 - One active owner per target attribute (with lease/reclaim policy)
 - Optional `component_mask` transforms
+- Server-authoritative relative composition from per-attribute baseline (`default_value`)
 - Filter chains (`Passthrough`, `Ema`, `Deadband`, `Clamp`)
 
 Supported transform patterns:
 - Scalar source -> selected vector components
 - Vector source component -> scalar target
 - Vector subset copy -> vector target
+
+Relative composition behavior:
+- scalar/vector: `output = baseline + delta`
+- quaternion: `output = normalize(baseline * delta)`
+- matrix: `output = baseline * delta`
+- non-composable semantic types use absolute assignment
+
+Baseline control actions:
+- `ResetSceneToBaseline`
+- `CommitSceneBaseline`
+- `CommitObjectBaseline`
+
+These operations are explicit control-plane actions and are not tied to mode transitions.
 
 ## Recording Architecture
 

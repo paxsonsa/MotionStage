@@ -133,21 +133,8 @@ impl RuntimeCore {
         }
 
         self.mode = mode;
-        if self.mode == Mode::Idle {
-            self.reset_to_defaults();
-        }
 
         Ok(())
-    }
-
-    fn reset_to_defaults(&mut self) {
-        for scene in self.scenes.values_mut() {
-            for object in scene.objects.values_mut() {
-                for attr in object.attributes.values_mut() {
-                    attr.reset();
-                }
-            }
-        }
     }
 
     pub fn register_device_connected(&mut self, device_id: Uuid) {
@@ -320,7 +307,11 @@ impl RuntimeCore {
                 .find(|m| {
                     m.state == MappingState::Active
                         && m.source_device == device_id
-                        && m.source_output == update.output_attribute
+                        && source_output_matches(
+                            &m.source_output,
+                            device_id,
+                            update.output_attribute.as_str(),
+                        )
                         && m.target_scene == active_scene
                 })
                 .ok_or_else(|| {
@@ -348,11 +339,20 @@ impl RuntimeCore {
                 continue;
             }
 
-            let transformed = apply_mapping_transform(
-                &attr.current_value,
-                &update.value,
-                mapping.component_mask.as_deref(),
-            )?;
+            let transformed = if supports_relative_composition(&attr.default_value) {
+                let delta = apply_mapping_delta_transform(
+                    &attr.default_value,
+                    &update.value,
+                    mapping.component_mask.as_deref(),
+                )?;
+                compose_relative_value(&attr.default_value, &delta)?
+            } else {
+                apply_mapping_transform(
+                    &attr.current_value,
+                    &update.value,
+                    mapping.component_mask.as_deref(),
+                )?
+            };
             let filtered = apply_filters(&attr.current_value, &transformed, &attr.filter_chain);
             attr.current_value = filtered;
             applied.insert(
@@ -367,6 +367,63 @@ impl RuntimeCore {
 
     pub fn tick_count(&self) -> u64 {
         self.world.resource::<RuntimeStats>().tick_count
+    }
+
+    pub fn reset_scene_to_baseline(&mut self, scene_id: SceneId) -> Result<u32, CoreError> {
+        let scene = self
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or(CoreError::SceneNotFound(scene_id))?;
+        let mut changed = 0_u32;
+        for object in scene.objects.values_mut() {
+            for attribute in object.attributes.values_mut() {
+                if attribute.current_value != attribute.default_value {
+                    attribute.current_value = attribute.default_value.clone();
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn commit_scene_baseline(&mut self, scene_id: SceneId) -> Result<u32, CoreError> {
+        let scene = self
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or(CoreError::SceneNotFound(scene_id))?;
+        let mut changed = 0_u32;
+        for object in scene.objects.values_mut() {
+            for attribute in object.attributes.values_mut() {
+                if attribute.default_value != attribute.current_value {
+                    attribute.default_value = attribute.current_value.clone();
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn commit_object_baseline(
+        &mut self,
+        scene_id: SceneId,
+        object_id: ObjectId,
+    ) -> Result<u32, CoreError> {
+        let scene = self
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or(CoreError::SceneNotFound(scene_id))?;
+        let object = scene
+            .objects
+            .get_mut(&object_id)
+            .ok_or(CoreError::ObjectNotFound(object_id))?;
+        let mut changed = 0_u32;
+        for attribute in object.attributes.values_mut() {
+            if attribute.default_value != attribute.current_value {
+                attribute.default_value = attribute.current_value.clone();
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     fn ensure_target_exists(
@@ -406,6 +463,11 @@ impl RuntimeCore {
         }
 
         let target = self.target_attribute_value(scene_id, object_id, attribute_name)?;
+        if matches!(target, AttributeValue::Mat4f(_)) {
+            return Err(CoreError::InvalidComponentMask(
+                "component_mask is unsupported for mat4f targets".into(),
+            ));
+        }
         if let Some(target_len) = vector_len(target) {
             let mut seen = BTreeSet::new();
             for index in mask {
@@ -652,6 +714,208 @@ fn apply_mapping_transform(
     }
 }
 
+fn apply_mapping_delta_transform(
+    baseline_target: &AttributeValue,
+    incoming_source: &AttributeValue,
+    component_mask: Option<&[usize]>,
+) -> Result<AttributeValue, CoreError> {
+    match component_mask {
+        None => {
+            if baseline_target.type_name() != incoming_source.type_name() {
+                return Err(CoreError::TypeMismatch {
+                    expected: baseline_target.type_name(),
+                    got: incoming_source.type_name(),
+                });
+            }
+            Ok(incoming_source.clone())
+        }
+        Some(mask) => {
+            if mask.is_empty() {
+                return Err(CoreError::InvalidComponentMask(
+                    "component_mask cannot be empty".into(),
+                ));
+            }
+
+            if vector_len(baseline_target).is_some() {
+                let mut transformed = default_delta_for_target(baseline_target)?;
+                if let Some(value) = scalar_as_f32(incoming_source) {
+                    for index in mask {
+                        transformed = set_vector_component(&transformed, *index, value)?;
+                    }
+                    return Ok(transformed);
+                }
+
+                if vector_len(incoming_source).is_some() {
+                    for index in mask {
+                        let Some(component) = vector_component(incoming_source, *index) else {
+                            return Err(CoreError::UnsupportedTransform(format!(
+                                "source component {} is unavailable on '{}'",
+                                index,
+                                incoming_source.type_name()
+                            )));
+                        };
+                        transformed = set_vector_component(&transformed, *index, component)?;
+                    }
+                    return Ok(transformed);
+                }
+
+                return Err(CoreError::UnsupportedTransform(format!(
+                    "cannot apply source '{}' to vector target '{}'",
+                    incoming_source.type_name(),
+                    baseline_target.type_name()
+                )));
+            }
+
+            if is_scalar_target(baseline_target) {
+                if mask.len() != 1 {
+                    return Err(CoreError::InvalidComponentMask(
+                        "scalar targets require exactly one component".into(),
+                    ));
+                }
+                let component_index = mask[0];
+                let Some(component) = vector_component(incoming_source, component_index) else {
+                    return Err(CoreError::UnsupportedTransform(format!(
+                        "source '{}' does not have component {}",
+                        incoming_source.type_name(),
+                        component_index
+                    )));
+                };
+                return set_scalar_value(baseline_target, component);
+            }
+
+            Err(CoreError::UnsupportedTransform(format!(
+                "component_mask is unsupported for '{}' targets",
+                baseline_target.type_name()
+            )))
+        }
+    }
+}
+
+fn default_delta_for_target(target: &AttributeValue) -> Result<AttributeValue, CoreError> {
+    match target {
+        AttributeValue::Vec2f(_) => Ok(AttributeValue::Vec2f([0.0, 0.0])),
+        AttributeValue::Vec3f(_) => Ok(AttributeValue::Vec3f([0.0, 0.0, 0.0])),
+        AttributeValue::Vec4f(_) => Ok(AttributeValue::Vec4f([0.0, 0.0, 0.0, 0.0])),
+        // Identity quaternion keeps unmasked components stable as a neutral relative rotation.
+        AttributeValue::Quatf(_) => Ok(AttributeValue::Quatf([0.0, 0.0, 0.0, 1.0])),
+        _ => Err(CoreError::UnsupportedTransform(format!(
+            "cannot synthesize delta for target '{}'",
+            target.type_name()
+        ))),
+    }
+}
+
+fn supports_relative_composition(target: &AttributeValue) -> bool {
+    matches!(
+        target,
+        AttributeValue::Int32(_)
+            | AttributeValue::Float32(_)
+            | AttributeValue::Float64(_)
+            | AttributeValue::Vec2f(_)
+            | AttributeValue::Vec3f(_)
+            | AttributeValue::Vec4f(_)
+            | AttributeValue::Quatf(_)
+            | AttributeValue::Mat4f(_)
+    )
+}
+
+fn is_scalar_target(target: &AttributeValue) -> bool {
+    matches!(
+        target,
+        AttributeValue::Int32(_) | AttributeValue::Float32(_) | AttributeValue::Float64(_)
+    )
+}
+
+fn compose_relative_value(
+    baseline: &AttributeValue,
+    delta: &AttributeValue,
+) -> Result<AttributeValue, CoreError> {
+    match (baseline, delta) {
+        (AttributeValue::Int32(base), AttributeValue::Int32(d)) => {
+            Ok(AttributeValue::Int32(base.saturating_add(*d)))
+        }
+        (AttributeValue::Float32(base), AttributeValue::Float32(d)) => {
+            Ok(AttributeValue::Float32(base + d))
+        }
+        (AttributeValue::Float64(base), AttributeValue::Float64(d)) => {
+            Ok(AttributeValue::Float64(base + d))
+        }
+        (AttributeValue::Vec2f(base), AttributeValue::Vec2f(d)) => {
+            Ok(AttributeValue::Vec2f([base[0] + d[0], base[1] + d[1]]))
+        }
+        (AttributeValue::Vec3f(base), AttributeValue::Vec3f(d)) => Ok(AttributeValue::Vec3f([
+            base[0] + d[0],
+            base[1] + d[1],
+            base[2] + d[2],
+        ])),
+        (AttributeValue::Vec4f(base), AttributeValue::Vec4f(d)) => Ok(AttributeValue::Vec4f([
+            base[0] + d[0],
+            base[1] + d[1],
+            base[2] + d[2],
+            base[3] + d[3],
+        ])),
+        (AttributeValue::Quatf(base), AttributeValue::Quatf(d)) => {
+            Ok(AttributeValue::Quatf(quat_multiply_normalized(*base, *d)))
+        }
+        (AttributeValue::Mat4f(base), AttributeValue::Mat4f(d)) => {
+            Ok(AttributeValue::Mat4f(mat4_multiply(*base, *d)))
+        }
+        _ => Err(CoreError::TypeMismatch {
+            expected: baseline.type_name(),
+            got: delta.type_name(),
+        }),
+    }
+}
+
+fn quat_multiply_normalized(base: [f32; 4], delta: [f32; 4]) -> [f32; 4] {
+    let [x1, y1, z1, w1] = base;
+    let [x2, y2, z2, w2] = delta;
+    let result = [
+        (w1 * x2) + (x1 * w2) + (y1 * z2) - (z1 * y2),
+        (w1 * y2) - (x1 * z2) + (y1 * w2) + (z1 * x2),
+        (w1 * z2) + (x1 * y2) - (y1 * x2) + (z1 * w2),
+        (w1 * w2) - (x1 * x2) - (y1 * y2) - (z1 * z2),
+    ];
+    let norm = result.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm <= f32::EPSILON {
+        return base;
+    }
+    [
+        result[0] / norm,
+        result[1] / norm,
+        result[2] / norm,
+        result[3] / norm,
+    ]
+}
+
+fn mat4_multiply(base: [[f32; 4]; 4], delta: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut out = [[0.0f32; 4]; 4];
+    for row in 0..4 {
+        for col in 0..4 {
+            out[row][col] = (0..4).map(|k| base[row][k] * delta[k][col]).sum();
+        }
+    }
+    out
+}
+
+fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
+    if mapping_output == update_output {
+        return true;
+    }
+    let prefix = format!("{device_id}.");
+    if let Some(stripped) = mapping_output.strip_prefix(&prefix) {
+        if stripped == update_output {
+            return true;
+        }
+    }
+    if let Some(stripped) = update_output.strip_prefix(&prefix) {
+        if mapping_output == stripped {
+            return true;
+        }
+    }
+    false
+}
+
 fn apply_filters(
     previous: &AttributeValue,
     incoming: &AttributeValue,
@@ -793,6 +1057,56 @@ mod tests {
         let applied = core.apply_updates(device_id, &updates, 200).unwrap();
         assert_eq!(applied.len(), 1);
         assert_eq!(core.tick_count(), 1);
+    }
+
+    #[test]
+    fn qualified_mapping_matches_unqualified_update_for_same_device() {
+        let (mut core, device_id, scene_id, object_id) = build_core();
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: format!("{device_id}.pose_pos"),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            100,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+
+        let updates = vec![AttributeUpdate {
+            output_attribute: "pose_pos".into(),
+            value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+        }];
+        let applied = core.apply_updates(device_id, &updates, 200).unwrap();
+        assert_eq!(applied.len(), 1);
+    }
+
+    #[test]
+    fn unqualified_mapping_matches_qualified_update_for_same_device() {
+        let (mut core, device_id, scene_id, object_id) = build_core();
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            100,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+
+        let updates = vec![AttributeUpdate {
+            output_attribute: format!("{device_id}.pose_pos"),
+            value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+        }];
+        let applied = core.apply_updates(device_id, &updates, 200).unwrap();
+        assert_eq!(applied.len(), 1);
     }
 
     #[test]
@@ -1190,7 +1504,405 @@ mod tests {
             AttributeValue::Vec3f(v) => v,
             _ => panic!("unexpected value type"),
         };
-        assert_eq!(current, [1.0, 20.0, 3.0]);
+        assert_eq!(current, [11.0, 20.0, 33.0]);
+    }
+
+    #[test]
+    fn relative_updates_are_composed_from_baseline() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([10.0, 20.0, 30.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_pos".into(),
+                value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            }],
+            2,
+        )
+        .unwrap();
+
+        let current = match core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("position")
+            .unwrap()
+            .current_value
+            .clone()
+        {
+            AttributeValue::Vec3f(v) => v,
+            _ => panic!("unexpected value type"),
+        };
+        assert_eq!(current, [11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn explicit_scene_reset_restores_defaults() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([10.0, 20.0, 30.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_pos".into(),
+                value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            }],
+            2,
+        )
+        .unwrap();
+        core.set_mode(Mode::Idle).unwrap();
+        let current_before_reset = match core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("position")
+            .unwrap()
+            .current_value
+            .clone()
+        {
+            AttributeValue::Vec3f(v) => v,
+            _ => panic!("unexpected value type"),
+        };
+        assert_eq!(current_before_reset, [11.0, 22.0, 33.0]);
+
+        let changed = core.reset_scene_to_baseline(scene_id).unwrap();
+        assert_eq!(changed, 1);
+        let current = match core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("position")
+            .unwrap()
+            .current_value
+            .clone()
+        {
+            AttributeValue::Vec3f(v) => v,
+            _ => panic!("unexpected value type"),
+        };
+        assert_eq!(current, [10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn commit_scene_and_object_baselines_update_defaults_explicitly() {
+        let mut core = RuntimeCore::default();
+        let camera = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([10.0, 20.0, 30.0]),
+        ));
+        let camera_id = camera.id;
+        let light = SceneObject::new("light").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+        ));
+        let light_id = light.id;
+        let scene = Scene::new("shot").with_object(camera).with_object(light);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: camera_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_pos".into(),
+                value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            }],
+            2,
+        )
+        .unwrap();
+
+        let object_changed = core.commit_object_baseline(scene_id, camera_id).unwrap();
+        assert_eq!(object_changed, 1);
+        let light_default = core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&light_id)
+            .unwrap()
+            .attributes
+            .get("position")
+            .unwrap()
+            .default_value
+            .clone();
+        assert_eq!(light_default, AttributeValue::Vec3f([1.0, 2.0, 3.0]));
+
+        let scene_changed = core.commit_scene_baseline(scene_id).unwrap();
+        assert_eq!(scene_changed, 0);
+    }
+
+    #[test]
+    fn quat_relative_composition_multiplies_and_normalizes() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "rotation",
+            AttributeValue::Quatf([0.0, 0.0, 0.0, 1.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_rot".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "rotation".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+
+        // 90 degrees around Z
+        let half_angle = std::f32::consts::FRAC_PI_4;
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_rot".into(),
+                value: AttributeValue::Quatf([0.0, 0.0, half_angle.sin(), half_angle.cos()]),
+            }],
+            2,
+        )
+        .unwrap();
+        let current = match core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("rotation")
+            .unwrap()
+            .current_value
+            .clone()
+        {
+            AttributeValue::Quatf(v) => v,
+            _ => panic!("unexpected value type"),
+        };
+        assert!((current[2] - half_angle.sin()).abs() < 1e-4);
+        assert!((current[3] - half_angle.cos()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn mat4_relative_composition_multiplies_base_by_delta() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "transform",
+            AttributeValue::Mat4f([
+                [1.0, 0.0, 0.0, 10.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_xform".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "transform".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_xform".into(),
+                value: AttributeValue::Mat4f([
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, 2.0],
+                    [0.0, 0.0, 1.0, 3.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+            }],
+            2,
+        )
+        .unwrap();
+        let current = match core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("transform")
+            .unwrap()
+            .current_value
+            .clone()
+        {
+            AttributeValue::Mat4f(v) => v,
+            _ => panic!("unexpected value type"),
+        };
+        assert_eq!(current[0][3], 11.0);
+        assert_eq!(current[1][3], 2.0);
+        assert_eq!(current[2][3], 3.0);
+    }
+
+    #[test]
+    fn component_mask_is_rejected_for_mat4_targets() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "transform",
+            AttributeValue::Mat4f([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+
+        let err = core
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_xform".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "transform".into(),
+                    component_mask: Some(vec![0]),
+                },
+                1,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("unsupported for mat4f"));
+    }
+
+    #[test]
+    fn non_composable_types_fall_back_to_absolute_transform() {
+        let mut core = RuntimeCore::default();
+        let object = SceneObject::new("camera")
+            .with_attribute(SceneAttribute::new("enabled", AttributeValue::Bool(false)));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        core.load_scene(scene);
+        let device_id = Uuid::now_v7();
+        core.register_device_connected(device_id);
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "enabled".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "enabled".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::Live).unwrap();
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "enabled".into(),
+                value: AttributeValue::Bool(true),
+            }],
+            2,
+        )
+        .unwrap();
+        let current = core
+            .scenes
+            .get(&scene_id)
+            .unwrap()
+            .objects
+            .get(&object_id)
+            .unwrap()
+            .attributes
+            .get("enabled")
+            .unwrap()
+            .current_value
+            .clone();
+        assert_eq!(current, AttributeValue::Bool(true));
     }
 
     #[test]

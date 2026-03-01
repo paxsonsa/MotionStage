@@ -43,7 +43,7 @@ MotionStage focuses on the runtime layer so creators can spend less time wiring 
 ### Interactive demo (fastest path)
 
 ```bash
-cargo run -p motionstage-cli -- simulate --bind 127.0.0.1:7788 --sample-hz 120
+cargo run -p motionstage-cli -- simulate --server-bind 127.0.0.1:0 --sample-hz 120
 ```
 
 Then in `motionstage-sim>`:
@@ -57,6 +57,30 @@ quit
 ```
 
 This gives you a local runtime, live motion samples, and a recording exportable by integrator crates.
+`simulate` runs an embedded server and a simulated client that connects through the same QUIC
+handshake/control/datagram path used by real devices.
+`--server-bind` controls the embedded server bind address; it is not a remote server connect flag.
+
+### Simulated client to an existing server
+
+```bash
+cargo run -p motionstage-cli -- simulate --connect 127.0.0.1:7788 --output-attribute demo.position
+```
+
+This runs in client-only mode and does not start an embedded server. Ensure scene/mapping/mode are
+already configured on the target server.
+Source outputs are normalized to fully-qualified IDs:
+`<device-id>.<attr>[.<component>]`.
+
+You can also discover a server over mDNS:
+
+```bash
+# auto-connect when exactly one server is discoverable
+cargo run -p motionstage-cli -- simulate --connect discover
+
+# select a specific server by advertised discovery name
+cargo run -p motionstage-cli -- simulate --connect discover:motionstage-blender
+```
 
 ### Server mode (for real clients)
 
@@ -99,7 +123,7 @@ This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
 - `crates/motionstage-export-chan`: deterministic CHAN exporter
 - `crates/motionstage-cli`: `serve` and `simulate` workflows
 - `crates/motionstage-testkit`: integration harness and soak helpers
-- `python/motionstage_sdk`: strict OOP delegate SDK and optional native Rust bridge
+- `python/motionstage_sdk`: strict OOP delegate SDK backed by the native Rust bridge
 - `python/blender_adapter`: reference Blender delegate adapter
 
 ## Validate

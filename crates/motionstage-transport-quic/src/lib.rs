@@ -2,6 +2,7 @@ use std::{
     fmt::Debug,
     net::SocketAddr,
     sync::{Arc, Once},
+    time::Duration,
 };
 
 use motionstage_core::{AttributeUpdate, AttributeValue};
@@ -30,8 +31,7 @@ impl QuicServer {
 
         let transport = Arc::get_mut(&mut server_config.transport)
             .expect("server transport config must be uniquely owned at construction");
-        transport.max_concurrent_uni_streams(32_u8.into());
-        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        configure_transport(transport);
 
         let endpoint = Endpoint::server(server_config, bind_addr)?;
         Ok(Self { endpoint })
@@ -73,10 +73,11 @@ impl QuicClient {
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
 
-        let client_cfg = quinn::ClientConfig::new(Arc::new(
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|err| QuicTransportError::Crypto(err.to_string()))?,
         ));
+        client_cfg.transport_config(default_transport_config());
         endpoint.set_default_client_config(client_cfg);
 
         Ok(Self { endpoint })
@@ -376,6 +377,19 @@ fn install_rustls_provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+fn configure_transport(transport: &mut quinn::TransportConfig) {
+    transport.max_concurrent_uni_streams(32_u8.into());
+    transport.datagram_receive_buffer_size(Some(64 * 1024));
+    // Prevent idle control-only sessions from expiring during interactive pauses.
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
+}
+
+fn default_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    configure_transport(&mut transport);
+    Arc::new(transport)
 }
 
 fn validate_wire_version(major: u16, minor: u16) -> Result<(), QuicTransportError> {
