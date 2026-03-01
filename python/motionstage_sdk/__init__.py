@@ -6,6 +6,7 @@ from .server import (
     MappingManager,
     RecordingController,
     SecurityMode,
+    TakeController,
 )
 from .video import (
     ColorPrimaries,
@@ -25,6 +26,7 @@ __all__ = [
     "MotionStageSession",
     "MappingManager",
     "RecordingController",
+    "TakeController",
     "SecurityMode",
     "SceneUpdateDelegate",
     "MainThreadDispatcher",

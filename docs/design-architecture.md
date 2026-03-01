@@ -56,8 +56,11 @@ Mode transitions:
 - `Idle` <-> `Live`
 - `Live` <-> `Recording`
 - `Recording` -> `Idle`
+- `Live` <-> `Playback`
+- `Playback` -> `Idle`
 
 Mapping mutations are blocked in `Recording` mode to preserve deterministic captures.
+Runtime ingest is ignored in `Playback` mode so take review remains deterministic.
 
 ## Mapping and Transform Engine
 
@@ -95,6 +98,13 @@ Recording is a server-owned writer pipeline.
 - Captures frame data plus marker timeline (`ModeTransition`, mapping create/update/remove/lock)
 
 Recording starts by forcing runtime mode into `Recording` and ends by returning to `Live`.
+Each completed recording is registered as a take in a server-owned catalog (`take_id`, scene, path, frame count, selection state).
+
+## Take Playback and Bake Cursor
+
+- Take playback is server-authoritative and applies recorded frame values back into runtime scene attributes.
+- Bake cursors provide pull-based frame iteration (`captured` timing or `fixed:<fps>` resampling) for DCC integrations to bake keys frame-by-frame.
+- Take deletion uses tombstone + immediate purge of underlying `.cmtrk` and catalog row.
 
 ## Video Architecture
 

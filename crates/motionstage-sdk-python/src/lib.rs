@@ -1,5 +1,7 @@
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
-use motionstage_protocol::{ClientRole, Feature, Mode};
+use motionstage_protocol::{
+    BakeAttributeValue, ClientRole, Feature, Mode, PlaybackRuntimeState, SamplingMode,
+};
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -134,6 +136,194 @@ impl PyMotionStageServer {
         self.rt
             .block_on(self.server.stop_recording())
             .map(|_| ())
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    #[pyo3(signature = (scene_id=None))]
+    pub fn list_takes(
+        &self,
+        scene_id: Option<String>,
+    ) -> PyResult<Vec<(String, String, String, String, u64, u64, bool, bool)>> {
+        let parsed_scene = parse_optional_uuid(scene_id)?;
+        let takes = self.rt.block_on(self.server.list_takes(parsed_scene));
+        Ok(takes
+            .into_iter()
+            .map(|take| {
+                (
+                    take.take_id.to_string(),
+                    take.scene_id.to_string(),
+                    take.name,
+                    take.path,
+                    take.created_ns,
+                    take.frame_count,
+                    take.selected,
+                    take.deleted,
+                )
+            })
+            .collect())
+    }
+
+    pub fn select_take(&self, take_id: String) -> PyResult<String> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let selected = self
+            .rt
+            .block_on(self.server.select_take(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(selected.take_id.to_string())
+    }
+
+    #[pyo3(signature = (take_id, looping=false))]
+    pub fn playback_play(&self, take_id: String, looping: bool) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_play(take_id, looping))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn playback_pause(&self, take_id: String) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) =
+            self.rt
+                .block_on(self.server.playback_pause(take_id))
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    #[pyo3(signature = (take_id, seek_ns, looping=false))]
+    pub fn playback_seek(
+        &self,
+        take_id: String,
+        seek_ns: u64,
+        looping: bool,
+    ) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_seek(take_id, seek_ns, looping))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn playback_stop(&self, take_id: String) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_stop(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn delete_take(&self, take_id: String) -> PyResult<()> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.rt
+            .block_on(self.server.delete_take(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    #[pyo3(signature = (take_id, sampling_mode=None))]
+    pub fn open_take_bake_cursor(
+        &self,
+        take_id: String,
+        sampling_mode: Option<String>,
+    ) -> PyResult<(String, u64)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let sampling_mode = parse_sampling_mode(sampling_mode.as_deref().unwrap_or("captured"))?;
+        let (cursor_id, total_frames) = self
+            .rt
+            .block_on(self.server.open_take_bake_cursor(take_id, sampling_mode))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((cursor_id.to_string(), total_frames))
+    }
+
+    pub fn read_take_bake_frame(
+        &self,
+        py: Python<'_>,
+        cursor_id: String,
+    ) -> PyResult<Option<(u64, u64, Vec<(String, String, PyObject)>)>> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let frame = self
+            .rt
+            .block_on(self.server.read_take_bake_frame(cursor_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(frame.map(|(frame_index, timestamp_ns, attributes)| {
+            (
+                frame_index,
+                timestamp_ns,
+                attributes
+                    .into_iter()
+                    .map(|attr| {
+                        (
+                            attr.object_id.to_string(),
+                            attr.attribute,
+                            bake_attribute_value_to_py(py, &attr.value),
+                        )
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    pub fn seek_take_bake_frame(
+        &self,
+        py: Python<'_>,
+        cursor_id: String,
+        frame_index: u64,
+    ) -> PyResult<Option<(u64, u64, Vec<(String, String, PyObject)>)>> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let frame = self
+            .rt
+            .block_on(self.server.seek_take_bake_frame(cursor_id, frame_index))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(frame.map(|(resolved_index, timestamp_ns, attributes)| {
+            (
+                resolved_index,
+                timestamp_ns,
+                attributes
+                    .into_iter()
+                    .map(|attr| {
+                        (
+                            attr.object_id.to_string(),
+                            attr.attribute,
+                            bake_attribute_value_to_py(py, &attr.value),
+                        )
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    pub fn close_take_bake_cursor(&self, cursor_id: String) -> PyResult<()> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.rt
+            .block_on(self.server.close_take_bake_cursor(cursor_id))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
@@ -308,8 +498,9 @@ fn parse_mode(value: &str) -> PyResult<Mode> {
         "idle" | "stopped" | "stop" => Ok(Mode::Idle),
         "live" => Ok(Mode::Live),
         "recording" | "record" => Ok(Mode::Recording),
+        "playback" | "play" => Ok(Mode::Playback),
         other => Err(PyValueError::new_err(format!(
-            "unsupported mode `{other}` (expected idle/live/recording)"
+            "unsupported mode `{other}` (expected idle/live/recording/playback)"
         ))),
     }
 }
@@ -335,6 +526,7 @@ fn mode_to_str(mode: Mode) -> &'static str {
         Mode::Idle => "idle",
         Mode::Live => "live",
         Mode::Recording => "recording",
+        Mode::Playback => "playback",
     }
 }
 
@@ -356,6 +548,33 @@ fn feature_to_str(feature: Feature) -> &'static str {
         Feature::Hdr10 => "hdr10",
         Feature::SdrFallback => "sdr_fallback",
     }
+}
+
+fn playback_state_to_str(state: PlaybackRuntimeState) -> &'static str {
+    match state {
+        PlaybackRuntimeState::Stopped => "stopped",
+        PlaybackRuntimeState::Playing => "playing",
+        PlaybackRuntimeState::Paused => "paused",
+    }
+}
+
+fn parse_sampling_mode(value: &str) -> PyResult<SamplingMode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "captured" {
+        return Ok(SamplingMode::Captured);
+    }
+    if let Some(raw) = normalized.strip_prefix("fixed:") {
+        let fps: u32 = raw
+            .parse()
+            .map_err(|err| PyValueError::new_err(format!("invalid fixed fps `{raw}`: {err}")))?;
+        if fps == 0 {
+            return Err(PyValueError::new_err("fixed fps must be > 0"));
+        }
+        return Ok(SamplingMode::FixedFps { fps });
+    }
+    Err(PyValueError::new_err(format!(
+        "unsupported sampling mode `{value}` (expected captured or fixed:<fps>)"
+    )))
 }
 
 fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
@@ -639,6 +858,25 @@ fn attribute_value_to_py(py: Python<'_>, value: &AttributeValue) -> PyObject {
             vec![v[0], v[1], v[2], v[3]].into_py(py)
         }
         AttributeValue::Mat4f(v) => v
+            .iter()
+            .map(|row| vec![row[0], row[1], row[2], row[3]])
+            .collect::<Vec<_>>()
+            .into_py(py),
+    }
+}
+
+fn bake_attribute_value_to_py(py: Python<'_>, value: &BakeAttributeValue) -> PyObject {
+    match value {
+        BakeAttributeValue::Bool(v) | BakeAttributeValue::Trigger(v) => v.into_py(py),
+        BakeAttributeValue::Int32(v) => v.into_py(py),
+        BakeAttributeValue::Float32(v) => f64::from(*v).into_py(py),
+        BakeAttributeValue::Float64(v) => v.into_py(py),
+        BakeAttributeValue::Vec2f(v) => vec![v[0], v[1]].into_py(py),
+        BakeAttributeValue::Vec3f(v) => vec![v[0], v[1], v[2]].into_py(py),
+        BakeAttributeValue::Vec4f(v) | BakeAttributeValue::Quatf(v) => {
+            vec![v[0], v[1], v[2], v[3]].into_py(py)
+        }
+        BakeAttributeValue::Mat4f(v) => v
             .iter()
             .map(|row| vec![row[0], row[1], row[2], row[3]])
             .collect::<Vec<_>>()

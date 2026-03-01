@@ -120,9 +120,13 @@ impl RuntimeCore {
                 | (Mode::Live, Mode::Recording)
                 | (Mode::Recording, Mode::Live)
                 | (Mode::Recording, Mode::Idle)
+                | (Mode::Live, Mode::Playback)
+                | (Mode::Playback, Mode::Live)
+                | (Mode::Playback, Mode::Idle)
                 | (Mode::Idle, Mode::Idle)
                 | (Mode::Live, Mode::Live)
                 | (Mode::Recording, Mode::Recording)
+                | (Mode::Playback, Mode::Playback)
         );
 
         if !valid {
@@ -134,6 +138,29 @@ impl RuntimeCore {
 
         self.mode = mode;
 
+        Ok(())
+    }
+
+    pub fn set_scene_attribute_value(
+        &mut self,
+        scene_id: SceneId,
+        object_id: ObjectId,
+        attribute_name: &str,
+        value: AttributeValue,
+    ) -> Result<(), CoreError> {
+        let scene = self
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or(CoreError::SceneNotFound(scene_id))?;
+        let object = scene
+            .objects
+            .get_mut(&object_id)
+            .ok_or(CoreError::ObjectNotFound(object_id))?;
+        let attr = object
+            .attributes
+            .get_mut(attribute_name)
+            .ok_or_else(|| CoreError::AttributeNotFound(attribute_name.to_owned()))?;
+        attr.current_value = value;
         Ok(())
     }
 
@@ -291,7 +318,7 @@ impl RuntimeCore {
         now_ns: u64,
     ) -> Result<BTreeMap<String, AttributeValue>, CoreError> {
         self.heartbeat(device_id, now_ns);
-        if self.mode == Mode::Idle {
+        if self.mode == Mode::Idle || self.mode == Mode::Playback {
             return Ok(BTreeMap::new());
         }
 

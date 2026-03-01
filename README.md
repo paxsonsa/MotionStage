@@ -53,6 +53,7 @@ start
 record start recordings/demo.cmtrk
 status
 record stop
+takes list
 quit
 ```
 
@@ -97,7 +98,8 @@ This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
 3. Server applies mapping transforms and filters to incoming attributes.
 4. Runtime publishes snapshots for downstream systems.
 5. Recording mode persists `.cmtrk` (`CMTRK2`) events.
-6. Export crates produce deterministic USD or CHAN output.
+6. Each recording run is registered as a take in the server catalog.
+7. Selected takes can be replayed in `Playback` mode and consumed via bake cursor APIs for DCC-side key baking.
 
 ## Docs
 

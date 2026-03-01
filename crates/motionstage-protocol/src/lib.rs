@@ -3,7 +3,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -40,6 +40,61 @@ pub enum Mode {
     Idle,
     Live,
     Recording,
+    Playback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeInfo {
+    pub take_id: Uuid,
+    pub scene_id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub created_ns: u64,
+    pub frame_count: u64,
+    pub selected: bool,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaybackAction {
+    Play,
+    Pause,
+    Stop,
+    Seek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaybackRuntimeState {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SamplingMode {
+    Captured,
+    FixedFps { fps: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BakeAttributeValue {
+    Bool(bool),
+    Int32(i32),
+    Float32(f32),
+    Float64(f64),
+    Vec2f([f32; 2]),
+    Vec3f([f32; 3]),
+    Vec4f([f32; 4]),
+    Quatf([f32; 4]),
+    Mat4f([[f32; 4]; 4]),
+    Trigger(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakeBakeAttribute {
+    pub object_id: Uuid,
+    pub attribute: String,
+    pub value: BakeAttributeValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +224,7 @@ pub struct SignalMessage {
     pub payload: SignalPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     ServerHello(ServerHello),
     ClientHello(ClientHello),
@@ -184,6 +239,63 @@ pub enum ControlMessage {
         track_id: String,
     },
     VideoOffer(SdpMessage),
+    ListTakes {
+        scene_id: Option<Uuid>,
+    },
+    TakeList {
+        takes: Vec<TakeInfo>,
+    },
+    SelectTake {
+        take_id: Uuid,
+    },
+    TakeSelected {
+        take_id: Uuid,
+    },
+    PlaybackControl {
+        take_id: Uuid,
+        action: PlaybackAction,
+        seek_ns: Option<u64>,
+        looping: bool,
+    },
+    PlaybackState {
+        take_id: Uuid,
+        state: PlaybackRuntimeState,
+        playhead_ns: u64,
+        looping: bool,
+    },
+    DeleteTake {
+        take_id: Uuid,
+    },
+    TakeDeleted {
+        take_id: Uuid,
+    },
+    OpenTakeBakeCursor {
+        take_id: Uuid,
+        sampling_mode: SamplingMode,
+    },
+    TakeBakeCursorOpened {
+        cursor_id: Uuid,
+        total_frames: u64,
+    },
+    ReadTakeBakeFrame {
+        cursor_id: Uuid,
+    },
+    SeekTakeBakeFrame {
+        cursor_id: Uuid,
+        frame_index: u64,
+    },
+    TakeBakeFrame {
+        cursor_id: Uuid,
+        frame_index: u64,
+        timestamp_ns: u64,
+        attributes: Vec<TakeBakeAttribute>,
+    },
+    CloseTakeBakeCursor {
+        cursor_id: Uuid,
+    },
+    TakeBakeCursorClosed {
+        cursor_id: Uuid,
+    },
     Error {
         code: RejectCode,
         reason: String,
@@ -307,6 +419,37 @@ mod tests {
         let message = ControlMessage::CommitObjectBaseline {
             scene_id: None,
             object_id,
+        };
+        let encoded = bincode::serialize(&message).expect("control message serializes");
+        let decoded: ControlMessage =
+            bincode::deserialize(&encoded).expect("control message deserializes");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn control_message_supports_take_variants() {
+        let take_id = Uuid::now_v7();
+        let cursor_id = Uuid::now_v7();
+        let message = ControlMessage::TakeBakeFrame {
+            cursor_id,
+            frame_index: 3,
+            timestamp_ns: 123,
+            attributes: vec![TakeBakeAttribute {
+                object_id: Uuid::nil(),
+                attribute: "position".into(),
+                value: BakeAttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            }],
+        };
+        let encoded = bincode::serialize(&message).expect("control message serializes");
+        let decoded: ControlMessage =
+            bincode::deserialize(&encoded).expect("control message deserializes");
+        assert_eq!(decoded, message);
+
+        let message = ControlMessage::PlaybackControl {
+            take_id,
+            action: PlaybackAction::Seek,
+            seek_ns: Some(1_000),
+            looping: true,
         };
         let encoded = bincode::serialize(&message).expect("control message serializes");
         let decoded: ControlMessage =

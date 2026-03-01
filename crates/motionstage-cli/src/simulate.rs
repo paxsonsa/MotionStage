@@ -15,8 +15,8 @@ use clap::Args;
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_discovery::{DiscoveredService, DiscoveryBrowser};
 use motionstage_protocol::{
-    ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest, SamplingMode,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use motionstage_transport_quic::{
@@ -146,6 +146,9 @@ struct SimulatorState {
     active_record_path: Option<PathBuf>,
     print_every: u32,
     last_error: Option<String>,
+    selected_take: Option<Uuid>,
+    playback_looping: bool,
+    active_bake_cursor: Option<Uuid>,
 }
 
 impl SimulatorState {
@@ -160,6 +163,9 @@ impl SimulatorState {
             active_record_path: None,
             print_every: args.print_every,
             last_error: None,
+            selected_take: None,
+            playback_looping: false,
+            active_bake_cursor: None,
         }
     }
 }
@@ -172,6 +178,18 @@ enum SimulationCommand {
     Status,
     RecordStart(Option<PathBuf>),
     RecordStop,
+    TakesList,
+    TakesSelect(Uuid),
+    TakesDelete(Uuid),
+    PlaybackPlay,
+    PlaybackPause,
+    PlaybackSeek(u64),
+    PlaybackLoop(bool),
+    PlaybackStop,
+    BakeOpen(Uuid, SamplingMode),
+    BakeNext,
+    BakeSeek(u64),
+    BakeClose,
     Mode(Mode),
     Amp(f32),
     Freq(f32),
@@ -737,7 +755,207 @@ async fn handle_command(
                 manifest.frame_count,
                 path
             );
+            state.selected_take = Some(manifest.recording_id);
+            sim_logln!("selected take set to {}", manifest.recording_id);
             state.active_record_path = None;
+        }
+        SimulationCommand::TakesList => {
+            let Some(server) = server else {
+                sim_logln!("takes list is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let takes = server.list_takes(None).await;
+            if takes.is_empty() {
+                sim_logln!("no takes available");
+            } else {
+                for take in takes {
+                    sim_logln!(
+                        "take {} scene={} name=\"{}\" frames={} selected={} path={}",
+                        take.take_id,
+                        take.scene_id,
+                        take.name,
+                        take.frame_count,
+                        take.selected,
+                        take.path
+                    );
+                    if take.selected {
+                        state.selected_take = Some(take.take_id);
+                    }
+                }
+            }
+        }
+        SimulationCommand::TakesSelect(take_id) => {
+            let Some(server) = server else {
+                sim_logln!("takes select is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let selected = server.select_take(take_id).await?;
+            state.selected_take = Some(selected.take_id);
+            sim_logln!("selected take {}", selected.take_id);
+        }
+        SimulationCommand::TakesDelete(take_id) => {
+            let Some(server) = server else {
+                sim_logln!("takes delete is unavailable in client-only mode");
+                return Ok(true);
+            };
+            server.delete_take(take_id).await?;
+            if state.selected_take == Some(take_id) {
+                state.selected_take = None;
+            }
+            sim_logln!("deleted take {take_id}");
+        }
+        SimulationCommand::PlaybackPlay => {
+            let Some(server) = server else {
+                sim_logln!("playback is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(take_id) = state.selected_take else {
+                sim_logln!("no selected take; run `takes select <take_id>` first");
+                return Ok(true);
+            };
+            let (_state, playhead_ns, looping) = server
+                .playback_play(take_id, state.playback_looping)
+                .await?;
+            state.playback_looping = looping;
+            sim_logln!(
+                "playback started take={} playhead_ns={} looping={}",
+                take_id,
+                playhead_ns,
+                looping
+            );
+        }
+        SimulationCommand::PlaybackPause => {
+            let Some(server) = server else {
+                sim_logln!("playback is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(take_id) = state.selected_take else {
+                sim_logln!("no selected take; run `takes select <take_id>` first");
+                return Ok(true);
+            };
+            let (_state, playhead_ns, looping) = server.playback_pause(take_id).await?;
+            state.playback_looping = looping;
+            sim_logln!(
+                "playback paused take={} playhead_ns={} looping={}",
+                take_id,
+                playhead_ns,
+                looping
+            );
+        }
+        SimulationCommand::PlaybackSeek(seek_ns) => {
+            let Some(server) = server else {
+                sim_logln!("playback is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(take_id) = state.selected_take else {
+                sim_logln!("no selected take; run `takes select <take_id>` first");
+                return Ok(true);
+            };
+            let (_state, playhead_ns, looping) = server
+                .playback_seek(take_id, seek_ns, state.playback_looping)
+                .await?;
+            state.playback_looping = looping;
+            sim_logln!(
+                "playback seek take={} playhead_ns={} looping={}",
+                take_id,
+                playhead_ns,
+                looping
+            );
+        }
+        SimulationCommand::PlaybackLoop(looping) => {
+            state.playback_looping = looping;
+            sim_logln!("playback looping set to {}", state.playback_looping);
+        }
+        SimulationCommand::PlaybackStop => {
+            let Some(server) = server else {
+                sim_logln!("playback is unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(take_id) = state.selected_take else {
+                sim_logln!("no selected take; run `takes select <take_id>` first");
+                return Ok(true);
+            };
+            let (_state, playhead_ns, looping) = server.playback_stop(take_id).await?;
+            state.playback_looping = looping;
+            sim_logln!(
+                "playback stopped take={} playhead_ns={} looping={}",
+                take_id,
+                playhead_ns,
+                looping
+            );
+        }
+        SimulationCommand::BakeOpen(take_id, sampling_mode) => {
+            let Some(server) = server else {
+                sim_logln!("bake commands are unavailable in client-only mode");
+                return Ok(true);
+            };
+            let (cursor_id, total_frames) =
+                server.open_take_bake_cursor(take_id, sampling_mode).await?;
+            state.active_bake_cursor = Some(cursor_id);
+            sim_logln!(
+                "bake cursor opened id={} take={} total_frames={} sampling={:?}",
+                cursor_id,
+                take_id,
+                total_frames,
+                sampling_mode
+            );
+        }
+        SimulationCommand::BakeNext => {
+            let Some(server) = server else {
+                sim_logln!("bake commands are unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(cursor_id) = state.active_bake_cursor else {
+                sim_logln!("no active bake cursor; run `bake open <take_id>` first");
+                return Ok(true);
+            };
+            match server.read_take_bake_frame(cursor_id).await? {
+                Some((frame_index, timestamp_ns, attributes)) => {
+                    sim_logln!(
+                        "bake frame cursor={} index={} timestamp_ns={} attributes={}",
+                        cursor_id,
+                        frame_index,
+                        timestamp_ns,
+                        attributes.len()
+                    );
+                }
+                None => sim_logln!("bake cursor reached end of stream"),
+            }
+        }
+        SimulationCommand::BakeSeek(frame_index) => {
+            let Some(server) = server else {
+                sim_logln!("bake commands are unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(cursor_id) = state.active_bake_cursor else {
+                sim_logln!("no active bake cursor; run `bake open <take_id>` first");
+                return Ok(true);
+            };
+            match server.seek_take_bake_frame(cursor_id, frame_index).await? {
+                Some((resolved_index, timestamp_ns, attributes)) => {
+                    sim_logln!(
+                        "bake seek cursor={} index={} timestamp_ns={} attributes={}",
+                        cursor_id,
+                        resolved_index,
+                        timestamp_ns,
+                        attributes.len()
+                    );
+                }
+                None => sim_logln!("bake seek out of range"),
+            }
+        }
+        SimulationCommand::BakeClose => {
+            let Some(server) = server else {
+                sim_logln!("bake commands are unavailable in client-only mode");
+                return Ok(true);
+            };
+            let Some(cursor_id) = state.active_bake_cursor else {
+                sim_logln!("no active bake cursor");
+                return Ok(true);
+            };
+            server.close_take_bake_cursor(cursor_id).await?;
+            state.active_bake_cursor = None;
+            sim_logln!("bake cursor closed {cursor_id}");
         }
         SimulationCommand::Amp(value) => {
             if value < 0.0 || !value.is_finite() {
@@ -810,6 +1028,73 @@ fn parse_command(line: &str) -> SimulationCommand {
                 _ => SimulationCommand::Unknown(trimmed.to_owned()),
             }
         }
+        "takes" => {
+            let Some(op) = parts.next() else {
+                return SimulationCommand::Unknown(trimmed.to_owned());
+            };
+            match op {
+                "list" => SimulationCommand::TakesList,
+                "select" => match parts.next().and_then(|raw| Uuid::parse_str(raw).ok()) {
+                    Some(take_id) => SimulationCommand::TakesSelect(take_id),
+                    None => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                "delete" => match parts.next().and_then(|raw| Uuid::parse_str(raw).ok()) {
+                    Some(take_id) => SimulationCommand::TakesDelete(take_id),
+                    None => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                _ => SimulationCommand::Unknown(trimmed.to_owned()),
+            }
+        }
+        "playback" => {
+            let Some(op) = parts.next() else {
+                return SimulationCommand::Unknown(trimmed.to_owned());
+            };
+            match op {
+                "play" => SimulationCommand::PlaybackPlay,
+                "pause" => SimulationCommand::PlaybackPause,
+                "seek" => match parts.next().and_then(|raw| raw.parse::<u64>().ok()) {
+                    Some(ns) => SimulationCommand::PlaybackSeek(ns),
+                    None => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                "loop" => match parts.next() {
+                    Some("on") => SimulationCommand::PlaybackLoop(true),
+                    Some("off") => SimulationCommand::PlaybackLoop(false),
+                    _ => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                "stop" => SimulationCommand::PlaybackStop,
+                _ => SimulationCommand::Unknown(trimmed.to_owned()),
+            }
+        }
+        "bake" => {
+            let Some(op) = parts.next() else {
+                return SimulationCommand::Unknown(trimmed.to_owned());
+            };
+            match op {
+                "open" => {
+                    let Some(take_raw) = parts.next() else {
+                        return SimulationCommand::Unknown(trimmed.to_owned());
+                    };
+                    let Some(take_id) = Uuid::parse_str(take_raw).ok() else {
+                        return SimulationCommand::Unknown(trimmed.to_owned());
+                    };
+                    let sampling_mode = parts
+                        .next()
+                        .map(parse_sampling_mode)
+                        .unwrap_or(Some(SamplingMode::Captured));
+                    match sampling_mode {
+                        Some(mode) => SimulationCommand::BakeOpen(take_id, mode),
+                        None => SimulationCommand::Unknown(trimmed.to_owned()),
+                    }
+                }
+                "next" => SimulationCommand::BakeNext,
+                "seek" => match parts.next().and_then(|raw| raw.parse::<u64>().ok()) {
+                    Some(index) => SimulationCommand::BakeSeek(index),
+                    None => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                "close" => SimulationCommand::BakeClose,
+                _ => SimulationCommand::Unknown(trimmed.to_owned()),
+            }
+        }
         "amp" => match parts.next().and_then(|v| v.parse::<f32>().ok()) {
             Some(v) => SimulationCommand::Amp(v),
             None => SimulationCommand::Unknown(trimmed.to_owned()),
@@ -823,6 +1108,7 @@ fn parse_command(line: &str) -> SimulationCommand {
                 Some("live") => Some(Mode::Live),
                 Some("idle") | Some("stop") | Some("stopped") => Some(Mode::Idle),
                 Some("record") | Some("recording") => Some(Mode::Recording),
+                Some("play") | Some("playback") => Some(Mode::Playback),
                 _ => None,
             };
             match requested {
@@ -832,6 +1118,21 @@ fn parse_command(line: &str) -> SimulationCommand {
         }
         _ => SimulationCommand::Unknown(trimmed.to_owned()),
     }
+}
+
+fn parse_sampling_mode(raw: &str) -> Option<SamplingMode> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized == "captured" {
+        return Some(SamplingMode::Captured);
+    }
+    if let Some(v) = normalized.strip_prefix("fixed:") {
+        if let Ok(fps) = v.parse::<u32>() {
+            if fps > 0 {
+                return Some(SamplingMode::FixedFps { fps });
+            }
+        }
+    }
+    None
 }
 
 fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
@@ -918,14 +1219,26 @@ fn print_help(mode: SimulationMode) {
     sim_logln!("  stop                  stop streaming");
     sim_logln!("  record start [path]   start CMTRK recording (embedded mode only)");
     sim_logln!("  record stop           stop active recording (embedded mode only)");
+    sim_logln!("  takes list            list available takes");
+    sim_logln!("  takes select <id>     select active take");
+    sim_logln!("  takes delete <id>     delete take");
+    sim_logln!("  playback play         play selected take");
+    sim_logln!("  playback pause        pause selected take");
+    sim_logln!("  playback seek <ns>    seek selected take to nanoseconds");
+    sim_logln!("  playback loop on|off  set looping behavior");
+    sim_logln!("  playback stop         stop selected take playback");
+    sim_logln!("  bake open <id> [captured|fixed:<fps>]  open bake cursor");
+    sim_logln!("  bake next             read next bake frame");
+    sim_logln!("  bake seek <index>     seek bake cursor frame index");
+    sim_logln!("  bake close            close bake cursor");
     sim_logln!("  amp <value>           set sine amplitude");
     sim_logln!("  freq <value>          set sine frequency in Hz");
-    sim_logln!("  mode <idle|live|recording>  request runtime mode");
+    sim_logln!("  mode <idle|live|recording|playback>  request runtime mode");
     sim_logln!("  status                print simulator state");
     sim_logln!("  help                  print this help");
     sim_logln!("  quit                  exit simulator");
     if matches!(mode, SimulationMode::ClientOnly) {
-        sim_logln!("note: `record` commands are unavailable in client-only mode");
+        sim_logln!("note: `record`, `takes`, `playback`, and `bake` commands are unavailable in client-only mode");
     }
 }
 
@@ -948,6 +1261,21 @@ async fn print_status(
     sim_logln!("  frequency_hz: {}", state.frequency_hz);
     sim_logln!("  source_device: {}", route.source_device);
     sim_logln!("  source_output: {}", route.source_output);
+    sim_logln!(
+        "  selected_take: {}",
+        state
+            .selected_take
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
+    sim_logln!("  playback_looping: {}", state.playback_looping);
+    sim_logln!(
+        "  active_bake_cursor: {}",
+        state
+            .active_bake_cursor
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
     sim_logln!(
         "  last_error: {}",
         state.last_error.as_deref().unwrap_or("<none>")
@@ -1185,6 +1513,48 @@ mod tests {
     fn parse_tunable_commands() {
         assert_eq!(parse_command("amp 2.5"), SimulationCommand::Amp(2.5));
         assert_eq!(parse_command("freq 1.25"), SimulationCommand::Freq(1.25));
+    }
+
+    #[test]
+    fn parse_take_and_playback_commands() {
+        let take_id = Uuid::parse_str("00000000-0000-0000-0000-000000000123").unwrap();
+        assert_eq!(parse_command("takes list"), SimulationCommand::TakesList);
+        assert_eq!(
+            parse_command("takes select 00000000-0000-0000-0000-000000000123"),
+            SimulationCommand::TakesSelect(take_id)
+        );
+        assert_eq!(
+            parse_command("playback play"),
+            SimulationCommand::PlaybackPlay
+        );
+        assert_eq!(
+            parse_command("playback pause"),
+            SimulationCommand::PlaybackPause
+        );
+        assert_eq!(
+            parse_command("playback seek 1000"),
+            SimulationCommand::PlaybackSeek(1000)
+        );
+        assert_eq!(
+            parse_command("playback loop on"),
+            SimulationCommand::PlaybackLoop(true)
+        );
+    }
+
+    #[test]
+    fn parse_bake_commands() {
+        let take_id = Uuid::parse_str("00000000-0000-0000-0000-000000000123").unwrap();
+        assert_eq!(
+            parse_command("bake open 00000000-0000-0000-0000-000000000123"),
+            SimulationCommand::BakeOpen(take_id, SamplingMode::Captured)
+        );
+        assert_eq!(
+            parse_command("bake open 00000000-0000-0000-0000-000000000123 fixed:24"),
+            SimulationCommand::BakeOpen(take_id, SamplingMode::FixedFps { fps: 24 })
+        );
+        assert_eq!(parse_command("bake next"), SimulationCommand::BakeNext);
+        assert_eq!(parse_command("bake seek 5"), SimulationCommand::BakeSeek(5));
+        assert_eq!(parse_command("bake close"), SimulationCommand::BakeClose);
     }
 
     #[test]

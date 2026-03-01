@@ -7,8 +7,11 @@
 - `SceneAttribute`: value + live/record flags + filter chain
 - `Mapping`: source output -> target scene/object/attribute binding
 - `Mode`: `Idle`, `Live`, `Recording`
+- `Playback`: dedicated runtime mode that replays a selected take into scene state
 - `Baseline`: per-attribute `default_value` used for relative motion composition and explicit reset/commit actions
 - `Session`: authenticated client lifecycle with negotiated roles/features
+- `Take`: one completed recording run (`.cmtrk`) plus catalog metadata
+- `Bake Cursor`: pull-based frame iterator for DCC-side key baking workflows
 
 ## End-to-End Workflow
 
@@ -19,8 +22,8 @@
 5. Runtime enters `Live` mode.
 6. Motion updates are ingested and applied through transform/filter pipeline (`baseline + delta` for transform-capable targets).
 7. Publish loop snapshots runtime state at `publish_hz`.
-8. Optional recording writes frame + marker timeline as `.cmtrk`.
-9. Recording can be exported to USD/CHAN for DCC workflows.
+8. Optional recording writes frame + marker timeline as `.cmtrk` and registers one take entry.
+9. Selected takes can be replayed in `Playback` mode and consumed frame-by-frame through bake cursor APIs.
 
 ## Quickstart Workflow (Fastest)
 
@@ -80,6 +83,23 @@ In that mode it does not create scenes or mappings.
   - Writes `CMTRK2` output
   - Appends terminal mode transition marker
   - Returns manifest with frame count and IDs
+  - Registers a catalog take (`Take 001`, `Take 002`, ...)
+
+## Take and Playback Workflow
+
+- `list_takes(scene_id?)` returns non-deleted take metadata.
+- `select_take(take_id)` marks one take selected for its scene.
+- `playback_play(take_id, looping)` enters `Playback` mode and advances scene state from recorded frames.
+- `playback_pause/seek/stop` provide deterministic timeline control for review.
+- While in `Playback` mode, live ingest updates are ignored.
+
+## DCC Bake Cursor Workflow
+
+- `open_take_bake_cursor(take_id, sampling_mode)` opens a pull cursor.
+- `read_take_bake_frame(cursor_id)` returns next frame (`timestamp_ns`, per-attribute values).
+- `seek_take_bake_frame(cursor_id, frame_index)` jumps to an index and returns that frame.
+- `close_take_bake_cursor(cursor_id)` finalizes cursor lifecycle.
+- DCC adapters own downstream key authoring, scrubbing, and render-cache generation.
 
 ## Observability Workflow
 

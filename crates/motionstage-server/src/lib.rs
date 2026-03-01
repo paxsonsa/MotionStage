@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,13 +17,15 @@ use motionstage_media::{
     VideoStreamDescriptor,
 };
 use motionstage_protocol::{
-    negotiate_version, BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode,
-    ProtocolError, ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest,
-    RejectCode, SdpMessage, SdpType, ServerHello, SessionState, SignalMessage, SignalPayload,
+    negotiate_version, BakeAttributeValue, BaselineAction, ClientHello, ClientRole, ControlMessage,
+    Feature, Mode, PlaybackAction, PlaybackRuntimeState, ProtocolError, ProtocolVersion,
+    RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SamplingMode, SdpMessage,
+    SdpType, ServerHello, SessionState, SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_recording::{
-    RecordedAttribute, RecordedFrame, RecordingManifest, RecordingMarker, RecordingWriter,
+    read_recording, RecordedAttribute, RecordedFrame, RecordingFile, RecordingManifest,
+    RecordingMarker, RecordingWriter,
 };
 use motionstage_transport_quic::{MotionDatagram, QuicServer};
 use motionstage_webrtc::WebRtcSession;
@@ -30,6 +33,9 @@ use thiserror::Error;
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
+
+mod take_catalog;
+use take_catalog::TakeCatalog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityMode {
@@ -63,6 +69,7 @@ pub struct ServerConfig {
     pub lease: LeaseConfig,
     pub pairing_token: Option<String>,
     pub api_key: Option<String>,
+    pub take_catalog_path: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +93,7 @@ impl Default for ServerConfig {
             lease: LeaseConfig::default(),
             pairing_token: None,
             api_key: None,
+            take_catalog_path: PathBuf::from("recordings/takes_catalog.json"),
         }
     }
 }
@@ -104,6 +112,26 @@ pub struct SessionInfo {
 struct ActiveRecording {
     path: PathBuf,
     writer: RecordingWriter,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePlayback {
+    take_id: Uuid,
+    recording: RecordingFile,
+    state: PlaybackRuntimeState,
+    looping: bool,
+    playhead_ns: u64,
+    started_wall_ns: Option<u64>,
+    started_playhead_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TakeBakeCursor {
+    take_id: Uuid,
+    sampling_mode: SamplingMode,
+    recording: RecordingFile,
+    next_index: u64,
+    total_frames: u64,
 }
 
 struct VideoPeerSession {
@@ -126,6 +154,9 @@ struct ServerState {
     metrics: ServerMetrics,
     running: bool,
     active_recording: Option<ActiveRecording>,
+    active_playback: Option<ActivePlayback>,
+    take_catalog: TakeCatalog,
+    bake_cursors: BTreeMap<Uuid, TakeBakeCursor>,
     master_video_descriptor: Option<VideoStreamDescriptor>,
     signaling: SignalingHub,
     video_peers: BTreeMap<Uuid, VideoPeerSession>,
@@ -234,6 +265,76 @@ impl ServerState {
         }
         Ok(())
     }
+
+    fn apply_playback_frame(&mut self, frame: &RecordedFrame, scene_id: SceneId) {
+        for attr in &frame.attributes {
+            let _ = self.runtime.set_scene_attribute_value(
+                scene_id,
+                attr.object_id,
+                &attr.attribute,
+                attr.value.clone(),
+            );
+        }
+    }
+
+    fn playback_duration_ns(recording: &RecordingFile) -> u64 {
+        let Some(first) = recording.frames.first() else {
+            return 0;
+        };
+        let Some(last) = recording.frames.last() else {
+            return 0;
+        };
+        last.timestamp_ns.saturating_sub(first.timestamp_ns)
+    }
+
+    fn frame_for_playhead(recording: &RecordingFile, playhead_ns: u64) -> Option<RecordedFrame> {
+        let first_ts = recording.frames.first()?.timestamp_ns;
+        let target = first_ts.saturating_add(playhead_ns);
+        let mut chosen = recording.frames.first()?.clone();
+        for frame in &recording.frames {
+            if frame.timestamp_ns > target {
+                break;
+            }
+            chosen = frame.clone();
+        }
+        Some(chosen)
+    }
+
+    fn tick_playback(&mut self, now_ns: u64) {
+        let Some(playback) = self.active_playback.as_mut() else {
+            return;
+        };
+        if playback.state != PlaybackRuntimeState::Playing {
+            return;
+        }
+
+        let Some(started_wall_ns) = playback.started_wall_ns else {
+            playback.started_wall_ns = Some(now_ns);
+            return;
+        };
+
+        let elapsed = now_ns.saturating_sub(started_wall_ns);
+        let mut playhead = playback.started_playhead_ns.saturating_add(elapsed);
+        let duration = Self::playback_duration_ns(&playback.recording);
+        if duration > 0 && playhead > duration {
+            if playback.looping {
+                playhead %= duration;
+                playback.started_wall_ns = Some(now_ns);
+                playback.started_playhead_ns = playhead;
+            } else {
+                playhead = duration;
+                playback.state = PlaybackRuntimeState::Stopped;
+                playback.started_wall_ns = None;
+                playback.started_playhead_ns = playhead;
+            }
+        }
+
+        playback.playhead_ns = playhead;
+        let scene_id = playback.recording.manifest.scene_id;
+        if let Some(frame) = Self::frame_for_playhead(&playback.recording, playback.playhead_ns) {
+            self.apply_playback_frame(&frame, scene_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -276,6 +377,19 @@ impl ServerHandle {
             metrics: ServerMetrics::default(),
             running: false,
             active_recording: None,
+            active_playback: None,
+            take_catalog: TakeCatalog::load_or_new(&config.take_catalog_path).unwrap_or_else(
+                |err| {
+                    warn!(
+                        path = %config.take_catalog_path.display(),
+                        error = %err,
+                        "failed to load take catalog, starting empty"
+                    );
+                    TakeCatalog::load_or_new("recordings/takes_catalog.json")
+                        .unwrap_or_else(|_| panic!("fallback take catalog must be creatable"))
+                },
+            ),
+            bake_cursors: BTreeMap::new(),
             master_video_descriptor: None,
             signaling: SignalingHub::default(),
             video_peers: BTreeMap::new(),
@@ -435,6 +549,7 @@ impl ServerHandle {
                         }
                         let now = now_ns();
                         state.runtime.scheduler_tick(now);
+                        state.tick_playback(now);
                         state.metrics.scheduler_ticks += 1;
                         trace!(scheduler_ticks = state.metrics.scheduler_ticks, "scheduler tick");
                     }
@@ -703,6 +818,9 @@ impl ServerHandle {
         let mut state = self.state.write().await;
         let from = state.runtime.mode();
         state.runtime.set_mode(mode).map_err(ServerError::Core)?;
+        if mode != Mode::Playback {
+            state.active_playback = None;
+        }
         if let Some(recording) = state.active_recording.as_mut() {
             recording
                 .writer
@@ -994,6 +1112,7 @@ impl ServerHandle {
         now_ns: u64,
     ) -> Result<Uuid, ServerError> {
         let mut state = self.state.write().await;
+        state.active_playback = None;
         let mut from_mode = state.runtime.mode();
         if from_mode == Mode::Idle {
             state
@@ -1056,6 +1175,7 @@ impl ServerHandle {
         let Some(mut recording) = state.active_recording.take() else {
             return Err(ServerError::Recording("no active recording".into()));
         };
+        let recording_path = recording.path.clone();
 
         recording
             .writer
@@ -1067,8 +1187,19 @@ impl ServerHandle {
 
         let manifest = recording
             .writer
-            .finish(&recording.path)
+            .finish(&recording_path)
             .map_err(|err| ServerError::Recording(err.to_string()))?;
+
+        state
+            .take_catalog
+            .register_take(
+                manifest.recording_id,
+                manifest.scene_id,
+                recording_path,
+                manifest.started_ns,
+                manifest.frame_count,
+            )
+            .map_err(ServerError::Take)?;
 
         state
             .runtime
@@ -1076,6 +1207,253 @@ impl ServerHandle {
             .map_err(ServerError::Core)?;
 
         Ok(manifest)
+    }
+
+    pub async fn list_takes(&self, scene_id: Option<SceneId>) -> Vec<TakeInfo> {
+        let state = self.state.read().await;
+        state.take_catalog.list(scene_id)
+    }
+
+    pub async fn select_take(&self, take_id: Uuid) -> Result<TakeInfo, ServerError> {
+        let mut state = self.state.write().await;
+        state
+            .take_catalog
+            .select_take(take_id)
+            .map_err(ServerError::Take)
+    }
+
+    pub async fn playback_play(
+        &self,
+        take_id: Uuid,
+        looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let take = state
+            .take_catalog
+            .get(take_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
+        let recording =
+            read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        state
+            .runtime
+            .set_active_scene(recording.manifest.scene_id)
+            .map_err(ServerError::Core)?;
+        state
+            .runtime
+            .set_mode(Mode::Playback)
+            .map_err(ServerError::Core)?;
+        let playback = ActivePlayback {
+            take_id,
+            recording,
+            state: PlaybackRuntimeState::Playing,
+            looping,
+            playhead_ns: 0,
+            started_wall_ns: Some(now_ns()),
+            started_playhead_ns: 0,
+        };
+        if let Some(frame) = ServerState::frame_for_playhead(&playback.recording, 0) {
+            state.apply_playback_frame(&frame, playback.recording.manifest.scene_id);
+        }
+        let playhead_ns = playback.playhead_ns;
+        let looping = playback.looping;
+        state.active_playback = Some(playback);
+        Ok((PlaybackRuntimeState::Playing, playhead_ns, looping))
+    }
+
+    pub async fn playback_pause(
+        &self,
+        take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let Some(playback) = state.active_playback.as_mut() else {
+            return Err(ServerError::Take("no active playback".into()));
+        };
+        if playback.take_id != take_id {
+            return Err(ServerError::Take(format!(
+                "active playback is not take {take_id}"
+            )));
+        }
+        if playback.state == PlaybackRuntimeState::Playing {
+            let started = playback.started_wall_ns.unwrap_or_else(now_ns);
+            let elapsed = now_ns().saturating_sub(started);
+            playback.playhead_ns = playback.started_playhead_ns.saturating_add(elapsed);
+        }
+        playback.state = PlaybackRuntimeState::Paused;
+        playback.started_wall_ns = None;
+        playback.started_playhead_ns = playback.playhead_ns;
+        Ok((playback.state, playback.playhead_ns, playback.looping))
+    }
+
+    pub async fn playback_seek(
+        &self,
+        take_id: Uuid,
+        seek_ns: u64,
+        looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let (status, playhead, loop_state, scene_id, frame) = {
+            let Some(playback) = state.active_playback.as_mut() else {
+                return Err(ServerError::Take("no active playback".into()));
+            };
+            if playback.take_id != take_id {
+                return Err(ServerError::Take(format!(
+                    "active playback is not take {take_id}"
+                )));
+            }
+            let duration = ServerState::playback_duration_ns(&playback.recording);
+            let seek = if duration == 0 {
+                0
+            } else if looping {
+                seek_ns % duration
+            } else {
+                seek_ns.min(duration)
+            };
+            playback.looping = looping;
+            playback.playhead_ns = seek;
+            playback.started_wall_ns = Some(now_ns());
+            playback.started_playhead_ns = seek;
+            let scene_id = playback.recording.manifest.scene_id;
+            let frame = ServerState::frame_for_playhead(&playback.recording, seek);
+            (
+                playback.state,
+                playback.playhead_ns,
+                playback.looping,
+                scene_id,
+                frame,
+            )
+        };
+        if let Some(frame) = frame {
+            state.apply_playback_frame(&frame, scene_id);
+        }
+        Ok((status, playhead, loop_state))
+    }
+
+    pub async fn playback_stop(
+        &self,
+        take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let Some(playback) = state.active_playback.take() else {
+            return Err(ServerError::Take("no active playback".into()));
+        };
+        if playback.take_id != take_id {
+            state.active_playback = Some(playback);
+            return Err(ServerError::Take(format!(
+                "active playback is not take {take_id}"
+            )));
+        }
+        state
+            .runtime
+            .set_mode(Mode::Live)
+            .map_err(ServerError::Core)?;
+        Ok((
+            PlaybackRuntimeState::Stopped,
+            playback.playhead_ns,
+            playback.looping,
+        ))
+    }
+
+    pub async fn open_take_bake_cursor(
+        &self,
+        take_id: Uuid,
+        sampling_mode: SamplingMode,
+    ) -> Result<(Uuid, u64), ServerError> {
+        let mut state = self.state.write().await;
+        let take = state
+            .take_catalog
+            .get(take_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
+        let recording =
+            read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        let total_frames = take_bake_total_frames(&recording, sampling_mode);
+        let cursor_id = Uuid::now_v7();
+        state.bake_cursors.insert(
+            cursor_id,
+            TakeBakeCursor {
+                take_id,
+                sampling_mode,
+                recording,
+                next_index: 0,
+                total_frames,
+            },
+        );
+        Ok((cursor_id, total_frames))
+    }
+
+    pub async fn read_take_bake_frame(
+        &self,
+        cursor_id: Uuid,
+    ) -> Result<Option<(u64, u64, Vec<TakeBakeAttribute>)>, ServerError> {
+        let mut state = self.state.write().await;
+        let Some(cursor) = state.bake_cursors.get_mut(&cursor_id) else {
+            return Err(ServerError::Take(format!(
+                "unknown bake cursor: {cursor_id}"
+            )));
+        };
+        let frame_index = cursor.next_index;
+        let Some((timestamp_ns, attributes)) = take_bake_frame_for_index(cursor, frame_index)
+        else {
+            return Ok(None);
+        };
+        cursor.next_index = cursor.next_index.saturating_add(1);
+        Ok(Some((frame_index, timestamp_ns, attributes)))
+    }
+
+    pub async fn seek_take_bake_frame(
+        &self,
+        cursor_id: Uuid,
+        frame_index: u64,
+    ) -> Result<Option<(u64, u64, Vec<TakeBakeAttribute>)>, ServerError> {
+        let mut state = self.state.write().await;
+        let Some(cursor) = state.bake_cursors.get_mut(&cursor_id) else {
+            return Err(ServerError::Take(format!(
+                "unknown bake cursor: {cursor_id}"
+            )));
+        };
+        cursor.next_index = frame_index.saturating_add(1);
+        Ok(take_bake_frame_for_index(cursor, frame_index)
+            .map(|(timestamp_ns, attributes)| (frame_index, timestamp_ns, attributes)))
+    }
+
+    pub async fn close_take_bake_cursor(&self, cursor_id: Uuid) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let _ = state.bake_cursors.remove(&cursor_id);
+        Ok(())
+    }
+
+    pub async fn delete_take(&self, take_id: Uuid) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let path = state
+            .take_catalog
+            .mark_deleted(take_id)
+            .map_err(ServerError::Take)?;
+
+        if let Some(path) = path {
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(ServerError::Take(err.to_string()));
+                }
+            }
+            state
+                .take_catalog
+                .purge_take(take_id)
+                .map_err(ServerError::Take)?;
+        }
+
+        if matches!(state.active_playback.as_ref(), Some(active) if active.take_id == take_id) {
+            state.active_playback = None;
+            state
+                .runtime
+                .set_mode(Mode::Live)
+                .map_err(ServerError::Core)?;
+        }
+
+        state
+            .bake_cursors
+            .retain(|_, cursor| cursor.take_id != take_id);
+        Ok(())
     }
 
     pub async fn set_master_video_descriptor(
@@ -1492,6 +1870,233 @@ async fn handle_quic_peer(
                             }
                         }
                     }
+                    Ok(ControlMessage::ListTakes { scene_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to list takes".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        let takes = server.list_takes(scene_id).await;
+                        control
+                            .send(&ControlMessage::TakeList { takes })
+                            .await
+                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                    }
+                    Ok(ControlMessage::SelectTake { take_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to select takes".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.select_take(take_id).await {
+                            Ok(selected) => {
+                                control
+                                    .send(&ControlMessage::TakeSelected {
+                                        take_id: selected.take_id,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::PlaybackControl {
+                        take_id,
+                        action,
+                        seek_ns,
+                        looping,
+                    }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to control playback".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        let result = match action {
+                            PlaybackAction::Play => server.playback_play(take_id, looping).await,
+                            PlaybackAction::Pause => server.playback_pause(take_id).await,
+                            PlaybackAction::Stop => server.playback_stop(take_id).await,
+                            PlaybackAction::Seek => {
+                                let seek = seek_ns.unwrap_or_default();
+                                server.playback_seek(take_id, seek, looping).await
+                            }
+                        };
+                        match result {
+                            Ok((state, playhead_ns, looping)) => {
+                                control
+                                    .send(&ControlMessage::PlaybackState {
+                                        take_id,
+                                        state,
+                                        playhead_ns,
+                                        looping,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::DeleteTake { take_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to delete takes".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.delete_take(take_id).await {
+                            Ok(()) => {
+                                control
+                                    .send(&ControlMessage::TakeDeleted { take_id })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::OpenTakeBakeCursor {
+                        take_id,
+                        sampling_mode,
+                    }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to open bake cursors".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.open_take_bake_cursor(take_id, sampling_mode).await {
+                            Ok((cursor_id, total_frames)) => {
+                                control
+                                    .send(&ControlMessage::TakeBakeCursorOpened {
+                                        cursor_id,
+                                        total_frames,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::ReadTakeBakeFrame { cursor_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to read bake frames".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.read_take_bake_frame(cursor_id).await {
+                            Ok(Some((frame_index, timestamp_ns, attributes))) => {
+                                control
+                                    .send(&ControlMessage::TakeBakeFrame {
+                                        cursor_id,
+                                        frame_index,
+                                        timestamp_ns,
+                                        attributes,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Ok(None) => {
+                                if send_protocol_error(&mut control, RejectCode::ServerBusy, "bake cursor reached end of stream".into()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SeekTakeBakeFrame {
+                        cursor_id,
+                        frame_index,
+                    }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to seek bake frames".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.seek_take_bake_frame(cursor_id, frame_index).await {
+                            Ok(Some((resolved_index, timestamp_ns, attributes))) => {
+                                control
+                                    .send(&ControlMessage::TakeBakeFrame {
+                                        cursor_id,
+                                        frame_index: resolved_index,
+                                        timestamp_ns,
+                                        attributes,
+                                    })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Ok(None) => {
+                                if send_protocol_error(&mut control, RejectCode::ServerBusy, "bake seek was out of range".into()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::CloseTakeBakeCursor { cursor_id }) => {
+                        if !client_hello.roles.contains(&ClientRole::Operator) {
+                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to close bake cursors".into()).await.is_err() {
+                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                break;
+                            }
+                            continue;
+                        }
+                        match server.close_take_bake_cursor(cursor_id).await {
+                            Ok(()) => {
+                                control
+                                    .send(&ControlMessage::TakeBakeCursorClosed { cursor_id })
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
+                            Err(err) => {
+                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Ok(ControlMessage::CreateVideoOffer { stream_id, track_id }) => {
                         match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
                             Ok(offer) => {
@@ -1563,6 +2168,13 @@ async fn handle_quic_peer(
                     | Ok(ControlMessage::VideoOffer(_))
                     | Ok(ControlMessage::ModeState(_))
                     | Ok(ControlMessage::BaselineActionApplied { .. })
+                    | Ok(ControlMessage::TakeList { .. })
+                    | Ok(ControlMessage::TakeSelected { .. })
+                    | Ok(ControlMessage::PlaybackState { .. })
+                    | Ok(ControlMessage::TakeDeleted { .. })
+                    | Ok(ControlMessage::TakeBakeCursorOpened { .. })
+                    | Ok(ControlMessage::TakeBakeFrame { .. })
+                    | Ok(ControlMessage::TakeBakeCursorClosed { .. })
                     | Ok(ControlMessage::Error { .. })
                     | Ok(ControlMessage::ServerHello(_))
                     | Ok(ControlMessage::ClientHello(_))
@@ -1618,9 +2230,10 @@ fn map_server_error_to_reject(err: &ServerError) -> RejectCode {
         ServerError::SessionNotFound(_) => RejectCode::RoleDenied,
         ServerError::RegisterRejected(rejected) => rejected.code,
         ServerError::Video(_) | ServerError::Signaling(_) => RejectCode::RoleDenied,
-        ServerError::Core(_) | ServerError::Recording(_) | ServerError::WebRtc(_) => {
-            RejectCode::ServerBusy
-        }
+        ServerError::Core(_)
+        | ServerError::Recording(_)
+        | ServerError::WebRtc(_)
+        | ServerError::Take(_) => RejectCode::ServerBusy,
         ServerError::Discovery(_) | ServerError::Runtime(_) => RejectCode::ServerBusy,
     }
 }
@@ -1641,6 +2254,82 @@ fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &
         }
     }
     false
+}
+
+fn take_bake_total_frames(recording: &RecordingFile, sampling_mode: SamplingMode) -> u64 {
+    match sampling_mode {
+        SamplingMode::Captured => recording.frames.len() as u64,
+        SamplingMode::FixedFps { fps } => {
+            if fps == 0 || recording.frames.is_empty() {
+                return 0;
+            }
+            let duration = ServerState::playback_duration_ns(recording);
+            let step_ns = (1_000_000_000_u64 / fps as u64).max(1);
+            if duration == 0 {
+                1
+            } else {
+                duration / step_ns + 1
+            }
+        }
+    }
+}
+
+fn take_bake_frame_for_index(
+    cursor: &TakeBakeCursor,
+    frame_index: u64,
+) -> Option<(u64, Vec<TakeBakeAttribute>)> {
+    if frame_index >= cursor.total_frames {
+        return None;
+    }
+    match cursor.sampling_mode {
+        SamplingMode::Captured => {
+            let frame = cursor.recording.frames.get(frame_index as usize)?;
+            Some((
+                frame.timestamp_ns,
+                frame
+                    .attributes
+                    .iter()
+                    .cloned()
+                    .map(recorded_to_bake_attribute)
+                    .collect(),
+            ))
+        }
+        SamplingMode::FixedFps { fps } => {
+            if fps == 0 || cursor.recording.frames.is_empty() {
+                return None;
+            }
+            let step_ns = (1_000_000_000_u64 / fps as u64).max(1);
+            let playhead_ns = frame_index.saturating_mul(step_ns);
+            let frame = ServerState::frame_for_playhead(&cursor.recording, playhead_ns)?;
+            Some((
+                frame.timestamp_ns,
+                frame
+                    .attributes
+                    .into_iter()
+                    .map(recorded_to_bake_attribute)
+                    .collect(),
+            ))
+        }
+    }
+}
+
+fn recorded_to_bake_attribute(recorded: RecordedAttribute) -> TakeBakeAttribute {
+    TakeBakeAttribute {
+        object_id: recorded.object_id,
+        attribute: recorded.attribute,
+        value: match recorded.value {
+            AttributeValue::Bool(v) => BakeAttributeValue::Bool(v),
+            AttributeValue::Int32(v) => BakeAttributeValue::Int32(v),
+            AttributeValue::Float32(v) => BakeAttributeValue::Float32(v),
+            AttributeValue::Float64(v) => BakeAttributeValue::Float64(v),
+            AttributeValue::Vec2f(v) => BakeAttributeValue::Vec2f(v),
+            AttributeValue::Vec3f(v) => BakeAttributeValue::Vec3f(v),
+            AttributeValue::Vec4f(v) => BakeAttributeValue::Vec4f(v),
+            AttributeValue::Quatf(v) => BakeAttributeValue::Quatf(v),
+            AttributeValue::Mat4f(v) => BakeAttributeValue::Mat4f(v),
+            AttributeValue::Trigger(v) => BakeAttributeValue::Trigger(v),
+        },
+    }
 }
 
 fn now_ns() -> u64 {
@@ -1671,6 +2360,8 @@ pub enum ServerError {
     RegisterRejected(RegisterRejected),
     #[error("recording error: {0}")]
     Recording(String),
+    #[error("take error: {0}")]
+    Take(String),
     #[error("video error: {0}")]
     Video(String),
     #[error("webrtc error: {0}")]
@@ -1696,9 +2387,9 @@ mod tests {
     };
     use motionstage_protocol::{
         BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest,
-        RejectCode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        RejectCode, SamplingMode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
 
     use crate::{SecurityMode, ServerConfig, ServerError, ServerHandle};
@@ -2755,5 +3446,209 @@ mod tests {
             recording.frames[0].attributes[0].value,
             AttributeValue::Vec3f([11.0, 22.0, 33.0])
         );
+    }
+
+    #[tokio::test]
+    async fn stop_recording_registers_take_in_catalog() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+
+        let takes = server.list_takes(None).await;
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].take_id, manifest.recording_id);
+        assert_eq!(takes[0].scene_id, scene_id);
+        assert_eq!(takes[0].frame_count, 1);
+        assert!(takes[0].selected);
+    }
+
+    #[tokio::test]
+    async fn playback_mode_blocks_ingest_and_supports_bake_cursor() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+
+        let _ = server
+            .playback_play(manifest.recording_id, false)
+            .await
+            .unwrap();
+        assert_eq!(server.mode().await, Mode::Playback);
+
+        let before = server.runtime_snapshot().await;
+        let before_value = before
+            .scenes
+            .get(&scene_id)
+            .and_then(|scene| scene.objects.get(&object_id))
+            .and_then(|object| object.attributes.get("position"))
+            .map(|attr| attr.current_value.clone())
+            .unwrap();
+
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([9.0, 9.0, 9.0]),
+                }],
+                200,
+            )
+            .await
+            .unwrap();
+        let after = server.runtime_snapshot().await;
+        let after_value = after
+            .scenes
+            .get(&scene_id)
+            .and_then(|scene| scene.objects.get(&object_id))
+            .and_then(|object| object.attributes.get("position"))
+            .map(|attr| attr.current_value.clone())
+            .unwrap();
+        assert_eq!(before_value, after_value);
+
+        let (cursor_id, total_frames) = server
+            .open_take_bake_cursor(manifest.recording_id, SamplingMode::Captured)
+            .await
+            .unwrap();
+        assert!(total_frames >= 1);
+        let first = server.read_take_bake_frame(cursor_id).await.unwrap();
+        assert!(first.is_some());
+        server.close_take_bake_cursor(cursor_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_take_purges_recording_file_and_catalog_entry() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+        assert!(recording_path.exists());
+
+        server.delete_take(manifest.recording_id).await.unwrap();
+        assert!(!recording_path.exists());
+        assert!(server.list_takes(None).await.is_empty());
     }
 }

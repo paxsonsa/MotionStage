@@ -64,6 +64,44 @@ class RecordingController:
         self.active_path = None
 
 
+@dataclass
+class TakeController:
+    _owner: "MotionStageServer"
+
+    def list_takes(self, scene_id: UUID | None = None) -> list[dict[str, Any]]:
+        return self._owner.list_takes(scene_id)
+
+    def select_take(self, take_id: UUID) -> UUID:
+        return self._owner.select_take(take_id)
+
+    def delete_take(self, take_id: UUID) -> None:
+        self._owner.delete_take(take_id)
+
+    def playback_play(self, take_id: UUID, looping: bool = False) -> dict[str, Any]:
+        return self._owner.playback_play(take_id, looping=looping)
+
+    def playback_pause(self, take_id: UUID) -> dict[str, Any]:
+        return self._owner.playback_pause(take_id)
+
+    def playback_seek(self, take_id: UUID, seek_ns: int, looping: bool = False) -> dict[str, Any]:
+        return self._owner.playback_seek(take_id, seek_ns, looping=looping)
+
+    def playback_stop(self, take_id: UUID) -> dict[str, Any]:
+        return self._owner.playback_stop(take_id)
+
+    def open_bake_cursor(self, take_id: UUID, sampling_mode: str = "captured") -> dict[str, Any]:
+        return self._owner.open_take_bake_cursor(take_id, sampling_mode=sampling_mode)
+
+    def read_bake_frame(self, cursor_id: UUID) -> Optional[dict[str, Any]]:
+        return self._owner.read_take_bake_frame(cursor_id)
+
+    def seek_bake_frame(self, cursor_id: UUID, frame_index: int) -> Optional[dict[str, Any]]:
+        return self._owner.seek_take_bake_frame(cursor_id, frame_index)
+
+    def close_bake_cursor(self, cursor_id: UUID) -> None:
+        self._owner.close_take_bake_cursor(cursor_id)
+
+
 class MotionStageServer:
     def __init__(self, name: str = "motionstage", security: SecurityMode = SecurityMode.TRUSTED_LAN):
         if _NativeMotionStageServer is None:
@@ -75,6 +113,7 @@ class MotionStageServer:
         self.security = security
         self.mapping_manager = MappingManager(self)
         self.recording = RecordingController(self)
+        self.takes = TakeController(self)
         self._delegate: Optional[SceneUpdateDelegate] = None
         self._native = _NativeMotionStageServer(name=name)
         self._running = False
@@ -142,6 +181,95 @@ class MotionStageServer:
 
     def stop_recording(self) -> None:
         self._native.stop_recording()
+
+    def list_takes(self, scene_id: UUID | None = None) -> list[dict[str, Any]]:
+        raw_scene_id = str(scene_id) if scene_id is not None else None
+        rows = self._native.list_takes(raw_scene_id)
+        takes: list[dict[str, Any]] = []
+        for row in rows:
+            (
+                take_id,
+                resolved_scene_id,
+                name,
+                path,
+                created_ns,
+                frame_count,
+                selected,
+                deleted,
+            ) = row
+            takes.append(
+                {
+                    "take_id": str(take_id),
+                    "scene_id": str(resolved_scene_id),
+                    "name": str(name),
+                    "path": str(path),
+                    "created_ns": int(created_ns),
+                    "frame_count": int(frame_count),
+                    "selected": bool(selected),
+                    "deleted": bool(deleted),
+                }
+            )
+        return takes
+
+    def select_take(self, take_id: UUID) -> UUID:
+        selected = self._native.select_take(str(take_id))
+        return UUID(str(selected))
+
+    def playback_play(self, take_id: UUID, looping: bool = False) -> dict[str, Any]:
+        state, playhead_ns, loop_state = self._native.playback_play(str(take_id), bool(looping))
+        return {"state": str(state), "playhead_ns": int(playhead_ns), "looping": bool(loop_state)}
+
+    def playback_pause(self, take_id: UUID) -> dict[str, Any]:
+        state, playhead_ns, loop_state = self._native.playback_pause(str(take_id))
+        return {"state": str(state), "playhead_ns": int(playhead_ns), "looping": bool(loop_state)}
+
+    def playback_seek(self, take_id: UUID, seek_ns: int, looping: bool = False) -> dict[str, Any]:
+        state, playhead_ns, loop_state = self._native.playback_seek(
+            str(take_id), int(seek_ns), bool(looping)
+        )
+        return {"state": str(state), "playhead_ns": int(playhead_ns), "looping": bool(loop_state)}
+
+    def playback_stop(self, take_id: UUID) -> dict[str, Any]:
+        state, playhead_ns, loop_state = self._native.playback_stop(str(take_id))
+        return {"state": str(state), "playhead_ns": int(playhead_ns), "looping": bool(loop_state)}
+
+    def delete_take(self, take_id: UUID) -> None:
+        self._native.delete_take(str(take_id))
+
+    def open_take_bake_cursor(self, take_id: UUID, sampling_mode: str = "captured") -> dict[str, Any]:
+        cursor_id, total_frames = self._native.open_take_bake_cursor(str(take_id), str(sampling_mode))
+        return {"cursor_id": str(cursor_id), "total_frames": int(total_frames)}
+
+    def read_take_bake_frame(self, cursor_id: UUID) -> Optional[dict[str, Any]]:
+        row = self._native.read_take_bake_frame(str(cursor_id))
+        if row is None:
+            return None
+        frame_index, timestamp_ns, attrs = row
+        return {
+            "frame_index": int(frame_index),
+            "timestamp_ns": int(timestamp_ns),
+            "attributes": [
+                {"object_id": str(object_id), "attribute": str(attribute), "value": value}
+                for (object_id, attribute, value) in attrs
+            ],
+        }
+
+    def seek_take_bake_frame(self, cursor_id: UUID, frame_index: int) -> Optional[dict[str, Any]]:
+        row = self._native.seek_take_bake_frame(str(cursor_id), int(frame_index))
+        if row is None:
+            return None
+        resolved_index, timestamp_ns, attrs = row
+        return {
+            "frame_index": int(resolved_index),
+            "timestamp_ns": int(timestamp_ns),
+            "attributes": [
+                {"object_id": str(object_id), "attribute": str(attribute), "value": value}
+                for (object_id, attribute, value) in attrs
+            ],
+        }
+
+    def close_take_bake_cursor(self, cursor_id: UUID) -> None:
+        self._native.close_take_bake_cursor(str(cursor_id))
 
     def sessions(self) -> list[dict[str, Any]]:
         rows = self._native.sessions()
@@ -348,7 +476,7 @@ class MotionStageServer:
         return True
 
     def _current_attribute_poll_interval_s(self) -> float:
-        if self._known_mode in {"live", "recording", "record"}:
+        if self._known_mode in {"live", "recording", "record", "playback", "play"}:
             return self._attribute_poll_interval_live_s
         return self._attribute_poll_interval_idle_s
 
