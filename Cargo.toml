@@ -11,6 +11,7 @@ members = [
   "crates/motionstage-export-usd",
   "crates/motionstage-export-chan",
   "crates/motionstage-sdk-python",
+  "crates/motionstage-sdk-swift",
   "crates/motionstage-cli",
   "crates/motionstage-testkit",
 ]
@@ -55,6 +56,7 @@ motionstage-recording = { path = "crates/motionstage-recording" }
 motionstage-export-usd = { path = "crates/motionstage-export-usd" }
 motionstage-export-chan = { path = "crates/motionstage-export-chan" }
 motionstage-sdk-python = { path = "crates/motionstage-sdk-python" }
+motionstage-sdk-swift = { path = "crates/motionstage-sdk-swift" }
 motionstage-testkit = { path = "crates/motionstage-testkit" }
 motionstage-transport-quic = { path = "crates/motionstage-transport-quic" }
 motionstage-webrtc = { path = "crates/motionstage-webrtc" }

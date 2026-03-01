@@ -12,6 +12,7 @@ Status legend: `DONE`, `IN_PROGRESS`, `TODO`
 | [x] | P6 | Python Packaging + Native Bridge | Python package is installable via `pip install -e ./python`; `maturin` config added for Rust extension build; runtime now fails fast when native extension is missing. | Imports/tests succeed without `PYTHONPATH`; native wheel builds/imports and missing-native path errors clearly. | DONE |
 | [x] | P7 | Hardening + Observability | Expanded soak tests (multi-client + scheduler checks), structured tracing for signaling/scheduler/motion paths, and CI gates for Rust/Python/native packaging. | CI matrix and local validation pass. | DONE |
 | [x] | P8 | Docs + Final Matrix | Updated protocol/hardening/readme docs for signaling, recording compatibility, runtime lifecycle, and quality gates. | Docs align with implementation and no stale TODO rows remain. | DONE |
+| [x] | P9 | iOS Swift Binding Build Pipeline | Added `motionstage-sdk-swift` FFI crate, exported C header/module map, created iOS XCFramework build script, and added Swift package wrapper client surface for iOS device apps. | `cargo test -p motionstage-sdk-swift` passes and `./scripts/build-swift-ios.sh` generates XCFramework artifacts for Swift consumption. | DONE |
 
 ## Validation Snapshot
 

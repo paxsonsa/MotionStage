@@ -1,0 +1,4 @@
+module MotionStageSwiftFFI {
+  header "motionstage_swift.h"
+  export *
+}

@@ -166,3 +166,15 @@ Registration failures return explicit reject codes (auth, capacity, compatibilit
   `<device-id>.<attr>[.<component>]` because mappings are key-based.
 - Handle `Error` control messages as actionable protocol failures.
 - Reconnect by repeating full handshake and registration.
+
+## Swift/iOS Client Path
+
+If you are integrating from an iOS client app, use the Swift binding build pipeline:
+
+- Build Rust+iOS XCFramework: `./scripts/build-swift-ios.sh`
+- Swift package wrapper: `swift/MotionStageClient`
+- FFI contract header: `crates/motionstage-sdk-swift/include/motionstage_swift.h`
+
+Detailed iOS integration and validation matrix:
+
+- `docs/ios-integrators.md`

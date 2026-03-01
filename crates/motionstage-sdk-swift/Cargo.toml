@@ -1,0 +1,18 @@
+[package]
+name = "motionstage-sdk-swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "motionstage_sdk_swift"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+motionstage-protocol.workspace = true
+motionstage-transport-quic.workspace = true
+
+[dev-dependencies]
+motionstage-server.workspace = true

@@ -105,6 +105,7 @@ This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
 - [Concepts and Workflow](docs/concepts-workflow.md)
 - [DCC Integrators](docs/dcc-integrators.md)
 - [Device Integrators](docs/device-integrators.md)
+- [iOS Integrators](docs/ios-integrators.md)
 - [Protocol Overview](docs/protocol.md)
 - [Hardening Gates](docs/hardening.md)
 - [Completion Matrix](docs/tasks.md)
@@ -123,6 +124,7 @@ This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
 - `crates/motionstage-export-chan`: deterministic CHAN exporter
 - `crates/motionstage-cli`: `serve` and `simulate` workflows
 - `crates/motionstage-testkit`: integration harness and soak helpers
+- `crates/motionstage-sdk-swift`: C ABI bridge for iOS/Swift client apps
 - `python/motionstage_sdk`: strict OOP delegate SDK backed by the native Rust bridge
 - `python/blender_adapter`: reference Blender delegate adapter
 
@@ -132,4 +134,5 @@ This starts QUIC control/datagram ingest, mDNS discovery, and scheduler loops.
 cargo test --workspace
 python -m pip install -e ./python
 python -m pytest -q python/tests
+./scripts/build-swift-ios.sh
 ```

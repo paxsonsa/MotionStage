@@ -1807,6 +1807,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "motionstage-sdk-swift"
+version = "0.1.0"
+dependencies = [
+ "motionstage-protocol",
+ "motionstage-server",
+ "motionstage-transport-quic",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "motionstage-server"
 version = "0.1.0"
 dependencies = [

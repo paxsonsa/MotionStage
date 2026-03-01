@@ -1,4 +1,8 @@
 /target
+dist/*.xcframework
+swift/MotionStageClient/Artifacts/*.xcframework
+swift/**/.build/
+swift/**/.swiftpm/
 
 .vscode/
 .DS_Store

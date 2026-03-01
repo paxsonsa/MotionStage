@@ -45,3 +45,4 @@ Operators should route tracing to their observability backend and create dashboa
 - Rust compile + tests: `cargo build --verbose`, `cargo test --verbose`.
 - Python package tests: `python -m pip install -e ./python` followed by `python -m pytest -q python/tests`.
 - Native extension gate: `maturin build --manifest-path crates/motionstage-sdk-python/Cargo.toml --features extension-module` and import smoke test for `motionstage_sdk_rust`.
+- Swift iOS SDK gate: `./scripts/build-swift-ios.sh` followed by `xcodebuild -scheme MotionStageClient -destination 'generic/platform=iOS Simulator' build` in `swift/MotionStageClient`.

@@ -82,3 +82,22 @@ jobs:
           import motionstage_sdk_rust
           print("motionstage_sdk_rust import ok")
           PY
+
+  swift-ios-sdk:
+    name: Swift iOS SDK XCFramework
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust Artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Test Swift SDK Rust crate
+        run: cargo test -p motionstage-sdk-swift --locked --verbose
+      - name: Build iOS XCFramework
+        run: ./scripts/build-swift-ios.sh
+      - name: Build Swift package for iOS simulator
+        run: xcodebuild -scheme MotionStageClient -destination 'generic/platform=iOS Simulator' build
+        working-directory: ./swift/MotionStageClient
