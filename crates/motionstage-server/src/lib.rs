@@ -2342,10 +2342,22 @@ fn now_ns() -> u64 {
 
 fn advertised_host_for(addr: SocketAddr) -> String {
     if addr.ip().is_unspecified() {
-        "127.0.0.1".into()
+        local_lan_ip().unwrap_or_else(|| "127.0.0.1".into())
     } else {
         addr.ip().to_string()
     }
+}
+
+/// Resolve the primary LAN-facing IP by asking the OS which interface would
+/// route to an external address.  No traffic is actually sent.
+fn local_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    if local_addr.ip().is_loopback() || local_addr.ip().is_unspecified() {
+        return None;
+    }
+    Some(local_addr.ip().to_string())
 }
 
 #[derive(Debug, Error)]

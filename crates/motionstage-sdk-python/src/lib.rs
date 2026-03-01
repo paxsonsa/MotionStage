@@ -20,14 +20,17 @@ pub struct PyMotionStageServer {
 #[pymethods]
 impl PyMotionStageServer {
     #[new]
-    #[pyo3(signature = (name=None))]
-    pub fn new(name: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (name=None, discoverable=true, bind_addr=None))]
+    pub fn new(name: Option<String>, discoverable: bool, bind_addr: Option<String>) -> PyResult<Self> {
         let mut config = ServerConfig::default();
         if let Some(name) = name {
             config.name = name;
         }
-        config.quic_bind_addr = "127.0.0.1:0".parse().expect("static address parses");
-        config.enable_discovery = false;
+        let addr = bind_addr.as_deref().unwrap_or("0.0.0.0:0");
+        config.quic_bind_addr = addr
+            .parse()
+            .map_err(|err| PyValueError::new_err(format!("invalid bind address `{addr}`: {err}")))?;
+        config.enable_discovery = discoverable;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -891,7 +894,7 @@ mod tests {
     #[test]
     fn rust_binding_constructs_server() {
         let server =
-            PyMotionStageServer::new(Some("py-test".into())).expect("py server should build");
+            PyMotionStageServer::new(Some("py-test".into()), false, None).expect("py server should build");
         let _ = server.start().expect("start should succeed");
         server.stop().expect("stop should succeed");
     }
