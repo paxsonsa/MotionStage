@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 motionstage-recording.workspace = true
 motionstage-core.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 motionstage-protocol.workspace = true
-uuid.workspace = true
