@@ -2,17 +2,26 @@ import Foundation
 import MotionStageSwiftFFI
 import simd
 
-public struct MotionStageError: Error, LocalizedError, CustomStringConvertible {
-    public let statusCode: Int32
-    public let message: String
+public enum MotionStageError: Error, LocalizedError, CustomStringConvertible {
+    case invalidArgument(String)
+    case notConnected
+    case alreadyConnected
+    case protocolError(String)
+    case transportError(String)
+    case internalError(String)
 
     public var description: String {
-        "MotionStage error (status=\(statusCode)): \(message)"
+        switch self {
+        case .invalidArgument(let msg): return "MotionStage invalid argument: \(msg)"
+        case .notConnected: return "MotionStage error: not connected"
+        case .alreadyConnected: return "MotionStage error: already connected"
+        case .protocolError(let msg): return "MotionStage protocol error: \(msg)"
+        case .transportError(let msg): return "MotionStage transport error: \(msg)"
+        case .internalError(let msg): return "MotionStage internal error: \(msg)"
+        }
     }
 
-    public var errorDescription: String? {
-        message
-    }
+    public var errorDescription: String? { description }
 }
 
 public enum RuntimeMode: Int32 {
@@ -76,10 +85,10 @@ public final class MotionStageClient: @unchecked Sendable {
 
     public init(deviceName: String, outputAttribute: String = "camera.position") throws {
         guard !deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message: "deviceName must not be empty")
+            throw MotionStageError.invalidArgument("deviceName must not be empty")
         }
         guard !outputAttribute.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message: "outputAttribute must not be empty")
+            throw MotionStageError.invalidArgument("outputAttribute must not be empty")
         }
 
         let maybeClient = deviceName.withCString { deviceNamePtr in
@@ -89,7 +98,7 @@ public final class MotionStageClient: @unchecked Sendable {
         }
 
         guard let rawClient = maybeClient else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INTERNAL, message: "failed to allocate MotionStage client")
+            throw MotionStageError.internalError("failed to allocate MotionStage client")
         }
 
         self.rawClient = rawClient
@@ -99,10 +108,10 @@ public final class MotionStageClient: @unchecked Sendable {
 
     public init(deviceName: String, outputAttributes: [String]) throws {
         guard !deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message: "deviceName must not be empty")
+            throw MotionStageError.invalidArgument("deviceName must not be empty")
         }
         guard !outputAttributes.isEmpty else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message: "outputAttributes must not be empty")
+            throw MotionStageError.invalidArgument("outputAttributes must not be empty")
         }
 
         let csv = outputAttributes.joined(separator: ",")
@@ -114,7 +123,7 @@ public final class MotionStageClient: @unchecked Sendable {
         }
 
         guard let rawClient = maybeClient else {
-            throw MotionStageError(statusCode: MOTIONSTAGE_SWIFT_STATUS_INTERNAL, message: "failed to allocate MotionStage client")
+            throw MotionStageError.internalError("failed to allocate MotionStage client")
         }
 
         self.rawClient = rawClient
@@ -214,10 +223,7 @@ public final class MotionStageClient: @unchecked Sendable {
         try checkStatus(status)
 
         guard let activeMode = RuntimeMode(rawValue: activeModeRaw) else {
-            throw MotionStageError(
-                statusCode: MOTIONSTAGE_SWIFT_STATUS_PROTOCOL,
-                message: "received unsupported mode value: \(activeModeRaw)"
-            )
+            throw MotionStageError.protocolError("received unsupported mode value: \(activeModeRaw)")
         }
 
         return activeMode
@@ -240,11 +246,21 @@ public final class MotionStageClient: @unchecked Sendable {
     // MARK: - Private
 
     private func checkStatus(_ status: Int32) throws {
-        guard status == MOTIONSTAGE_SWIFT_STATUS_OK else {
-            throw MotionStageError(
-                statusCode: status,
-                message: lastErrorMessage ?? "operation failed with status \(status)"
-            )
+        guard status != MOTIONSTAGE_SWIFT_STATUS_OK else { return }
+        let msg = lastErrorMessage ?? "operation failed with status \(status)"
+        switch status {
+        case MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT:
+            throw MotionStageError.invalidArgument(msg)
+        case MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED:
+            throw MotionStageError.notConnected
+        case MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED:
+            throw MotionStageError.alreadyConnected
+        case MOTIONSTAGE_SWIFT_STATUS_PROTOCOL:
+            throw MotionStageError.protocolError(msg)
+        case MOTIONSTAGE_SWIFT_STATUS_TRANSPORT:
+            throw MotionStageError.transportError(msg)
+        default:
+            throw MotionStageError.internalError(msg)
         }
     }
 }

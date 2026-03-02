@@ -38,6 +38,12 @@ typedef struct {
     uint32_t field_mask;
 } MotionFrameFFI;
 
+typedef struct {
+    uint32_t handshake_timeout_ms;   /* 0 = use default (5000) */
+    uint32_t mode_reply_timeout_ms;  /* 0 = use default (5000) */
+    uint32_t reset_scene_timeout_ms; /* 0 = use default (5000) */
+} MotionStageClientConfig;
+
 /* Client lifecycle */
 
 void *motionstage_swift_client_new(
@@ -48,6 +54,12 @@ void *motionstage_swift_client_new(
 void *motionstage_swift_client_new_multi(
     const char *device_name,
     const char *output_attributes_csv
+);
+
+void *motionstage_swift_client_new_multi_with_config(
+    const char *device_name,
+    const char *output_attributes_csv,
+    const MotionStageClientConfig *config  /* NULL = use defaults */
 );
 
 void motionstage_swift_client_free(void *client);
@@ -116,8 +128,11 @@ int32_t motionstage_swift_client_set_mode(
 
 /* Accessors */
 
+/* OWNERSHIP: caller must free with motionstage_swift_string_free() */
 char *motionstage_swift_client_session_id(void *client);
+/* OWNERSHIP: caller must free with motionstage_swift_string_free() */
 char *motionstage_swift_client_device_id(void *client);
+/* OWNERSHIP: caller must free with motionstage_swift_string_free() */
 char *motionstage_swift_client_last_error(void *client);
 
 void motionstage_swift_string_free(char *value);

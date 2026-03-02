@@ -1,3 +1,6 @@
+// FFI functions take raw pointers by design; callers are responsible for validity.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::{
     ffi::{CStr, CString},
     net::SocketAddr,
@@ -39,9 +42,45 @@ pub const MOTIONSTAGE_SWIFT_FIELD_FOCAL_LENGTH: u32 = 0x08;
 pub const MOTIONSTAGE_SWIFT_FIELD_FOCUS_DISTANCE: u32 = 0x10;
 pub const MOTIONSTAGE_SWIFT_FIELD_APERTURE: u32 = 0x20;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-const RESET_SCENE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RESET_SCENE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[repr(C)]
+pub struct MotionStageClientConfig {
+    /// Timeout in milliseconds for the initial handshake. 0 = use default (5000 ms).
+    pub handshake_timeout_ms: u32,
+    /// Timeout in milliseconds for a mode-change reply. 0 = use default (5000 ms).
+    pub mode_reply_timeout_ms: u32,
+    /// Timeout in milliseconds for scene reset confirmation. 0 = use default (5000 ms).
+    pub reset_scene_timeout_ms: u32,
+}
+
+impl MotionStageClientConfig {
+    fn handshake_timeout(&self) -> Duration {
+        if self.handshake_timeout_ms == 0 {
+            DEFAULT_HANDSHAKE_TIMEOUT
+        } else {
+            Duration::from_millis(self.handshake_timeout_ms as u64)
+        }
+    }
+
+    fn mode_reply_timeout(&self) -> Duration {
+        if self.mode_reply_timeout_ms == 0 {
+            DEFAULT_MODE_REPLY_TIMEOUT
+        } else {
+            Duration::from_millis(self.mode_reply_timeout_ms as u64)
+        }
+    }
+
+    fn reset_scene_timeout(&self) -> Duration {
+        if self.reset_scene_timeout_ms == 0 {
+            DEFAULT_RESET_SCENE_TIMEOUT
+        } else {
+            Duration::from_millis(self.reset_scene_timeout_ms as u64)
+        }
+    }
+}
 
 #[repr(C)]
 pub struct MotionFrameFFI {
@@ -66,6 +105,9 @@ struct MotionStageSwiftClientInner {
     qualified_outputs: Vec<String>,
     session: Option<ConnectedSession>,
     last_error: Option<String>,
+    handshake_timeout: Duration,
+    mode_reply_timeout: Duration,
+    reset_scene_timeout: Duration,
 }
 
 struct ConnectedSession {
@@ -119,7 +161,7 @@ impl MotionStageSwiftClientInner {
         })?;
 
         let first_message = self.runtime.block_on(async {
-            timeout(HANDSHAKE_TIMEOUT, control.recv())
+            timeout(self.handshake_timeout, control.recv())
                 .await
                 .map_err(|_| "timed out waiting for ServerHello".to_owned())?
                 .map_err(|err| format!("failed to receive ServerHello: {err}"))
@@ -156,7 +198,7 @@ impl MotionStageSwiftClientInner {
             .map_err(|err| format!("failed to send RegisterRequest: {err}"))?;
 
         let register_message = self.runtime.block_on(async {
-            timeout(HANDSHAKE_TIMEOUT, control.recv())
+            timeout(self.handshake_timeout, control.recv())
                 .await
                 .map_err(|_| "timed out waiting for registration response".to_owned())?
                 .map_err(|err| format!("failed to receive registration response: {err}"))
@@ -326,7 +368,7 @@ impl MotionStageSwiftClientInner {
 
         self.runtime.block_on(async {
             loop {
-                let message = timeout(RESET_SCENE_TIMEOUT, session.control.recv())
+                let message = timeout(self.reset_scene_timeout, session.control.recv())
                     .await
                     .map_err(|_| "timed out waiting for baseline reset response".to_owned())?
                     .map_err(|err| format!("failed to receive reset response: {err}"))?;
@@ -366,7 +408,7 @@ impl MotionStageSwiftClientInner {
 
         let active_mode = self.runtime.block_on(async {
             loop {
-                let message = timeout(MODE_REPLY_TIMEOUT, session.control.recv())
+                let message = timeout(self.mode_reply_timeout, session.control.recv())
                     .await
                     .map_err(|_| "timed out waiting for mode response".to_owned())?
                     .map_err(|err| format!("failed to receive mode response: {err}"))?;
@@ -431,6 +473,7 @@ fn qualify_source_output(device_id: Uuid, output_attribute: &str) -> String {
 fn make_client_inner(
     device_name: String,
     source_outputs: Vec<String>,
+    config: Option<&MotionStageClientConfig>,
 ) -> Result<MotionStageSwiftClientInner, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -443,6 +486,16 @@ fn make_client_inner(
         .map(|attr| qualify_source_output(device_id, attr))
         .collect();
 
+    let handshake_timeout = config
+        .map(|c| c.handshake_timeout())
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT);
+    let mode_reply_timeout = config
+        .map(|c| c.mode_reply_timeout())
+        .unwrap_or(DEFAULT_MODE_REPLY_TIMEOUT);
+    let reset_scene_timeout = config
+        .map(|c| c.reset_scene_timeout())
+        .unwrap_or(DEFAULT_RESET_SCENE_TIMEOUT);
+
     Ok(MotionStageSwiftClientInner {
         runtime,
         device_id,
@@ -451,6 +504,9 @@ fn make_client_inner(
         qualified_outputs,
         session: None,
         last_error: None,
+        handshake_timeout,
+        mode_reply_timeout,
+        reset_scene_timeout,
     })
 }
 
@@ -526,7 +582,7 @@ pub extern "C" fn motionstage_swift_client_new(
         Err(_) => return ptr::null_mut(),
     };
 
-    let inner = match make_client_inner(device_name, vec![output_attribute]) {
+    let inner = match make_client_inner(device_name, vec![output_attribute], None) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
@@ -562,7 +618,50 @@ pub extern "C" fn motionstage_swift_client_new_multi(
         return ptr::null_mut();
     }
 
-    let inner = match make_client_inner(device_name, source_outputs) {
+    let inner = match make_client_inner(device_name, source_outputs, None) {
+        Ok(inner) => inner,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let client = MotionStageSwiftClient {
+        inner: Mutex::new(inner),
+    };
+
+    Box::into_raw(Box::new(client)).cast::<c_void>()
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_new_multi_with_config(
+    device_name: *const c_char,
+    output_attributes_csv: *const c_char,
+    config: *const MotionStageClientConfig,
+) -> *mut c_void {
+    let device_name = match unsafe { read_required_cstr(device_name, "device_name") } {
+        Ok(value) => value,
+        Err(_) => return ptr::null_mut(),
+    };
+    let csv = match unsafe { read_required_cstr(output_attributes_csv, "output_attributes_csv") } {
+        Ok(value) => value,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let source_outputs: Vec<String> = csv
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if source_outputs.is_empty() {
+        return ptr::null_mut();
+    }
+
+    let config_ref: Option<&MotionStageClientConfig> = if config.is_null() {
+        None
+    } else {
+        Some(unsafe { &*config })
+    };
+
+    let inner = match make_client_inner(device_name, source_outputs, config_ref) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
