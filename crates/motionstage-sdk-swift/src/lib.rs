@@ -7,7 +7,10 @@ use std::{
     os::raw::{c_char, c_void},
     ptr,
     str::FromStr,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -153,6 +156,12 @@ pub type MotionStageConnectCallback =
 
 pub struct MotionStageSwiftClient {
     inner: Mutex<MotionStageSwiftClientInner>,
+    /// Nanosecond timestamp of the last motion datagram send. Shared with ping thread.
+    last_send_ns: Arc<AtomicU64>,
+    /// Signal to stop the ping thread.
+    ping_shutdown: Arc<AtomicBool>,
+    /// Join handle for the background ping thread (set after connect).
+    ping_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct MotionStageSwiftClientInner {
@@ -165,6 +174,8 @@ struct MotionStageSwiftClientInner {
     handshake_timeout: Duration,
     mode_reply_timeout: Duration,
     reset_scene_timeout: Duration,
+    /// Shared with the ping thread; stamped on each datagram send.
+    last_send_ns: Arc<AtomicU64>,
 }
 
 struct ConnectedSession {
@@ -314,7 +325,10 @@ impl MotionStageSwiftClientInner {
                 timestamp_ns: now_ns(),
                 updates,
             })
-            .map_err(|err| format!("failed to send motion datagram: {err}"))
+            .map_err(|err| format!("failed to send motion datagram: {err}"))?;
+
+        self.last_send_ns.store(now_ns(), Ordering::Relaxed);
+        Ok(())
     }
 
     fn send_datagram_ref(&self, updates: &[AttributeUpdateFrame]) -> Result<(), String> {
@@ -629,6 +643,7 @@ fn make_client_inner(
     device_name: String,
     source_outputs: Vec<AttributeDescriptor>,
     config: Option<&MotionStageClientConfig>,
+    last_send_ns: Arc<AtomicU64>,
 ) -> Result<MotionStageSwiftClientInner, String> {
     // Ensure the global runtime is initialized.
     let _ = get_runtime();
@@ -662,6 +677,7 @@ fn make_client_inner(
         handshake_timeout,
         mode_reply_timeout,
         reset_scene_timeout,
+        last_send_ns,
     })
 }
 
@@ -719,6 +735,70 @@ fn into_c_string_ptr(value: &str) -> *mut c_char {
 }
 
 // ---------------------------------------------------------------------------
+// Ping heartbeat thread (4.3)
+// ---------------------------------------------------------------------------
+
+const PING_INTERVAL: Duration = Duration::from_secs(3);
+const PING_IDLE_THRESHOLD_NS: u64 = 2_000_000_000; // 2 seconds
+
+fn start_ping_thread(
+    client_ptr: usize,
+    last_send_ns: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("motionstage-ping".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(PING_INTERVAL);
+
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Only send a ping if no motion datagram was sent recently.
+                let last = last_send_ns.load(Ordering::Relaxed);
+                let now = now_ns();
+                if last > 0 && now.saturating_sub(last) < PING_IDLE_THRESHOLD_NS {
+                    continue;
+                }
+
+                // Lock client briefly to send Ping via the control channel.
+                let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                let send_ok = if let Some(session) = inner.session.as_mut() {
+                    get_runtime()
+                        .block_on(session.control.send(&ControlMessage::Ping))
+                        .is_ok()
+                } else {
+                    // No session — nothing to ping.
+                    false
+                };
+                drop(inner);
+
+                if !send_ok && inner_has_session(client_ptr) {
+                    // Connection is broken; stop pinging.
+                    break;
+                }
+            }
+        })
+        .expect("failed to spawn ping thread")
+}
+
+fn inner_has_session(client_ptr: usize) -> bool {
+    let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+    let inner = client_ref
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    inner.session.is_some()
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Runtime (2.3)
 // ---------------------------------------------------------------------------
 
@@ -758,6 +838,7 @@ pub extern "C" fn motionstage_swift_client_new(
         Err(_) => return ptr::null_mut(),
     };
 
+    let last_send_ns = Arc::new(AtomicU64::new(0));
     let inner = match make_client_inner(
         device_name,
         vec![AttributeDescriptor {
@@ -765,6 +846,7 @@ pub extern "C" fn motionstage_swift_client_new(
             value_type: infer_attribute_kind_from_path(""),
         }],
         None,
+        Arc::clone(&last_send_ns),
     ) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
@@ -772,6 +854,9 @@ pub extern "C" fn motionstage_swift_client_new(
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -806,13 +891,17 @@ pub extern "C" fn motionstage_swift_client_new_multi(
         return ptr::null_mut();
     }
 
-    let inner = match make_client_inner(device_name, source_outputs, None) {
+    let last_send_ns = Arc::new(AtomicU64::new(0));
+    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -853,13 +942,17 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
         Some(unsafe { &*config })
     };
 
-    let inner = match make_client_inner(device_name, source_outputs, config_ref) {
+    let last_send_ns = Arc::new(AtomicU64::new(0));
+    let inner = match make_client_inner(device_name, source_outputs, config_ref, Arc::clone(&last_send_ns)) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -893,13 +986,17 @@ pub extern "C" fn motionstage_swift_client_new_v2(
         }
     }
 
-    let inner = match make_client_inner(device_name, source_outputs, None) {
+    let last_send_ns = Arc::new(AtomicU64::new(0));
+    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -935,13 +1032,17 @@ pub extern "C" fn motionstage_swift_client_new_v3(
         source_outputs.push(AttributeDescriptor { path, value_type });
     }
 
-    let inner = match make_client_inner(device_name, source_outputs, None) {
+    let last_send_ns = Arc::new(AtomicU64::new(0));
+    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -953,9 +1054,10 @@ pub extern "C" fn motionstage_swift_client_free(client: *mut c_void) {
         return;
     }
 
-    unsafe {
-        drop(Box::from_raw(client as *mut MotionStageSwiftClient));
-    }
+    let client = unsafe { Box::from_raw(client as *mut MotionStageSwiftClient) };
+    // Signal ping thread to stop before dropping.
+    client.ping_shutdown.store(true, Ordering::Relaxed);
+    drop(client);
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1126,19 @@ pub extern "C" fn motionstage_swift_client_connect(
         Ok(session) => {
             inner.session = Some(session);
             inner.clear_error();
+            drop(inner);
+
+            // Start ping heartbeat thread.
+            let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+            client_ref.ping_shutdown.store(false, Ordering::Relaxed);
+            client_ref.last_send_ns.store(0, Ordering::Relaxed);
+            let handle = start_ping_thread(
+                client as usize,
+                Arc::clone(&client_ref.last_send_ns),
+                Arc::clone(&client_ref.ping_shutdown),
+            );
+            *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
         Err(err) => {
@@ -1128,6 +1243,17 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
                 inner.session = Some(session);
                 inner.clear_error();
                 drop(inner);
+
+                // Start ping heartbeat thread.
+                client_ref.ping_shutdown.store(false, Ordering::Relaxed);
+                client_ref.last_send_ns.store(0, Ordering::Relaxed);
+                let handle = start_ping_thread(
+                    client_addr,
+                    Arc::clone(&client_ref.last_send_ns),
+                    Arc::clone(&client_ref.ping_shutdown),
+                );
+                *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+
                 unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_OK, ptr::null(), ctx) };
             }
             Err(err) => {
@@ -1150,13 +1276,27 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
 
 #[no_mangle]
 pub extern "C" fn motionstage_swift_client_disconnect(client: *mut c_void) -> i32 {
-    let mut client = match lock_client(client) {
-        Ok(client) => client,
+    if client.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    // Signal ping thread to stop.
+    let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+    client_ref.ping_shutdown.store(true, Ordering::Relaxed);
+    // Take the thread handle (don't join — it'll exit on next sleep cycle).
+    let _ = client_ref
+        .ping_thread
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+
+    let mut inner = match lock_client(client) {
+        Ok(c) => c,
         Err(status) => return status,
     };
 
-    client.disconnect();
-    client.clear_error();
+    inner.disconnect();
+    inner.clear_error();
     MOTIONSTAGE_SWIFT_STATUS_OK
 }
 
