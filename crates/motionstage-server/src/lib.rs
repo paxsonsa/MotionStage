@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
+
 use motionstage_core::{
     AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId, MappingRequest, ObjectId,
     RuntimeCore, RuntimeSnapshot, Scene, SceneId, source_output_matches,
@@ -1685,6 +1687,37 @@ impl ServerHandle {
                 Ok(None)
             }
         }
+    }
+
+    pub async fn push_video_frame(
+        &self,
+        data: Bytes,
+        duration: Duration,
+    ) -> Result<(), ServerError> {
+        let state = self.state.read().await;
+        let peers_with_tracks: Vec<Arc<WebRtcSession>> = state
+            .video_peers
+            .values()
+            .filter(|entry| entry.track_added)
+            .map(|entry| Arc::clone(&entry.peer))
+            .collect();
+        drop(state);
+
+        for peer in peers_with_tracks {
+            if let Err(err) = peer.write_sample(data.clone(), duration).await {
+                tracing::warn!("failed to write video sample to peer: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn video_peer_count(&self) -> u32 {
+        let state = self.state.read().await;
+        state
+            .video_peers
+            .values()
+            .filter(|entry| entry.track_added)
+            .count() as u32
     }
 
     pub async fn has_video_session(&self, device_id: Uuid) -> bool {

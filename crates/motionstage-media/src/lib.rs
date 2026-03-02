@@ -1,3 +1,5 @@
+pub mod encoder;
+
 use bytes::Bytes;
 pub use motionstage_protocol::{IceCandidate, SdpMessage, SdpType, SignalMessage, SignalPayload};
 use serde::{Deserialize, Serialize};
@@ -251,6 +253,8 @@ pub enum MediaError {
     InvalidDescriptor(String),
     #[error("unsupported video descriptor: {0}")]
     UnsupportedDescriptor(String),
+    #[error("encoder error: {0}")]
+    Encoder(String),
 }
 
 #[cfg(test)]

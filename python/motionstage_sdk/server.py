@@ -9,6 +9,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from .delegates import SceneUpdateDelegate
+from .video import VideoStreamDescriptor
 
 try:  # pragma: no cover - exercised only when extension module is present
     from motionstage_sdk_rust import MotionStageServer as _NativeMotionStageServer
@@ -411,6 +412,21 @@ class MotionStageServer:
                 )
             )
         return values
+
+    # --- Video ---
+
+    def set_master_video_descriptor(self, descriptor: VideoStreamDescriptor) -> None:
+        self._native.set_master_video_descriptor(
+            descriptor.width, descriptor.height, descriptor.fps
+        )
+
+    def push_video_frame(self, frame_data: bytes, timestamp_ns: int) -> None:
+        self._native.push_video_frame(frame_data, timestamp_ns)
+
+    def video_peer_count(self) -> int:
+        return self._native.video_peer_count()
+
+    # --- Events ---
 
     def emit_scene_snapshot(self, snapshot: dict[str, Any]) -> None:
         if self._delegate:

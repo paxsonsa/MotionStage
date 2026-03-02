@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
 use motionstage_media::{IceCandidate, SdpMessage, SdpType};
 use thiserror::Error;
 use webrtc::{
@@ -8,6 +10,7 @@ use webrtc::{
     },
     ice_transport::ice_candidate::RTCIceCandidateInit,
     interceptor::registry::Registry,
+    media::Sample,
     peer_connection::{
         configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription, RTCPeerConnection,
@@ -18,6 +21,7 @@ use webrtc::{
 
 pub struct WebRtcSession {
     peer: Arc<RTCPeerConnection>,
+    track: tokio::sync::Mutex<Option<Arc<TrackLocalStaticSample>>>,
 }
 
 impl WebRtcSession {
@@ -38,6 +42,7 @@ impl WebRtcSession {
             .map_err(|err| WebRtcError::Peer(err.to_string()))?;
         Ok(Self {
             peer: Arc::new(peer),
+            track: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -103,7 +108,11 @@ impl WebRtcSession {
             .map_err(|err| WebRtcError::Ice(err.to_string()))
     }
 
-    pub async fn add_h264_track(&self, stream_id: &str, track_id: &str) -> Result<(), WebRtcError> {
+    pub async fn add_h264_track(
+        &self,
+        stream_id: &str,
+        track_id: &str,
+    ) -> Result<Arc<TrackLocalStaticSample>, WebRtcError> {
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: "video/H264".into(),
@@ -117,10 +126,31 @@ impl WebRtcSession {
         ));
 
         self.peer
-            .add_track(track)
+            .add_track(Arc::clone(&track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
             .await
             .map_err(|err| WebRtcError::Track(err.to_string()))?;
-        Ok(())
+
+        *self.track.lock().await = Some(Arc::clone(&track));
+        Ok(track)
+    }
+
+    pub async fn write_sample(&self, data: Bytes, duration: Duration) -> Result<(), WebRtcError> {
+        let guard = self.track.lock().await;
+        let track = guard
+            .as_ref()
+            .ok_or_else(|| WebRtcError::Track("no track added yet".into()))?;
+        track
+            .write_sample(&Sample {
+                data,
+                duration,
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| WebRtcError::Track(err.to_string()))
+    }
+
+    pub async fn has_track(&self) -> bool {
+        self.track.lock().await.is_some()
     }
 }
 

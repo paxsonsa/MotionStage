@@ -18,6 +18,8 @@ use uuid::Uuid;
 pub struct PyMotionStageServer {
     server: ServerHandle,
     rt: tokio::runtime::Runtime,
+    encoder: std::sync::Mutex<Option<motionstage_media::encoder::H264Encoder>>,
+    video_fps: std::sync::atomic::AtomicU32,
 }
 
 #[pymethods]
@@ -43,6 +45,8 @@ impl PyMotionStageServer {
         Ok(Self {
             server: ServerHandle::new(config),
             rt,
+            encoder: std::sync::Mutex::new(None),
+            video_fps: std::sync::atomic::AtomicU32::new(24),
         })
     }
 
@@ -491,6 +495,85 @@ impl PyMotionStageServer {
             }
         }
         Ok(rows)
+    }
+
+    // --- Video ---
+
+    pub fn set_master_video_descriptor(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> PyResult<()> {
+        use motionstage_media::{
+            ColorPrimaries, DynamicRange, TransferFunction, VideoStreamDescriptor,
+        };
+
+        let descriptor = VideoStreamDescriptor {
+            width,
+            height,
+            fps,
+            dynamic_range: DynamicRange::Sdr,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            bit_depth: 8,
+        };
+
+        self.rt
+            .block_on(self.server.set_master_video_descriptor(descriptor))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        // (Re)create the encoder to match the descriptor
+        let encoder = motionstage_media::encoder::H264Encoder::new(
+            width,
+            height,
+            fps as f32,
+            2_000_000, // 2 Mbps default — reasonable for 720p real-time preview
+        )
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        *self
+            .encoder
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))? = Some(encoder);
+
+        self.video_fps
+            .store(fps, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Accept raw RGBA bytes from Python, encode to H.264, push to all WebRTC peers.
+    pub fn push_video_frame(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
+        let encoded = {
+            let mut guard = self
+                .encoder
+                .lock()
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            let encoder = guard.as_mut().ok_or_else(|| {
+                PyRuntimeError::new_err("call set_master_video_descriptor before pushing frames")
+            })?;
+            encoder
+                .encode_rgba(data)
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+        };
+
+        let fps = self
+            .video_fps
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let _ = timestamp_ns; // reserved for future PTS support
+        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+
+        self.rt
+            .block_on(self.server.push_video_frame(encoded, duration))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        Ok(())
+    }
+
+    pub fn video_peer_count(&self) -> PyResult<u32> {
+        Ok(self.rt.block_on(self.server.video_peer_count()))
     }
 }
 

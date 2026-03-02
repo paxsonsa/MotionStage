@@ -47,6 +47,7 @@ mdns-sd = "0.13"
 flume = "0.11"
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
 webrtc = "0.11"
+openh264 = "0.9"
 motionstage-protocol = { path = "crates/motionstage-protocol" }
 motionstage-core = { path = "crates/motionstage-core" }
 motionstage-server = { path = "crates/motionstage-server" }
