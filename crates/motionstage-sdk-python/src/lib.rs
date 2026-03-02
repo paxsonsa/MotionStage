@@ -6,7 +6,7 @@ use motionstage_protocol::{
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyDeprecationWarning, PyRuntimeError, PyValueError},
     prelude::*,
     types::{PyAny, PyDict},
 };
@@ -373,9 +373,12 @@ impl PyMotionStageServer {
     }
 
     pub fn create_mapping(&self, request: &Bound<'_, PyDict>) -> PyResult<String> {
-        let source_device = parse_uuid_from_request_item(request, "source_device")?;
-        let source_output = extract_request_string(request, "source_output")?;
-        let target_attribute = extract_request_string(request, "target_attribute")?;
+        let source_device = parse_uuid_from_request_item(request, "source_device")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let source_output = extract_request_string(request, "source_output")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let target_attribute = extract_request_string(request, "target_attribute")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
         let component_mask = match request.get_item("component_mask") {
             Ok(Some(raw)) if !raw.is_none() => Some(
                 raw.extract::<Vec<usize>>()
@@ -396,7 +399,8 @@ impl PyMotionStageServer {
             .get(&target_scene)
             .ok_or_else(|| PyRuntimeError::new_err(format!("scene not found: {target_scene}")))?;
 
-        let target_object = parse_uuid_from_request_item(request, "target_object_id")?;
+        let target_object = parse_uuid_from_request_item(request, "target_object_id")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
         if !scene.objects.contains_key(&target_object) {
             return Err(PyRuntimeError::new_err(format!(
                 "target object id not found in scene: {target_object}"
@@ -583,7 +587,7 @@ fn parse_sampling_mode(value: &str) -> PyResult<SamplingMode> {
 }
 
 fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "scene spec")?;
     let mut scene = Scene::new(name);
 
     if let Some(raw) = spec
@@ -598,7 +602,7 @@ fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
     let raw_objects = spec
         .get_item("objects")
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err("missing required field `objects`"))?;
+        .ok_or_else(|| PyValueError::new_err("scene spec: missing required list field 'objects'"))?;
     let objects = raw_objects
         .iter()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -614,7 +618,7 @@ fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
 }
 
 fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "object spec")?;
     let mut object = SceneObject::new(name);
 
     if let Some(raw) = spec
@@ -629,7 +633,9 @@ fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
     let raw_attributes = spec
         .get_item("attributes")
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err("missing required field `attributes`"))?;
+        .ok_or_else(|| {
+            PyValueError::new_err("object spec: missing required list field 'attributes'")
+        })?;
     let attributes = raw_attributes
         .iter()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -646,9 +652,14 @@ fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
 }
 
 fn parse_scene_attribute_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneAttribute> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "attribute spec")?;
     let default_value = extract_spec_attribute_value(spec, "default_value")
-        .or_else(|_| extract_spec_attribute_value(spec, "value"))?;
+        .or_else(|_| extract_spec_attribute_value(spec, "value"))
+        .map_err(|_| {
+            PyValueError::new_err(
+                "attribute spec: missing required 'default_value' or 'value' field",
+            )
+        })?;
     let current_value =
         extract_spec_attribute_value(spec, "value").unwrap_or(default_value.clone());
 
@@ -679,11 +690,13 @@ fn parse_scene_attribute_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneAttribu
     Ok(attr)
 }
 
-fn extract_spec_string(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+fn extract_spec_string(spec: &Bound<'_, PyDict>, key: &str, context: &str) -> PyResult<String> {
     let raw = spec
         .get_item(key)
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err(format!("missing required field `{key}`")))?;
+        .ok_or_else(|| {
+            PyValueError::new_err(format!("{context}: missing required string field '{key}'"))
+        })?;
     if let Ok(value) = raw.extract::<String>() {
         return Ok(value);
     }
@@ -757,12 +770,23 @@ fn parse_attribute_value_typed(
         "quatf" => Ok(AttributeValue::Quatf(extract_vec_f32::<4>(value)?)),
         "mat4f" => Ok(AttributeValue::Mat4f(extract_mat4f(value)?)),
         other => Err(PyValueError::new_err(format!(
-            "unsupported attribute type `{other}`"
+            "attribute spec: unknown type '{other}'; valid types: bool, trigger, int32, float32, float64, vec2f, vec3f, vec4f, quatf, mat4f"
         ))),
     }
 }
 
 fn parse_attribute_value_inferred(value: &Bound<'_, PyAny>) -> PyResult<AttributeValue> {
+    let py = value.py();
+    py.import_bound("warnings")?.call_method1(
+        "warn",
+        (
+            "Attribute value type was inferred without an explicit 'type' field. \
+             Add {\"type\": \"float32\"} (or float64, int32, vec3f, etc.) to suppress this warning. \
+             Inference will be removed in a future release.",
+            py.get_type_bound::<PyDeprecationWarning>(),
+            1i32,
+        ),
+    )?;
     if let Ok(v) = value.extract::<bool>() {
         return Ok(AttributeValue::Bool(v));
     }

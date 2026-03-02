@@ -1,12 +1,18 @@
 """MotionStage Python SDK (strict OOP delegate API)."""
 
 from .server import (
+    BakeAttributeValue,
+    BakeCursorInfo,
+    BakeFrame,
+    MappingManager,
     MotionStageServer,
     MotionStageSession,
-    MappingManager,
+    PlaybackState,
     RecordingController,
     SecurityMode,
+    ServerMetrics,
     TakeController,
+    TakeInfo,
 )
 from .video import (
     ColorPrimaries,
@@ -22,13 +28,19 @@ from .video import (
 from .delegates import SceneUpdateDelegate
 
 __all__ = [
+    "BakeAttributeValue",
+    "BakeCursorInfo",
+    "BakeFrame",
+    "MappingManager",
     "MotionStageServer",
     "MotionStageSession",
-    "MappingManager",
+    "PlaybackState",
     "RecordingController",
-    "TakeController",
-    "SecurityMode",
     "SceneUpdateDelegate",
+    "SecurityMode",
+    "ServerMetrics",
+    "TakeController",
+    "TakeInfo",
     "MainThreadDispatcher",
     "FramePullDelegate",
     "FramePushSink",
