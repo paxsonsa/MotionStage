@@ -16,7 +16,7 @@ use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, Sc
 use motionstage_discovery::{DiscoveredService, DiscoveryBrowser};
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, ClientHello, ClientRole, ControlMessage, Feature, Mode,
-    RegisterRequest, SamplingMode, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    RecordingState, RegisterRequest, SamplingMode, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use motionstage_transport_quic::{
@@ -368,7 +368,7 @@ pub async fn run(args: SimulateArgs) -> Result<()> {
     }
     if state.streaming {
         if let Some(server) = server.as_ref() {
-            server.set_mode(Mode::Idle).await?;
+            server.set_mode(Mode::IDLE).await?;
         }
     }
 
@@ -682,10 +682,10 @@ async fn handle_command(
         }
         SimulationCommand::Start => {
             if let Some(server) = server {
-                server.set_mode(Mode::Live).await?;
+                server.set_mode(Mode::LIVE).await?;
                 sim_logln!("streaming started (mode=Live)");
             } else {
-                let active_mode = request_remote_mode(client, Mode::Live, verbose).await?;
+                let active_mode = request_remote_mode(client, Mode::LIVE, verbose).await?;
                 sim_logln!("streaming started (client-only mode, remote mode={active_mode:?})");
             }
             state.streaming = true;
@@ -698,10 +698,10 @@ async fn handle_command(
             }
             state.streaming = false;
             if let Some(server) = server {
-                server.set_mode(Mode::Idle).await?;
+                server.set_mode(Mode::IDLE).await?;
                 sim_logln!("streaming stopped (mode=Idle)");
             } else {
-                let active_mode = request_remote_mode(client, Mode::Idle, verbose).await?;
+                let active_mode = request_remote_mode(client, Mode::IDLE, verbose).await?;
                 sim_logln!("streaming stopped (client-only mode, remote mode={active_mode:?})");
             }
         }
@@ -718,7 +718,7 @@ async fn handle_command(
                 return Ok(true);
             }
             if !state.streaming {
-                server.set_mode(Mode::Live).await?;
+                server.set_mode(Mode::LIVE).await?;
                 state.streaming = true;
             }
             let path = path.unwrap_or_else(|| state.default_record_path.clone());
@@ -1107,10 +1107,10 @@ fn parse_command(line: &str) -> SimulationCommand {
         },
         "mode" => {
             let requested = match parts.next() {
-                Some("live") => Some(Mode::Live),
-                Some("idle") | Some("stop") | Some("stopped") => Some(Mode::Idle),
-                Some("record") | Some("recording") => Some(Mode::Recording),
-                Some("play") | Some("playback") => Some(Mode::Playback),
+                Some("live") => Some(Mode::LIVE),
+                Some("idle") | Some("stop") | Some("stopped") => Some(Mode::IDLE),
+                Some("record") | Some("recording") => Some(Mode::RECORDING),
+                Some("play") | Some("playback") => Some(Mode::PLAYBACK),
                 _ => None,
             };
             match requested {
@@ -1291,7 +1291,7 @@ async fn print_status(
 
     let snapshot = server.last_published_snapshot().await;
     let metrics = server.metrics().await;
-    let mode = snapshot.as_ref().and_then(|v| v.mode).unwrap_or(Mode::Idle);
+    let mode = snapshot.as_ref().and_then(|v| v.mode).unwrap_or(Mode::IDLE);
 
     sim_logln!("  mode: {mode:?}");
     sim_logln!(
@@ -1324,24 +1324,46 @@ async fn request_remote_mode(
     mode: Mode,
     verbose: bool,
 ) -> Result<Mode> {
-    if verbose {
-        sim_logln!("debug: sending ControlMessage::SetMode({mode:?})");
-    }
-    client.control.send(&ControlMessage::SetMode(mode)).await?;
-    match client.control.recv().await? {
-        ControlMessage::ModeState(active_mode) => {
-            if verbose {
-                sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
-            }
-            Ok(active_mode)
+    // Order matters: stop recording/playback before reducing data flow,
+    // but start data flow before enabling recording/playback.
+    let messages: Vec<ControlMessage> = if mode.recording == RecordingState::Inactive {
+        vec![
+            ControlMessage::SetRecording(mode.recording),
+            ControlMessage::SetDataFlow(mode.data_flow),
+        ]
+    } else {
+        vec![
+            ControlMessage::SetDataFlow(mode.data_flow),
+            ControlMessage::SetRecording(mode.recording),
+        ]
+    };
+
+    let mut last_mode = mode;
+    for msg in messages {
+        if verbose {
+            sim_logln!("debug: sending {msg:?}");
         }
-        ControlMessage::Error { code, reason } => Err(anyhow!(
-            "remote mode request rejected: code={code:?} reason={reason}"
-        )),
-        other => Err(anyhow!(
-            "unexpected control reply to mode request: {other:?}"
-        )),
+        client.control.send(&msg).await?;
+        match client.control.recv().await? {
+            ControlMessage::ModeState(active_mode) => {
+                if verbose {
+                    sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
+                }
+                last_mode = active_mode;
+            }
+            ControlMessage::Error { code, reason } => {
+                return Err(anyhow!(
+                    "remote mode request rejected: code={code:?} reason={reason}"
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "unexpected control reply to mode request: {other:?}"
+                ));
+            }
+        }
     }
+    Ok(last_mode)
 }
 
 fn sine_vec3(amplitude: f32, frequency_hz: f32, seconds: f32) -> [f32; 3] {

@@ -71,11 +71,41 @@ pub struct AttributeDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Mode {
+pub enum DataFlowState {
     Idle,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordingState {
+    Inactive,
     Recording,
     Playback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mode {
+    pub data_flow: DataFlowState,
+    pub recording: RecordingState,
+}
+
+impl Mode {
+    pub const IDLE: Self = Self {
+        data_flow: DataFlowState::Idle,
+        recording: RecordingState::Inactive,
+    };
+    pub const LIVE: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Inactive,
+    };
+    pub const RECORDING: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Recording,
+    };
+    pub const PLAYBACK: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Playback,
+    };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,7 +370,8 @@ pub enum ControlMessage {
     ClientGoodbye {
         reason: Option<String>,
     },
-    SetMode(Mode),
+    SetDataFlow(DataFlowState),
+    SetRecording(RecordingState),
     ModeState(Mode),
     ResetSceneToBaseline {
         scene_id: Option<Uuid>,

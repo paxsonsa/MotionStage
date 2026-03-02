@@ -76,7 +76,7 @@ mod tests {
             markers: Vec::new(),
             frames: vec![RecordedFrame {
                 timestamp_ns: 1,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![RecordedAttribute {
                     object_id: Uuid::nil(),
                     attribute: "position".into(),

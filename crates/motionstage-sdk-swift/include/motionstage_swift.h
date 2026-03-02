@@ -16,10 +16,20 @@ extern "C" {
 #define MOTIONSTAGE_SWIFT_STATUS_TRANSPORT 5
 #define MOTIONSTAGE_SWIFT_STATUS_INTERNAL 6
 
+/* Legacy mode constants (deprecated — use data flow / recording constants) */
 #define MOTIONSTAGE_SWIFT_MODE_IDLE 0
 #define MOTIONSTAGE_SWIFT_MODE_LIVE 1
 #define MOTIONSTAGE_SWIFT_MODE_RECORDING 2
 #define MOTIONSTAGE_SWIFT_MODE_PLAYBACK 3
+
+/* Data flow state (3.0) */
+#define MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE 0
+#define MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE 1
+
+/* Recording state (3.0) */
+#define MOTIONSTAGE_SWIFT_RECORDING_INACTIVE 0
+#define MOTIONSTAGE_SWIFT_RECORDING_RECORDING 1
+#define MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK 2
 
 #define MOTIONSTAGE_SWIFT_FIELD_POSITION      0x01
 #define MOTIONSTAGE_SWIFT_FIELD_ROTATION      0x02
@@ -221,8 +231,35 @@ int32_t motionstage_swift_client_send_named_float32(
 
 int32_t motionstage_swift_client_reset_scene(void *client);
 
-/* Mode */
+/* Mode (3.0 — prefer set_data_flow / set_recording) */
 
+/**
+ * Set the data flow state. Returns composite mode via out-parameters.
+ * state: MOTIONSTAGE_SWIFT_DATA_FLOW_* constant.
+ * out_data_flow: receives the active data flow state after the change.
+ * out_recording: receives the active recording state after the change.
+ */
+int32_t motionstage_swift_client_set_data_flow(
+    void *client,
+    int32_t state,
+    int32_t *out_data_flow,
+    int32_t *out_recording
+);
+
+/**
+ * Set the recording state. Returns composite mode via out-parameters.
+ * state: MOTIONSTAGE_SWIFT_RECORDING_* constant.
+ * out_data_flow: receives the active data flow state after the change.
+ * out_recording: receives the active recording state after the change.
+ */
+int32_t motionstage_swift_client_set_recording(
+    void *client,
+    int32_t state,
+    int32_t *out_data_flow,
+    int32_t *out_recording
+);
+
+/* Deprecated: prefer set_data_flow / set_recording */
 int32_t motionstage_swift_client_set_mode(
     void *client,
     int32_t requested_mode,

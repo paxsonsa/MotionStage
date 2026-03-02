@@ -13,7 +13,8 @@ use std::{
 
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole, ControlMessage,
-    Feature, Mode, RegisterRequest, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    DataFlowState, Feature, Mode, RecordingState, RegisterRequest, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 use motionstage_transport_quic::{
     AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient, QuicPeer,
@@ -30,10 +31,18 @@ pub const MOTIONSTAGE_SWIFT_STATUS_PROTOCOL: i32 = 4;
 pub const MOTIONSTAGE_SWIFT_STATUS_TRANSPORT: i32 = 5;
 pub const MOTIONSTAGE_SWIFT_STATUS_INTERNAL: i32 = 6;
 
+/// Deprecated legacy mode constants — kept for `set_mode` shim.
 pub const MOTIONSTAGE_SWIFT_MODE_IDLE: i32 = 0;
 pub const MOTIONSTAGE_SWIFT_MODE_LIVE: i32 = 1;
 pub const MOTIONSTAGE_SWIFT_MODE_RECORDING: i32 = 2;
 pub const MOTIONSTAGE_SWIFT_MODE_PLAYBACK: i32 = 3;
+
+pub const MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE: i32 = 0;
+pub const MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE: i32 = 1;
+
+pub const MOTIONSTAGE_SWIFT_RECORDING_INACTIVE: i32 = 0;
+pub const MOTIONSTAGE_SWIFT_RECORDING_RECORDING: i32 = 1;
+pub const MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK: i32 = 2;
 
 pub const MOTIONSTAGE_SWIFT_FIELD_POSITION: u32 = 0x01;
 pub const MOTIONSTAGE_SWIFT_FIELD_ROTATION: u32 = 0x02;
@@ -351,8 +360,8 @@ impl MotionStageSwiftClientInner {
         })
     }
 
-    fn set_mode(&mut self, requested_mode: i32) -> Result<i32, String> {
-        let requested_mode = parse_mode(requested_mode)?;
+    fn set_data_flow(&mut self, requested: i32) -> Result<(i32, i32), String> {
+        let state = parse_data_flow_state(requested)?;
 
         let session = self
             .session
@@ -363,12 +372,41 @@ impl MotionStageSwiftClientInner {
             .block_on(
                 session
                     .control
-                    .send(&ControlMessage::SetMode(requested_mode)),
+                    .send(&ControlMessage::SetDataFlow(state)),
             )
-            .map_err(|err| format!("failed to send mode request: {err}"))?;
+            .map_err(|err| format!("failed to send data-flow request: {err}"))?;
+
+        self.wait_for_mode_state()
+    }
+
+    fn set_recording(&mut self, requested: i32) -> Result<(i32, i32), String> {
+        let state = parse_recording_state(requested)?;
+
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime()
+            .block_on(
+                session
+                    .control
+                    .send(&ControlMessage::SetRecording(state)),
+            )
+            .map_err(|err| format!("failed to send recording request: {err}"))?;
+
+        self.wait_for_mode_state()
+    }
+
+    /// Wait for a `ModeState` response and return `(data_flow_i32, recording_i32)`.
+    fn wait_for_mode_state(&mut self) -> Result<(i32, i32), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
 
         let mode_reply_timeout = self.mode_reply_timeout;
-        let active_mode = get_runtime().block_on(async {
+        get_runtime().block_on(async {
             loop {
                 let message = timeout(mode_reply_timeout, session.control.recv())
                     .await
@@ -376,8 +414,8 @@ impl MotionStageSwiftClientInner {
                     .map_err(|err| format!("failed to receive mode response: {err}"))?;
 
                 match message {
-                    ControlMessage::ModeState(active_mode) => {
-                        return Ok(active_mode_to_i32(active_mode))
+                    ControlMessage::ModeState(mode) => {
+                        return Ok((mode_to_data_flow_i32(&mode), mode_to_recording_i32(&mode)))
                     }
                     ControlMessage::Error { code, reason } => {
                         return Err(format!(
@@ -388,9 +426,7 @@ impl MotionStageSwiftClientInner {
                     _ => continue,
                 }
             }
-        })?;
-
-        Ok(active_mode)
+        })
     }
 }
 
@@ -500,22 +536,45 @@ fn map_connect_error(err: &str) -> i32 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_mode(mode: i32) -> Result<Mode, String> {
-    match mode {
-        MOTIONSTAGE_SWIFT_MODE_IDLE => Ok(Mode::Idle),
-        MOTIONSTAGE_SWIFT_MODE_LIVE => Ok(Mode::Live),
-        MOTIONSTAGE_SWIFT_MODE_RECORDING => Ok(Mode::Recording),
-        MOTIONSTAGE_SWIFT_MODE_PLAYBACK => Ok(Mode::Playback),
-        _ => Err(format!("invalid mode value `{mode}`")),
+fn parse_data_flow_state(v: i32) -> Result<DataFlowState, String> {
+    match v {
+        MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE => Ok(DataFlowState::Idle),
+        MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE => Ok(DataFlowState::Live),
+        _ => Err(format!("invalid data-flow state value `{v}`")),
     }
 }
 
-fn active_mode_to_i32(mode: Mode) -> i32 {
-    match mode {
-        Mode::Idle => MOTIONSTAGE_SWIFT_MODE_IDLE,
-        Mode::Live => MOTIONSTAGE_SWIFT_MODE_LIVE,
-        Mode::Recording => MOTIONSTAGE_SWIFT_MODE_RECORDING,
-        Mode::Playback => MOTIONSTAGE_SWIFT_MODE_PLAYBACK,
+fn parse_recording_state(v: i32) -> Result<RecordingState, String> {
+    match v {
+        MOTIONSTAGE_SWIFT_RECORDING_INACTIVE => Ok(RecordingState::Inactive),
+        MOTIONSTAGE_SWIFT_RECORDING_RECORDING => Ok(RecordingState::Recording),
+        MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK => Ok(RecordingState::Playback),
+        _ => Err(format!("invalid recording state value `{v}`")),
+    }
+}
+
+fn mode_to_data_flow_i32(mode: &Mode) -> i32 {
+    match mode.data_flow {
+        DataFlowState::Idle => MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE,
+        DataFlowState::Live => MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE,
+    }
+}
+
+fn mode_to_recording_i32(mode: &Mode) -> i32 {
+    match mode.recording {
+        RecordingState::Inactive => MOTIONSTAGE_SWIFT_RECORDING_INACTIVE,
+        RecordingState::Recording => MOTIONSTAGE_SWIFT_RECORDING_RECORDING,
+        RecordingState::Playback => MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK,
+    }
+}
+
+/// Map a composite `Mode` back to a legacy single-integer mode value.
+fn mode_to_legacy_i32(mode: &Mode) -> i32 {
+    match (mode.data_flow, mode.recording) {
+        (DataFlowState::Idle, _) => MOTIONSTAGE_SWIFT_MODE_IDLE,
+        (DataFlowState::Live, RecordingState::Inactive) => MOTIONSTAGE_SWIFT_MODE_LIVE,
+        (DataFlowState::Live, RecordingState::Recording) => MOTIONSTAGE_SWIFT_MODE_RECORDING,
+        (DataFlowState::Live, RecordingState::Playback) => MOTIONSTAGE_SWIFT_MODE_PLAYBACK,
     }
 }
 
@@ -1334,9 +1393,83 @@ pub extern "C" fn motionstage_swift_client_reset_scene(client: *mut c_void) -> i
 }
 
 // ---------------------------------------------------------------------------
-// FFI: Mode
+// FFI: Mode (decoupled data-flow + recording)
 // ---------------------------------------------------------------------------
 
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_data_flow(
+    client: *mut c_void,
+    state: i32,
+    out_data_flow: *mut i32,
+    out_recording: *mut i32,
+) -> i32 {
+    if out_data_flow.is_null() || out_recording.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.set_data_flow(state) {
+        Ok((df, rec)) => {
+            unsafe {
+                *out_data_flow = df;
+                *out_recording = rec;
+            }
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("invalid data-flow state") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_recording(
+    client: *mut c_void,
+    state: i32,
+    out_data_flow: *mut i32,
+    out_recording: *mut i32,
+) -> i32 {
+    if out_data_flow.is_null() || out_recording.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.set_recording(state) {
+        Ok((df, rec)) => {
+            unsafe {
+                *out_data_flow = df;
+                *out_recording = rec;
+            }
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("invalid recording state") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+/// Deprecated: prefer `set_data_flow` / `set_recording`.
+/// Maps legacy single-integer modes to the decoupled commands.
 #[no_mangle]
 pub extern "C" fn motionstage_swift_client_set_mode(
     client: *mut c_void,
@@ -1352,22 +1485,78 @@ pub extern "C" fn motionstage_swift_client_set_mode(
         Err(status) => return status,
     };
 
-    match client.set_mode(requested_mode) {
-        Ok(active_mode) => {
-            unsafe {
-                *active_mode_out = active_mode;
+    let result = match requested_mode {
+        MOTIONSTAGE_SWIFT_MODE_IDLE => {
+            // Idle → set data-flow to Idle
+            client.set_data_flow(MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE)
+        }
+        MOTIONSTAGE_SWIFT_MODE_LIVE => {
+            // Live → set data-flow to Live
+            client.set_data_flow(MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE)
+        }
+        MOTIONSTAGE_SWIFT_MODE_RECORDING => {
+            // Recording → set data-flow to Live, then set recording to Recording
+            let (df, _) = match client.set_data_flow(MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE) {
+                Ok(v) => v,
+                Err(err) => return classify_mode_error(&mut client, err),
+            };
+            // If data-flow didn't go Live, bail early with what we got.
+            if df != MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE {
+                unsafe { *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE; }
+                client.clear_error();
+                return MOTIONSTAGE_SWIFT_STATUS_OK;
             }
+            client.set_recording(MOTIONSTAGE_SWIFT_RECORDING_RECORDING)
+        }
+        MOTIONSTAGE_SWIFT_MODE_PLAYBACK => {
+            // Playback → set data-flow to Live, then set recording to Playback
+            let (df, _) = match client.set_data_flow(MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE) {
+                Ok(v) => v,
+                Err(err) => return classify_mode_error(&mut client, err),
+            };
+            if df != MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE {
+                unsafe { *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE; }
+                client.clear_error();
+                return MOTIONSTAGE_SWIFT_STATUS_OK;
+            }
+            client.set_recording(MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK)
+        }
+        _ => Err(format!("invalid mode value `{requested_mode}`")),
+    };
+
+    match result {
+        Ok((df, rec)) => {
+            // Convert the two-axis result back to a legacy single integer.
+            let mode = Mode {
+                data_flow: if df == MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE {
+                    DataFlowState::Live
+                } else {
+                    DataFlowState::Idle
+                },
+                recording: match rec {
+                    MOTIONSTAGE_SWIFT_RECORDING_RECORDING => RecordingState::Recording,
+                    MOTIONSTAGE_SWIFT_RECORDING_PLAYBACK => RecordingState::Playback,
+                    _ => RecordingState::Inactive,
+                },
+            };
+            unsafe { *active_mode_out = mode_to_legacy_i32(&mode); }
             client.clear_error();
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
-        Err(err) if err.contains("invalid mode value") => {
-            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
-        }
-        Err(err) if err.contains("not connected") => {
-            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
-        }
-        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
-        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+        Err(err) => classify_mode_error(&mut client, err),
+    }
+}
+
+/// Classify an error string from the mode helpers into an FFI status code.
+fn classify_mode_error(client: &mut MotionStageSwiftClientInner, err: String) -> i32 {
+    if err.contains("invalid mode value") || err.contains("invalid data-flow") || err.contains("invalid recording") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+    } else if err.contains("not connected") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+    } else if err.contains("rejected") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err)
+    } else {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err)
     }
 }
 
@@ -1495,14 +1684,17 @@ mod tests {
         let session_id = ptr_to_string_and_free(motionstage_swift_client_session_id(client));
         assert!(session_id.is_some());
 
-        let mut active_mode = MOTIONSTAGE_SWIFT_MODE_IDLE;
-        let mode_status = motionstage_swift_client_set_mode(
+        let mut out_df = MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE;
+        let mut out_rec = MOTIONSTAGE_SWIFT_RECORDING_INACTIVE;
+        let mode_status = motionstage_swift_client_set_data_flow(
             client,
-            MOTIONSTAGE_SWIFT_MODE_LIVE,
-            &mut active_mode,
+            MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE,
+            &mut out_df,
+            &mut out_rec,
         );
         assert_eq!(mode_status, MOTIONSTAGE_SWIFT_STATUS_OK);
-        assert_eq!(active_mode, MOTIONSTAGE_SWIFT_MODE_LIVE);
+        assert_eq!(out_df, MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE);
+        assert_eq!(out_rec, MOTIONSTAGE_SWIFT_RECORDING_INACTIVE);
 
         let send_status = motionstage_swift_client_send_vec3f(client, 1.0, 2.0, 3.0);
         assert_eq!(send_status, MOTIONSTAGE_SWIFT_STATUS_OK);
@@ -1541,11 +1733,13 @@ mod tests {
         );
         assert_eq!(connect_status, MOTIONSTAGE_SWIFT_STATUS_OK);
 
-        let mut active_mode = MOTIONSTAGE_SWIFT_MODE_IDLE;
-        let mode_status = motionstage_swift_client_set_mode(
+        let mut out_df = MOTIONSTAGE_SWIFT_DATA_FLOW_IDLE;
+        let mut out_rec = MOTIONSTAGE_SWIFT_RECORDING_INACTIVE;
+        let mode_status = motionstage_swift_client_set_data_flow(
             client,
-            MOTIONSTAGE_SWIFT_MODE_LIVE,
-            &mut active_mode,
+            MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE,
+            &mut out_df,
+            &mut out_rec,
         );
         assert_eq!(mode_status, MOTIONSTAGE_SWIFT_STATUS_OK);
 

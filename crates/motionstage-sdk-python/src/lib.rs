@@ -2,7 +2,8 @@
 
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_protocol::{
-    BakeAttributeValue, ClientRole, Feature, Mode, PlaybackRuntimeState, SamplingMode,
+    BakeAttributeValue, ClientRole, DataFlowState, Feature, Mode, PlaybackRuntimeState,
+    RecordingState, SamplingMode,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
@@ -75,13 +76,13 @@ impl PyMotionStageServer {
 
     pub fn set_live_mode(&self) -> PyResult<()> {
         self.rt
-            .block_on(self.server.set_mode(Mode::Live))
+            .block_on(self.server.set_mode(Mode::LIVE))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
     pub fn set_stopped_mode(&self) -> PyResult<()> {
         self.rt
-            .block_on(self.server.set_mode(Mode::Idle))
+            .block_on(self.server.set_mode(Mode::IDLE))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
@@ -508,10 +509,10 @@ fn now_ns() -> u64 {
 
 fn parse_mode(value: &str) -> PyResult<Mode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "idle" | "stopped" | "stop" => Ok(Mode::Idle),
-        "live" => Ok(Mode::Live),
-        "recording" | "record" => Ok(Mode::Recording),
-        "playback" | "play" => Ok(Mode::Playback),
+        "idle" | "stopped" | "stop" => Ok(Mode::IDLE),
+        "live" => Ok(Mode::LIVE),
+        "recording" | "record" => Ok(Mode::RECORDING),
+        "playback" | "play" => Ok(Mode::PLAYBACK),
         other => Err(PyValueError::new_err(format!(
             "unsupported mode `{other}` (expected idle/live/recording/playback)"
         ))),
@@ -535,11 +536,14 @@ fn parse_optional_uuid(value: Option<String>) -> PyResult<Option<Uuid>> {
 }
 
 fn mode_to_str(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Idle => "idle",
-        Mode::Live => "live",
-        Mode::Recording => "recording",
-        Mode::Playback => "playback",
+    use DataFlowState::*;
+    use RecordingState::*;
+    match (mode.data_flow, mode.recording) {
+        (Idle, Inactive) => "idle",
+        (Live, Inactive) => "live",
+        (Live, Recording) => "recording",
+        (Live, Playback) => "playback",
+        _ => "unknown",
     }
 }
 

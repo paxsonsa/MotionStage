@@ -19,10 +19,11 @@ use motionstage_media::{
 };
 use motionstage_protocol::{
     negotiate_version, AttributeDescriptor, BakeAttributeValue, BaselineAction, ClientHello,
-    ClientRole, ControlMessage, Feature, Mode, PlaybackAction, PlaybackRuntimeState,
-    ProtocolError, ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest,
-    RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello, SessionState, SignalMessage,
-    SignalPayload, TakeBakeAttribute, TakeInfo, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction,
+    PlaybackRuntimeState, ProtocolError, ProtocolVersion, RecordingState, RegisterAccepted,
+    RegisterRejected, RegisterRequest, RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello,
+    SessionState, SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 use motionstage_recording::{
     read_recording, RecordedAttribute, RecordedFrame, RecordingFile, RecordingManifest,
@@ -852,11 +853,15 @@ impl ServerHandle {
             .map_err(ServerError::Core)
     }
 
-    pub async fn set_mode(&self, mode: Mode) -> Result<(), ServerError> {
+    pub async fn set_data_flow(&self, data_flow: DataFlowState) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let from = state.runtime.mode();
-        state.runtime.set_mode(mode).map_err(ServerError::Core)?;
-        if mode != Mode::Playback {
+        state
+            .runtime
+            .set_data_flow(data_flow)
+            .map_err(ServerError::Core)?;
+        let to = state.runtime.mode();
+        if to.recording != RecordingState::Playback {
             state.active_playback = None;
         }
         if let Some(recording) = state.active_recording.as_mut() {
@@ -865,8 +870,44 @@ impl ServerHandle {
                 .push_marker(RecordingMarker::ModeTransition {
                     timestamp_ns: now_ns(),
                     from,
-                    to: mode,
+                    to,
                 });
+        }
+        Ok(())
+    }
+
+    pub async fn set_recording(&self, recording: RecordingState) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let from = state.runtime.mode();
+        state
+            .runtime
+            .set_recording(recording)
+            .map_err(ServerError::Core)?;
+        let to = state.runtime.mode();
+        if to.recording != RecordingState::Playback {
+            state.active_playback = None;
+        }
+        if let Some(rec) = state.active_recording.as_mut() {
+            rec.writer
+                .push_marker(RecordingMarker::ModeTransition {
+                    timestamp_ns: now_ns(),
+                    from,
+                    to,
+                });
+        }
+        Ok(())
+    }
+
+    /// Convenience: set both axes of the composite mode in one call.
+    pub async fn set_mode(&self, mode: Mode) -> Result<(), ServerError> {
+        // Order matters: stop recording/playback before reducing data flow,
+        // but start data flow before enabling recording/playback.
+        if mode.recording == RecordingState::Inactive {
+            self.set_recording(mode.recording).await?;
+            self.set_data_flow(mode.data_flow).await?;
+        } else {
+            self.set_data_flow(mode.data_flow).await?;
+            self.set_recording(mode.recording).await?;
         }
         Ok(())
     }
@@ -1152,16 +1193,16 @@ impl ServerHandle {
         let mut state = self.state.write().await;
         state.active_playback = None;
         let mut from_mode = state.runtime.mode();
-        if from_mode == Mode::Idle {
+        if from_mode.data_flow == DataFlowState::Idle {
             state
                 .runtime
-                .set_mode(Mode::Live)
+                .set_data_flow(DataFlowState::Live)
                 .map_err(ServerError::Core)?;
-            from_mode = Mode::Live;
+            from_mode = state.runtime.mode();
         }
         state
             .runtime
-            .set_mode(Mode::Recording)
+            .set_recording(RecordingState::Recording)
             .map_err(ServerError::Core)?;
 
         let active_scene = state
@@ -1184,7 +1225,7 @@ impl ServerHandle {
                 .push_marker(RecordingMarker::ModeTransition {
                     timestamp_ns: now_ns,
                     from: from_mode,
-                    to: Mode::Recording,
+                    to: Mode::RECORDING,
                 });
 
             for mapping in snapshot.mappings.values() {
@@ -1219,8 +1260,8 @@ impl ServerHandle {
             .writer
             .push_marker(RecordingMarker::ModeTransition {
                 timestamp_ns: now_ns(),
-                from: Mode::Recording,
-                to: Mode::Live,
+                from: Mode::RECORDING,
+                to: Mode::LIVE,
             });
 
         let manifest = recording
@@ -1241,7 +1282,7 @@ impl ServerHandle {
 
         state
             .runtime
-            .set_mode(Mode::Live)
+            .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
 
         Ok(manifest)
@@ -1279,7 +1320,11 @@ impl ServerHandle {
             .map_err(ServerError::Core)?;
         state
             .runtime
-            .set_mode(Mode::Playback)
+            .set_data_flow(DataFlowState::Live)
+            .map_err(ServerError::Core)?;
+        state
+            .runtime
+            .set_recording(RecordingState::Playback)
             .map_err(ServerError::Core)?;
         let playback = ActivePlayback {
             take_id,
@@ -1383,7 +1428,7 @@ impl ServerHandle {
         }
         state
             .runtime
-            .set_mode(Mode::Live)
+            .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
         Ok((
             PlaybackRuntimeState::Stopped,
@@ -1484,7 +1529,7 @@ impl ServerHandle {
             state.active_playback = None;
             state
                 .runtime
-                .set_mode(Mode::Live)
+                .set_recording(RecordingState::Inactive)
                 .map_err(ServerError::Core)?;
         }
 
@@ -1721,11 +1766,11 @@ impl ServerHandle {
 // Break = exit session loop; Continue = keep looping
 type HandlerOutcome = ControlFlow<()>;
 
-async fn handle_set_mode(
+async fn handle_set_data_flow(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
-    requested_mode: Mode,
+    state: DataFlowState,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
         if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
@@ -1734,7 +1779,38 @@ async fn handle_set_mode(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    match server.set_mode(requested_mode).await {
+    match server.set_data_flow(state).await {
+        Ok(()) => {
+            let active_mode = server.mode().await;
+            control
+                .send(&ControlMessage::ModeState(active_mode))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_set_recording(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    state: RecordingState,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match server.set_recording(state).await {
         Ok(()) => {
             let active_mode = server.mode().await;
             control
@@ -2177,8 +2253,14 @@ async fn handle_quic_peer(
                         let _ = server.close_session_with_reason(client_hello.device_id, now_ns(), reason).await;
                         break;
                     }
-                    Ok(ControlMessage::SetMode(mode)) => {
-                        match handle_set_mode(&mut control, &server, &client_hello, mode).await? {
+                    Ok(ControlMessage::SetDataFlow(state)) => {
+                        match handle_set_data_flow(&mut control, &server, &client_hello, state).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
+                        }
+                    }
+                    Ok(ControlMessage::SetRecording(state)) => {
+                        match handle_set_recording(&mut control, &server, &client_hello, state).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
@@ -2439,8 +2521,8 @@ mod tests {
     };
     use motionstage_protocol::{
         AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole,
-        ControlMessage, Feature, Mode, RegisterRequest, RejectCode, SamplingMode, SessionState,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        ControlMessage, DataFlowState, Feature, Mode, RecordingState, RegisterRequest, RejectCode,
+        SamplingMode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
@@ -2673,7 +2755,7 @@ mod tests {
         assert!(recording.markers.iter().any(|marker| matches!(
             marker,
             RecordingMarker::ModeTransition {
-                to: Mode::Recording,
+                to: Mode { recording: RecordingState::Recording, .. },
                 ..
             }
         )));
@@ -3087,7 +3169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_role_can_set_mode_over_control() {
+    async fn operator_role_can_set_data_flow_over_control() {
         let device_id = Uuid::now_v7();
         let mut config = ServerConfig::default();
         config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
@@ -3104,11 +3186,11 @@ mod tests {
         .await;
 
         control
-            .send(&ControlMessage::SetMode(Mode::Live))
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
         match control.recv().await.unwrap() {
-            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
 
@@ -3117,7 +3199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_role_can_set_mode_without_allowlist() {
+    async fn operator_role_can_set_data_flow_without_allowlist() {
         let mut config = ServerConfig::default();
         config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
         config.enable_discovery = false;
@@ -3134,11 +3216,11 @@ mod tests {
         .await;
 
         control
-            .send(&ControlMessage::SetMode(Mode::Live))
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
         match control.recv().await.unwrap() {
-            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
 
@@ -3325,7 +3407,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.set_mode(Mode::Live).await.unwrap();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
 
         let runtime = server.start_quic_runtime().await.unwrap();
         let client = QuicClient::new_insecure_for_local_dev().unwrap();
@@ -3405,7 +3487,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.set_mode(Mode::Live).await.unwrap();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
 
         server
             .ingest_motion_datagram(MotionDatagram {
@@ -3609,7 +3691,7 @@ mod tests {
             .playback_play(manifest.recording_id, false)
             .await
             .unwrap();
-        assert_eq!(server.mode().await, Mode::Playback);
+        assert_eq!(server.mode().await, Mode::PLAYBACK);
 
         let before = server.runtime_snapshot().await;
         let before_value = before

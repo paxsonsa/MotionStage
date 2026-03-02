@@ -26,13 +26,32 @@ public enum MotionStageError: Error, LocalizedError, CustomStringConvertible {
     public var errorDescription: String? { description }
 }
 
-// MARK: - RuntimeMode
+// MARK: - RuntimeMode (3.0)
 
-public enum RuntimeMode: Int32 {
+public enum DataFlowState: Int32, Sendable {
     case idle = 0
     case live = 1
-    case recording = 2
-    case playback = 3
+}
+
+public enum RecordingState: Int32, Sendable {
+    case inactive = 0
+    case recording = 1
+    case playback = 2
+}
+
+public struct RuntimeMode: Sendable, Equatable {
+    public let dataFlow: DataFlowState
+    public let recording: RecordingState
+
+    public init(dataFlow: DataFlowState, recording: RecordingState) {
+        self.dataFlow = dataFlow
+        self.recording = recording
+    }
+
+    public static let idle = RuntimeMode(dataFlow: .idle, recording: .inactive)
+    public static let live = RuntimeMode(dataFlow: .live, recording: .inactive)
+    public static let recording = RuntimeMode(dataFlow: .live, recording: .recording)
+    public static let playback = RuntimeMode(dataFlow: .live, recording: .playback)
 }
 
 // MARK: - FieldMask
@@ -337,24 +356,60 @@ public final class MotionStageClient: @unchecked Sendable {
         }.value
     }
 
-    // MARK: - Mode
+    // MARK: - Mode (3.0)
 
-    /// Async set mode. Blocks a thread internally (acceptable for infrequent control ops).
+    /// Set the data flow state. Returns the resulting composite mode.
+    @discardableResult
+    public func setDataFlow(_ state: DataFlowState) async throws -> RuntimeMode {
+        let rawClient = self.rawClient
+        return try await Task.detached(priority: .userInitiated) {
+            var outDataFlow: Int32 = 0
+            var outRecording: Int32 = 0
+            let status = motionstage_swift_client_set_data_flow(
+                rawClient, state.rawValue, &outDataFlow, &outRecording
+            )
+            if status != MOTIONSTAGE_SWIFT_STATUS_OK {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "set data flow failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+            return buildRuntimeMode(dataFlow: outDataFlow, recording: outRecording)
+        }.value
+    }
+
+    /// Set the recording state. Returns the resulting composite mode.
+    @discardableResult
+    public func setRecording(_ state: RecordingState) async throws -> RuntimeMode {
+        let rawClient = self.rawClient
+        return try await Task.detached(priority: .userInitiated) {
+            var outDataFlow: Int32 = 0
+            var outRecording: Int32 = 0
+            let status = motionstage_swift_client_set_recording(
+                rawClient, state.rawValue, &outDataFlow, &outRecording
+            )
+            if status != MOTIONSTAGE_SWIFT_STATUS_OK {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "set recording failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+            return buildRuntimeMode(dataFlow: outDataFlow, recording: outRecording)
+        }.value
+    }
+
+    /// Deprecated convenience: set both axes via composite mode.
+    @available(*, deprecated, message: "Use setDataFlow(_:) and setRecording(_:)")
     @discardableResult
     public func setMode(_ mode: RuntimeMode) async throws -> RuntimeMode {
         let rawClient = self.rawClient
         return try await Task.detached(priority: .userInitiated) {
             var activeModeRaw: Int32 = MOTIONSTAGE_SWIFT_MODE_IDLE
-            let status = motionstage_swift_client_set_mode(rawClient, mode.rawValue, &activeModeRaw)
+            let status = motionstage_swift_client_set_mode(rawClient, mode.legacyRawValue, &activeModeRaw)
             if status != MOTIONSTAGE_SWIFT_STATUS_OK {
                 let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
                     ?? "set mode failed with status \(status)"
                 throw makeError(status: status, message: msg)
             }
-            guard let activeMode = RuntimeMode(rawValue: activeModeRaw) else {
-                throw MotionStageError.protocolError("received unsupported mode value: \(activeModeRaw)")
-            }
-            return activeMode
+            return RuntimeMode.fromLegacyRaw(activeModeRaw)
         }.value
     }
 
@@ -476,4 +531,33 @@ private func withOptionalCString<T>(
 ) rethrows -> T {
     guard let value else { return try body(nil) }
     return try value.withCString { try body($0) }
+}
+
+private func buildRuntimeMode(dataFlow: Int32, recording: Int32) -> RuntimeMode {
+    RuntimeMode(
+        dataFlow: DataFlowState(rawValue: dataFlow) ?? .idle,
+        recording: RecordingState(rawValue: recording) ?? .inactive
+    )
+}
+
+extension RuntimeMode {
+    /// Map composite mode to legacy integer for deprecated set_mode FFI.
+    var legacyRawValue: Int32 {
+        switch (dataFlow, recording) {
+        case (.idle, _):         return MOTIONSTAGE_SWIFT_MODE_IDLE
+        case (.live, .inactive): return MOTIONSTAGE_SWIFT_MODE_LIVE
+        case (.live, .recording): return MOTIONSTAGE_SWIFT_MODE_RECORDING
+        case (.live, .playback): return MOTIONSTAGE_SWIFT_MODE_PLAYBACK
+        }
+    }
+
+    /// Reconstruct from legacy integer.
+    static func fromLegacyRaw(_ raw: Int32) -> RuntimeMode {
+        switch raw {
+        case MOTIONSTAGE_SWIFT_MODE_LIVE:      return .live
+        case MOTIONSTAGE_SWIFT_MODE_RECORDING: return .recording
+        case MOTIONSTAGE_SWIFT_MODE_PLAYBACK:  return .playback
+        default:                                return .idle
+        }
+    }
 }

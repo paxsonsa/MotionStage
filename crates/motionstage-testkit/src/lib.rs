@@ -149,7 +149,7 @@ mod tests {
             )
             .await
             .unwrap();
-        harness.server.set_mode(Mode::Live).await.unwrap();
+        harness.server.set_mode(Mode::LIVE).await.unwrap();
 
         let report = harness
             .run_motion_soak(device_id, Duration::from_millis(120), 60, "pose_pos")
@@ -189,7 +189,7 @@ mod tests {
             )
             .await
             .unwrap();
-        harness.server.set_mode(Mode::Live).await.unwrap();
+        harness.server.set_mode(Mode::LIVE).await.unwrap();
 
         let report = harness
             .run_motion_soak(device_id, Duration::from_millis(250), 120, "pose_pos")
@@ -253,7 +253,7 @@ mod tests {
             )
             .await
             .unwrap();
-        harness.server.set_mode(Mode::Live).await.unwrap();
+        harness.server.set_mode(Mode::LIVE).await.unwrap();
 
         let (a_report, b_report) = tokio::join!(
             harness.run_motion_soak(device_a, Duration::from_millis(120), 60, "pose_a"),
