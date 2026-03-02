@@ -362,6 +362,12 @@ public enum MotionStageError: Error {
 |---|------|----------|--------|--------|
 | 10.1 | Codec negotiation (`VideoCodec` field in `VideoStreamDescriptor`) | Medium | Medium | `TODO` |
 | 10.3 | Port in mDNS TXT records (enables iOS discovery fix 6.3) | Medium | Small | `TODO` |
+| 10.4 | H.264 encoder in `motionstage-media` (OpenH264, RGBA→I420→NAL) | High | Medium | `DONE` |
+| 10.5 | WebRTC track storage + `write_sample` on `WebRtcSession` | High | Small | `DONE` |
+| 10.6 | Server `push_video_frame` to all connected video peers | High | Small | `DONE` |
+| 10.7 | PyO3 video bindings (`set_master_video_descriptor`, `push_video_frame`, `video_peer_count`) | High | Medium | `DONE` |
+| 10.8 | Python SDK video methods on `MotionStageServer` | High | Small | `DONE` |
+| 10.9 | Blender viewport capture (`GPUOffScreen`) + video streaming UI | High | Medium | `DONE` |
 
 > **Note:** STUN/TURN configuration (10.2) is **not needed** — this system runs on LAN only.
 
@@ -373,6 +379,18 @@ public enum MotionStageError: Error {
 - **Problem:** `DiscoveryAdvertisement.to_txt_records()` doesn't include the port, forcing the iOS discovery service to probe with a temporary NWConnection.
 - **Recommendation:** Add `format!("port={}", self.bind_port)` to `to_txt_records()`.
 - **File:** `crates/motionstage-discovery/src/lib.rs`
+
+**10.4–10.9 Video Streaming Pipeline (DONE)**
+- **Problem:** WebRTC signaling and track setup existed, but three critical gaps prevented actual video: (1) no H.264 encoder, (2) no mechanism to write encoded frames to tracks, (3) no video methods exposed to Python/Blender.
+- **Implementation:**
+  - `motionstage-media/src/encoder.rs`: `H264Encoder` wrapping OpenH264 0.9 (BSD-2-Clause). Uses built-in `RgbaSliceU8` for RGBA→YUV conversion with reusable `YUVBuffer`.
+  - `motionstage-webrtc`: `WebRtcSession` stores `Arc<TrackLocalStaticSample>` from `add_h264_track()`, exposes `write_sample(data, duration)` and `has_track()`.
+  - `motionstage-server`: `push_video_frame(data, duration)` iterates video peers with tracks, writes samples (per-peer error isolation). `video_peer_count()` for UI.
+  - `motionstage-sdk-python`: `set_master_video_descriptor(w, h, fps)` creates encoder + sets server descriptor. `push_video_frame(rgba, ts)` encodes in-process (zero-copy via PyO3 buffer protocol) and pushes to WebRTC. `video_peer_count()`.
+  - `python/motionstage_sdk/server.py`: Thin wrapper methods delegating to native extension.
+  - `motionstage-blender/capture.py`: `ViewportCapture` using `gpu.types.GPUOffScreen` for offscreen rendering at fixed resolution with explicit camera matrices (independent of viewport pane size). Runs in `SpaceView3D.draw_handler` (GPU context required).
+  - `motionstage-blender/addon.py`: Video Streaming sub-panel (resolution, fps, start/stop, viewer count), `MOTIONSTAGE_OT_toggle_video_streaming` operator, draw-handler-based capture with fps throttling.
+- **Files:** `crates/motionstage-media/`, `crates/motionstage-webrtc/`, `crates/motionstage-server/`, `crates/motionstage-sdk-python/`, `python/motionstage_sdk/server.py`, `motionstage-blender/motionstage_blender/{capture,service,addon}.py`
 
 ---
 
@@ -434,6 +452,12 @@ public enum MotionStageError: Error {
 - [ ] **9.1** USD typed time-sampled export
 - [ ] **9.2** Export from live stream snapshots
 - [ ] **9.3** Export customization options
+- [x] **10.4** H.264 encoder in `motionstage-media` (OpenH264)
+- [x] **10.5** WebRTC track storage + `write_sample`
+- [x] **10.6** Server `push_video_frame` to video peers
+- [x] **10.7** PyO3 video bindings (encode + push in-process)
+- [x] **10.8** Python SDK video methods
+- [x] **10.9** Blender viewport capture + video streaming UI
 - [ ] **10.1** Video codec negotiation
 - [ ] **7.4** `ServerState` substructure *(only if profiling confirms contention)*
 - [ ] **7.6** Snapshot `Arc` clone optimization *(only if profiling confirms cost)*
