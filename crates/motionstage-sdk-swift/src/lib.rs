@@ -12,8 +12,8 @@ use std::{
 };
 
 use motionstage_protocol::{
-    BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole, ControlMessage,
+    Feature, Mode, RegisterRequest, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_transport_quic::{
     AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient, QuicPeer,
@@ -113,6 +113,15 @@ pub struct MotionFrameFFI {
     pub field_mask: u32,
 }
 
+/// Attribute descriptor for typed constructor (3.0).
+/// `value_type`: AttributeKind ordinal (0=Bool, 1=Int32, 2=Float32, 3=Float64,
+///   4=Vec2f, 5=Vec3f, 6=Vec4f, 7=Quatf, 8=Mat4f, 9=Trigger)
+#[repr(C)]
+pub struct MotionStageAttributeDescriptorC {
+    pub path: *const c_char,
+    pub value_type: u32,
+}
+
 /// General-purpose attribute update for `send_batch` (2.1).
 /// `component_count`: 1=Float32, 2=Vec2f, 3=Vec3f, 4=Quatf, 16=Mat4f
 #[repr(C)]
@@ -140,8 +149,8 @@ pub struct MotionStageSwiftClient {
 struct MotionStageSwiftClientInner {
     device_id: Uuid,
     device_name: String,
-    _source_outputs: Vec<String>,
-    qualified_outputs: Vec<String>,
+    _source_outputs: Vec<AttributeDescriptor>,
+    qualified_outputs: Vec<AttributeDescriptor>,
     session: Option<ConnectedSession>,
     last_error: Option<String>,
     handshake_timeout: Duration,
@@ -182,8 +191,8 @@ impl MotionStageSwiftClientInner {
         let first_output = self
             .qualified_outputs
             .first()
-            .ok_or_else(|| "no output attributes configured".to_owned())?
-            .clone();
+            .map(|d| d.path.clone())
+            .ok_or_else(|| "no output attributes configured".to_owned())?;
 
         self.send_datagram(vec![AttributeUpdateFrame {
             output_attribute: first_output,
@@ -226,7 +235,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_POSITION != 0 {
             if let Some(attr) = self.qualified_output_for(0) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Vec3f(frame.position),
                 });
             }
@@ -234,7 +243,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_ROTATION != 0 {
             if let Some(attr) = self.qualified_output_for(1) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Quatf(frame.rotation),
                 });
             }
@@ -242,7 +251,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_VELOCITY != 0 {
             if let Some(attr) = self.qualified_output_for(2) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Vec3f(frame.velocity),
                 });
             }
@@ -250,7 +259,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_FOCAL_LENGTH != 0 {
             if let Some(attr) = self.qualified_output_for(3) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Float32(frame.focal_length),
                 });
             }
@@ -258,7 +267,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_FOCUS_DISTANCE != 0 {
             if let Some(attr) = self.qualified_output_for(4) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Float32(frame.focus_distance),
                 });
             }
@@ -266,7 +275,7 @@ impl MotionStageSwiftClientInner {
         if mask & MOTIONSTAGE_SWIFT_FIELD_APERTURE != 0 {
             if let Some(attr) = self.qualified_output_for(5) {
                 updates.push(AttributeUpdateFrame {
-                    output_attribute: attr.clone(),
+                    output_attribute: attr.to_owned(),
                     value: AttributeValueFrame::Float32(frame.aperture),
                 });
             }
@@ -279,8 +288,8 @@ impl MotionStageSwiftClientInner {
         self.send_datagram_ref(&updates)
     }
 
-    fn qualified_output_for(&self, index: usize) -> Option<&String> {
-        self.qualified_outputs.get(index)
+    fn qualified_output_for(&self, index: usize) -> Option<&str> {
+        self.qualified_outputs.get(index).map(|d| d.path.as_str())
     }
 
     fn send_datagram(&self, updates: Vec<AttributeUpdateFrame>) -> Result<(), String> {
@@ -392,7 +401,7 @@ impl MotionStageSwiftClientInner {
 async fn connect_impl(
     device_id: Uuid,
     device_name: String,
-    qualified_outputs: Vec<String>,
+    qualified_outputs: Vec<AttributeDescriptor>,
     server_addr: String,
     pairing_token: Option<String>,
     api_key: Option<String>,
@@ -510,6 +519,34 @@ fn active_mode_to_i32(mode: Mode) -> i32 {
     }
 }
 
+/// Convert C ordinal to AttributeKind.
+fn attribute_kind_from_ordinal(ordinal: u32) -> Option<AttributeKind> {
+    match ordinal {
+        0 => Some(AttributeKind::Bool),
+        1 => Some(AttributeKind::Int32),
+        2 => Some(AttributeKind::Float32),
+        3 => Some(AttributeKind::Float64),
+        4 => Some(AttributeKind::Vec2f),
+        5 => Some(AttributeKind::Vec3f),
+        6 => Some(AttributeKind::Vec4f),
+        7 => Some(AttributeKind::Quatf),
+        8 => Some(AttributeKind::Mat4f),
+        9 => Some(AttributeKind::Trigger),
+        _ => None,
+    }
+}
+
+/// Infer AttributeKind from a path name for legacy constructors that don't specify types.
+fn infer_attribute_kind_from_path(path: &str) -> AttributeKind {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    match leaf {
+        "position" | "velocity" => AttributeKind::Vec3f,
+        "rotation" => AttributeKind::Quatf,
+        "focal_length" | "focus_distance" | "aperture" => AttributeKind::Float32,
+        _ => AttributeKind::Float32,
+    }
+}
+
 fn qualify_source_output(device_id: Uuid, output_attribute: &str) -> String {
     let normalized = output_attribute.trim();
     if normalized.is_empty() {
@@ -531,16 +568,19 @@ fn qualify_source_output(device_id: Uuid, output_attribute: &str) -> String {
 
 fn make_client_inner(
     device_name: String,
-    source_outputs: Vec<String>,
+    source_outputs: Vec<AttributeDescriptor>,
     config: Option<&MotionStageClientConfig>,
 ) -> Result<MotionStageSwiftClientInner, String> {
     // Ensure the global runtime is initialized.
     let _ = get_runtime();
 
     let device_id = Uuid::now_v7();
-    let qualified_outputs: Vec<String> = source_outputs
+    let qualified_outputs: Vec<AttributeDescriptor> = source_outputs
         .iter()
-        .map(|attr| qualify_source_output(device_id, attr))
+        .map(|desc| AttributeDescriptor {
+            path: qualify_source_output(device_id, &desc.path),
+            value_type: desc.value_type,
+        })
         .collect();
 
     let handshake_timeout = config
@@ -659,7 +699,14 @@ pub extern "C" fn motionstage_swift_client_new(
         Err(_) => return ptr::null_mut(),
     };
 
-    let inner = match make_client_inner(device_name, vec![output_attribute], None) {
+    let inner = match make_client_inner(
+        device_name,
+        vec![AttributeDescriptor {
+            path: output_attribute,
+            value_type: infer_attribute_kind_from_path(""),
+        }],
+        None,
+    ) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
@@ -686,10 +733,14 @@ pub extern "C" fn motionstage_swift_client_new_multi(
         Err(_) => return ptr::null_mut(),
     };
 
-    let source_outputs: Vec<String> = csv
+    let source_outputs: Vec<AttributeDescriptor> = csv
         .split(',')
-        .map(|s| s.trim().to_owned())
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .map(|s| AttributeDescriptor {
+            path: s.to_owned(),
+            value_type: infer_attribute_kind_from_path(s),
+        })
         .collect();
 
     if source_outputs.is_empty() {
@@ -723,10 +774,14 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
         Err(_) => return ptr::null_mut(),
     };
 
-    let source_outputs: Vec<String> = csv
+    let source_outputs: Vec<AttributeDescriptor> = csv
         .split(',')
-        .map(|s| s.trim().to_owned())
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .map(|s| AttributeDescriptor {
+            path: s.to_owned(),
+            value_type: infer_attribute_kind_from_path(s),
+        })
         .collect();
 
     if source_outputs.is_empty() {
@@ -771,9 +826,54 @@ pub extern "C" fn motionstage_swift_client_new_v2(
     for i in 0..attribute_count as usize {
         let ptr = unsafe { *attribute_names.add(i) };
         match unsafe { read_required_cstr(ptr, "attribute_names[i]") } {
-            Ok(s) => source_outputs.push(s),
+            Ok(s) => source_outputs.push(AttributeDescriptor {
+                value_type: infer_attribute_kind_from_path(&s),
+                path: s,
+            }),
             Err(_) => return ptr::null_mut(),
         }
+    }
+
+    let inner = match make_client_inner(device_name, source_outputs, None) {
+        Ok(inner) => inner,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let client = MotionStageSwiftClient {
+        inner: Mutex::new(inner),
+    };
+
+    Box::into_raw(Box::new(client)).cast::<c_void>()
+}
+
+/// Typed descriptor constructor (3.0). Preferred over `_new_v2`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_new_v3(
+    device_name: *const c_char,
+    attribute_count: u32,
+    attributes: *const MotionStageAttributeDescriptorC,
+) -> *mut c_void {
+    let device_name = match unsafe { read_required_cstr(device_name, "device_name") } {
+        Ok(value) => value,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    if attributes.is_null() || attribute_count == 0 {
+        return ptr::null_mut();
+    }
+
+    let mut source_outputs = Vec::with_capacity(attribute_count as usize);
+    for i in 0..attribute_count as usize {
+        let desc = unsafe { &*attributes.add(i) };
+        let path = match unsafe { read_required_cstr(desc.path, "attribute path") } {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+        let value_type = match attribute_kind_from_ordinal(desc.value_type) {
+            Some(k) => k,
+            None => return ptr::null_mut(),
+        };
+        source_outputs.push(AttributeDescriptor { path, value_type });
     }
 
     let inner = match make_client_inner(device_name, source_outputs, None) {

@@ -365,7 +365,11 @@ impl PyMotionStageServer {
                         .map(feature_to_str)
                         .map(str::to_owned)
                         .collect(),
-                    session.advertised_attributes,
+                    session
+                        .advertised_attributes
+                        .into_iter()
+                        .map(|ad| ad.path)
+                        .collect(),
                     format!("{:?}", session.state),
                 )
             })

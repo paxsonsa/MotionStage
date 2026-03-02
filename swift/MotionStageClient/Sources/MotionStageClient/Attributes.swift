@@ -19,6 +19,18 @@ public enum AttributeKind: Sendable {
         case .mat4f:   return 16
         }
     }
+
+    /// C ordinal matching the Rust `AttributeKind` enum discriminant.
+    public var cOrdinal: UInt32 {
+        switch self {
+        case .float32: return 2
+        case .vec2f:   return 4
+        case .vec3f:   return 5
+        case .vec4f:   return 6
+        case .quatf:   return 7
+        case .mat4f:   return 8
+        }
+    }
 }
 
 /// A typed handle to an attribute path.

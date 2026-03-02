@@ -15,8 +15,8 @@ use clap::Args;
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_discovery::{DiscoveredService, DiscoveryBrowser};
 use motionstage_protocol::{
-    ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest, SamplingMode,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    AttributeDescriptor, AttributeKind, ClientHello, ClientRole, ControlMessage, Feature, Mode,
+    RegisterRequest, SamplingMode, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use motionstage_transport_quic::{
@@ -1410,7 +1410,10 @@ async fn connect_simulated_client(
             device_name: "simulated-motion-device".into(),
             roles: vec![ClientRole::MotionSource, ClientRole::Operator],
             features: vec![Feature::Motion, Feature::Mapping, Feature::Recording],
-            advertised_attributes: vec![output_attribute.to_owned()],
+            advertised_attributes: vec![AttributeDescriptor {
+                path: output_attribute.to_owned(),
+                value_type: AttributeKind::Vec3f,
+            }],
         }))
         .await?;
     if verbose {

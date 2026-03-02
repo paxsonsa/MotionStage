@@ -46,6 +46,26 @@ typedef struct {
 } MotionStageClientConfig;
 
 /**
+ * Typed attribute descriptor for motionstage_swift_client_new_v3.
+ *
+ * value_type ordinal:
+ *   0  = Bool
+ *   1  = Int32
+ *   2  = Float32
+ *   3  = Float64
+ *   4  = Vec2f
+ *   5  = Vec3f
+ *   6  = Vec4f
+ *   7  = Quatf
+ *   8  = Mat4f
+ *   9  = Trigger
+ */
+typedef struct {
+    const char *path;           /* attribute path, e.g. "motion.position" */
+    uint32_t value_type;        /* AttributeKind ordinal */
+} MotionStageAttributeDescriptorC;
+
+/**
  * General-purpose attribute update entry for motionstage_swift_client_send_batch.
  *
  * component_count encodes the value type:
@@ -107,6 +127,16 @@ void *motionstage_swift_client_new_v2(
     const char *device_name,
     uint32_t attribute_count,
     const char *const *attribute_names
+);
+
+/**
+ * Typed descriptor constructor (3.0). Preferred over _new_v2.
+ * attributes: array of attribute_count MotionStageAttributeDescriptorC entries.
+ */
+void *motionstage_swift_client_new_v3(
+    const char *device_name,
+    uint32_t attribute_count,
+    const MotionStageAttributeDescriptorC *attributes
 );
 
 void motionstage_swift_client_free(void *client);

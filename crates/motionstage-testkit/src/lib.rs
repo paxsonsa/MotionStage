@@ -1,4 +1,6 @@
-use motionstage_protocol::{ClientHello, ClientRole, Feature, RegisterRequest};
+use motionstage_protocol::{
+    AttributeDescriptor, AttributeKind, ClientHello, ClientRole, Feature, RegisterRequest,
+};
 use motionstage_server::{ServerConfig, ServerError, ServerHandle, ServerMetrics};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -27,7 +29,10 @@ impl TestHarness {
                 device_name: name.into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await?;
         self.server.authenticate(device_id).await?;

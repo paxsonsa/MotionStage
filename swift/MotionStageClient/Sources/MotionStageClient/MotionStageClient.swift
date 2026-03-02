@@ -149,8 +149,7 @@ public final class MotionStageClient: @unchecked Sendable {
             throw MotionStageError.invalidArgument("outputAttributes must not be empty")
         }
 
-        let paths = outputAttributes.map(\.path)
-        let raw = try MotionStageClient.makeClientV2(deviceName: deviceName, paths: paths)
+        let raw = try MotionStageClient.makeClientV3(deviceName: deviceName, attributes: outputAttributes)
         self.rawClient = raw
         (self.events, self.eventContinuation) = AsyncStream<ConnectionEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(16)
@@ -394,6 +393,37 @@ public final class MotionStageClient: @unchecked Sendable {
         let maybeClient = ptrs.withUnsafeMutableBufferPointer { ptrBuf in
             deviceName.withCString { namePtr in
                 motionstage_swift_client_new_v2(namePtr, UInt32(paths.count), ptrBuf.baseAddress)
+            }
+        }
+
+        guard let raw = maybeClient else {
+            throw MotionStageError.internalError("failed to allocate MotionStage client")
+        }
+        return raw
+    }
+
+    /// Creates a client via the typed _new_v3 constructor.
+    private static func makeClientV3(
+        deviceName: String,
+        attributes: [AttributeKey]
+    ) throws -> UnsafeMutableRawPointer {
+        let cPaths = attributes.map { $0.path.withCString { strdup($0) } }
+        defer { cPaths.forEach { free($0) } }
+
+        var descriptors = attributes.enumerated().map { (i, attr) in
+            MotionStageAttributeDescriptorC(
+                path: cPaths[i],
+                value_type: attr.kind.cOrdinal
+            )
+        }
+
+        let maybeClient = descriptors.withUnsafeMutableBufferPointer { descBuf in
+            deviceName.withCString { namePtr in
+                motionstage_swift_client_new_v3(
+                    namePtr,
+                    UInt32(attributes.count),
+                    descBuf.baseAddress
+                )
             }
         }
 

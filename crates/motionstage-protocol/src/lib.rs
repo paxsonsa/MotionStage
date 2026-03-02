@@ -35,6 +35,41 @@ pub enum Feature {
     SdrFallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AttributeKind {
+    Bool,
+    Int32,
+    Float32,
+    Float64,
+    Vec2f,
+    Vec3f,
+    Vec4f,
+    Quatf,
+    Mat4f,
+    Trigger,
+}
+
+impl AttributeKind {
+    /// Map FFI component counts to attribute kinds.
+    /// 1=Float32, 2=Vec2f, 3=Vec3f, 4=Quatf, 16=Mat4f
+    pub fn from_component_count(count: u32) -> Option<AttributeKind> {
+        match count {
+            1 => Some(AttributeKind::Float32),
+            2 => Some(AttributeKind::Vec2f),
+            3 => Some(AttributeKind::Vec3f),
+            4 => Some(AttributeKind::Quatf),
+            16 => Some(AttributeKind::Mat4f),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributeDescriptor {
+    pub path: String,
+    pub value_type: AttributeKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     Idle,
@@ -171,7 +206,7 @@ pub struct ClientHello {
     pub device_name: String,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
-    pub advertised_attributes: Vec<String>,
+    pub advertised_attributes: Vec<AttributeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,11 +18,11 @@ use motionstage_media::{
     VideoStreamDescriptor,
 };
 use motionstage_protocol::{
-    negotiate_version, BakeAttributeValue, BaselineAction, ClientHello, ClientRole, ControlMessage,
-    Feature, Mode, PlaybackAction, PlaybackRuntimeState, ProtocolError, ProtocolVersion,
-    RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SamplingMode, SdpMessage,
-    SdpType, ServerHello, SessionState, SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    negotiate_version, AttributeDescriptor, BakeAttributeValue, BaselineAction, ClientHello,
+    ClientRole, ControlMessage, Feature, Mode, PlaybackAction, PlaybackRuntimeState,
+    ProtocolError, ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest,
+    RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello, SessionState, SignalMessage,
+    SignalPayload, TakeBakeAttribute, TakeInfo, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_recording::{
     read_recording, RecordedAttribute, RecordedFrame, RecordingFile, RecordingManifest,
@@ -106,7 +106,7 @@ pub struct SessionInfo {
     pub session_id: Option<Uuid>,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
-    pub advertised_attributes: Vec<String>,
+    pub advertised_attributes: Vec<AttributeDescriptor>,
     pub state: SessionState,
 }
 
@@ -2438,8 +2438,9 @@ mod tests {
         SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoStreamDescriptor,
     };
     use motionstage_protocol::{
-        BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest,
-        RejectCode, SamplingMode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole,
+        ControlMessage, Feature, Mode, RegisterRequest, RejectCode, SamplingMode, SessionState,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
@@ -2475,7 +2476,7 @@ mod tests {
                 roles: vec![role],
                 features: vec![feature],
                 advertised_attributes: if role == ClientRole::MotionSource {
-                    vec!["pose_pos".into()]
+                    vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }]
                 } else {
                     Vec::new()
                 },
@@ -2512,7 +2513,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
             })
             .await
             .unwrap();
@@ -2542,7 +2543,7 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
             })
             .await
             .unwrap();
@@ -2578,7 +2579,7 @@ mod tests {
                     device_name: "ipad".into(),
                     roles: vec![ClientRole::MotionSource],
                     features: vec![Feature::Motion],
-                    advertised_attributes: vec!["pose_pos".into()],
+                    advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
                 })
                 .await
                 .unwrap();
@@ -2701,7 +2702,7 @@ mod tests {
                 device_name: "controller".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
             })
             .await
             .unwrap();
@@ -2927,7 +2928,7 @@ mod tests {
                     roles: vec![role],
                     features: vec![feature],
                     advertised_attributes: if role == ClientRole::MotionSource {
-                        vec!["pose_pos".into()]
+                        vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }]
                     } else {
                         Vec::new()
                     },
@@ -3009,7 +3010,7 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
             })
             .await
             .unwrap_err();
@@ -3344,7 +3345,7 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
             }))
             .await
             .unwrap();
