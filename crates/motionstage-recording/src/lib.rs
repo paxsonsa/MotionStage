@@ -78,6 +78,16 @@ pub enum RecordingMarker {
         mapping_id: MappingId,
         lock: bool,
     },
+    ClientJoined {
+        timestamp_ns: u64,
+        device_id: Uuid,
+        device_name: String,
+    },
+    ClientLeft {
+        timestamp_ns: u64,
+        device_id: Uuid,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

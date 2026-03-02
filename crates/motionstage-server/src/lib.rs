@@ -790,11 +790,48 @@ impl ServerHandle {
     pub async fn activate(&self, device_id: Uuid) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state.runtime.register_device_connected(device_id);
-        state.change_session_state(device_id, SessionState::Active)
+        state.change_session_state(device_id, SessionState::Active)?;
+        let device_name = state
+            .sessions
+            .get(&device_id)
+            .map(|s| s.device_name.clone())
+            .unwrap_or_default();
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording
+                .writer
+                .push_marker(RecordingMarker::ClientJoined {
+                    timestamp_ns: now_ns(),
+                    device_id,
+                    device_name,
+                });
+        }
+        Ok(())
     }
 
-    pub async fn close_session(&self, device_id: Uuid, now_ns: u64) -> Result<(), ServerError> {
+    pub async fn close_session(
+        &self,
+        device_id: Uuid,
+        now_ns: u64,
+    ) -> Result<(), ServerError> {
+        self.close_session_with_reason(device_id, now_ns, None).await
+    }
+
+    pub async fn close_session_with_reason(
+        &self,
+        device_id: Uuid,
+        now_ns: u64,
+        reason: Option<String>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording
+                .writer
+                .push_marker(RecordingMarker::ClientLeft {
+                    timestamp_ns: now_ns,
+                    device_id,
+                    reason,
+                });
+        }
         state
             .runtime
             .register_device_disconnected(device_id, now_ns);
@@ -2137,7 +2174,7 @@ async fn handle_quic_peer(
                             reason = reason.as_deref().unwrap_or("none"),
                             "client sent goodbye"
                         );
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        let _ = server.close_session_with_reason(client_hello.device_id, now_ns(), reason).await;
                         break;
                     }
                     Ok(ControlMessage::SetMode(mode)) => {
