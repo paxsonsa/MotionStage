@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion, clippy::type_complexity, clippy::needless_borrow)]
+
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_protocol::{
     BakeAttributeValue, ClientRole, Feature, Mode, PlaybackRuntimeState, SamplingMode,

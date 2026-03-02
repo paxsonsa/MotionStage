@@ -61,14 +61,12 @@ fn encode_value(value: &AttributeValue) -> String {
         AttributeValue::Vec3f(v) => format!("{} {} {}", v[0], v[1], v[2]),
         AttributeValue::Vec4f(v) => format!("{} {} {} {}", v[0], v[1], v[2], v[3]),
         AttributeValue::Quatf(v) => format!("{} {} {} {}", v[0], v[1], v[2], v[3]),
-        AttributeValue::Mat4f(v) => format!(
-            "{}",
-            v.iter()
-                .flat_map(|row| row.iter())
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        AttributeValue::Mat4f(v) => v
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         AttributeValue::Trigger(v) => v.to_string(),
     }
 }

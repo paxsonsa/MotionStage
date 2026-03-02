@@ -214,10 +214,12 @@ pub async fn run(args: SimulateArgs) -> Result<()> {
             (SimulationMode::ClientOnly, None, route, client)
         }
         None => {
-            let mut config = ServerConfig::default();
-            config.name = args.name.clone();
-            config.quic_bind_addr = args.bind;
-            config.enable_discovery = args.discoverable;
+            let config = ServerConfig {
+                name: args.name.clone(),
+                quic_bind_addr: args.bind,
+                enable_discovery: args.discoverable,
+                ..ServerConfig::default()
+            };
 
             let server = ServerHandle::new(config);
             let advertisement = server.start().await.map_err(|err| {
@@ -648,7 +650,7 @@ async fn emit_sample(
         }],
     })?;
 
-    if state.sample_index % state.print_every as u64 == 0 {
+    if state.sample_index.is_multiple_of(state.print_every as u64) {
         sim_logln!(
             "sample {:>8} -> [{:>7.3}, {:>7.3}, {:>7.3}]",
             state.sample_index,
