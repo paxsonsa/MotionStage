@@ -2,12 +2,16 @@ import Foundation
 import MotionStageSwiftFFI
 import simd
 
-public struct MotionStageError: Error, CustomStringConvertible {
+public struct MotionStageError: Error, LocalizedError, CustomStringConvertible {
     public let statusCode: Int32
     public let message: String
 
     public var description: String {
         "MotionStage error (status=\(statusCode)): \(message)"
+    }
+
+    public var errorDescription: String? {
+        message
     }
 }
 
