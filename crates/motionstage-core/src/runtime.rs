@@ -1,6 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use bevy_ecs::{prelude::Resource, world::World};
 use indexmap::IndexMap;
 use motionstage_protocol::Mode;
 use thiserror::Error;
@@ -44,18 +43,14 @@ pub struct RuntimeSnapshot {
     pub mappings: IndexMap<MappingId, Mapping>,
 }
 
-#[derive(Resource, Default)]
-struct RuntimeStats {
-    tick_count: u64,
-}
-
 #[derive(Debug)]
 pub struct RuntimeCore {
-    world: World,
+    tick_count: u64,
     scenes: IndexMap<SceneId, Scene>,
     active_scene: Option<SceneId>,
     mode: Mode,
     mappings: IndexMap<MappingId, Mapping>,
+    mapping_index: HashMap<(Uuid, String), MappingId>,
     lease: LeaseConfig,
     connected_devices: BTreeSet<Uuid>,
 }
@@ -68,15 +63,13 @@ impl Default for RuntimeCore {
 
 impl RuntimeCore {
     pub fn new(lease: LeaseConfig) -> Self {
-        let mut world = World::new();
-        world.insert_resource(RuntimeStats::default());
-
         Self {
-            world,
+            tick_count: 0,
             scenes: IndexMap::new(),
             active_scene: None,
             mode: Mode::Idle,
             mappings: IndexMap::new(),
+            mapping_index: HashMap::new(),
             lease,
             connected_devices: BTreeSet::new(),
         }
@@ -222,6 +215,8 @@ impl RuntimeCore {
         }
 
         let id = Uuid::now_v7();
+        self.mapping_index
+            .insert((req.source_device, req.source_output.clone()), id);
         self.mappings.insert(
             id,
             Mapping {
@@ -257,9 +252,11 @@ impl RuntimeCore {
         if self.mode == Mode::Recording {
             return Err(CoreError::MappingBlockedInRecording);
         }
-        let Some(_) = self.mappings.shift_remove(&mapping_id) else {
+        let Some(mapping) = self.mappings.shift_remove(&mapping_id) else {
             return Err(CoreError::MappingDenied("mapping not found".into()));
         };
+        self.mapping_index
+            .remove(&(mapping.source_device, mapping.source_output));
         Ok(())
     }
 
@@ -286,6 +283,7 @@ impl RuntimeCore {
             return Err(CoreError::MappingDenied("mapping is locked".into()));
         }
 
+        let old_key = (mapping.source_device, mapping.source_output.clone());
         mapping.source_device = req.source_device;
         mapping.source_output = req.source_output;
         mapping.target_scene = req.target_scene;
@@ -294,6 +292,10 @@ impl RuntimeCore {
         mapping.component_mask = req.component_mask;
         mapping.last_heartbeat_ns = now_ns;
         mapping.disconnected_at_ns = None;
+
+        self.mapping_index.remove(&old_key);
+        self.mapping_index
+            .insert((mapping.source_device, mapping.source_output.clone()), mapping_id);
         Ok(())
     }
 
@@ -328,26 +330,37 @@ impl RuntimeCore {
 
         let mut applied = BTreeMap::new();
         for update in updates {
-            let mapping = self
-                .mappings
-                .values()
-                .find(|m| {
-                    m.state == MappingState::Active
-                        && m.source_device == device_id
-                        && source_output_matches(
-                            &m.source_output,
-                            device_id,
-                            update.output_attribute.as_str(),
-                        )
-                        && m.target_scene == active_scene
-                })
-                .ok_or_else(|| {
-                    CoreError::MappingDenied(format!(
-                        "no active mapping for output '{}'",
-                        update.output_attribute
-                    ))
-                })?
-                .clone();
+            // Fast path: O(1) index lookup for exact-match keys.
+            let indexed = self
+                .mapping_index
+                .get(&(device_id, update.output_attribute.clone()))
+                .and_then(|id| self.mappings.get(id))
+                .filter(|m| m.state == MappingState::Active && m.target_scene == active_scene)
+                .cloned();
+
+            let mapping = match indexed {
+                Some(m) => m,
+                None => self
+                    .mappings
+                    .values()
+                    .find(|m| {
+                        m.state == MappingState::Active
+                            && m.source_device == device_id
+                            && source_output_matches(
+                                &m.source_output,
+                                device_id,
+                                update.output_attribute.as_str(),
+                            )
+                            && m.target_scene == active_scene
+                    })
+                    .ok_or_else(|| {
+                        CoreError::MappingDenied(format!(
+                            "no active mapping for output '{}'",
+                            update.output_attribute
+                        ))
+                    })?
+                    .clone(),
+            };
 
             let scene = self
                 .scenes
@@ -388,12 +401,12 @@ impl RuntimeCore {
             );
         }
 
-        self.world.resource_mut::<RuntimeStats>().tick_count += 1;
+        self.tick_count += 1;
         Ok(applied)
     }
 
     pub fn tick_count(&self) -> u64 {
-        self.world.resource::<RuntimeStats>().tick_count
+        self.tick_count
     }
 
     pub fn reset_scene_to_baseline(&mut self, scene_id: SceneId) -> Result<u32, CoreError> {
@@ -925,7 +938,7 @@ fn mat4_multiply(base: [[f32; 4]; 4], delta: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
+pub fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
     if mapping_output == update_output {
         return true;
     }

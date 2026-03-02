@@ -9,7 +9,6 @@ thiserror.workspace = true
 serde.workspace = true
 uuid.workspace = true
 indexmap.workspace = true
-bevy_ecs.workspace = true
 motionstage-protocol.workspace = true
 
 [dev-dependencies]
