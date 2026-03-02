@@ -22,6 +22,7 @@ pub struct DiscoveryAdvertisement {
 impl DiscoveryAdvertisement {
     pub fn to_txt_records(&self) -> Vec<String> {
         vec![
+            format!("port={}", self.bind_port),
             format!("name={}", self.service_name),
             format!("proto_major={}", self.protocol_major),
             format!("proto_minor={}", self.protocol_minor),
@@ -249,6 +250,7 @@ mod tests {
     fn txt_records_include_version_and_security() {
         let adv = DiscoveryAdvertisement::default_for("cine", 7788);
         let txt = adv.to_txt_records();
+        assert!(txt.iter().any(|s| s.contains("port=7788")));
         assert!(txt.iter().any(|s| s.contains("proto_major=1")));
         assert!(txt.iter().any(|s| s.contains("security=trusted_lan")));
     }
