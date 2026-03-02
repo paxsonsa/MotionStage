@@ -109,6 +109,8 @@ pub struct SessionInfo {
     pub features: Vec<Feature>,
     pub advertised_attributes: Vec<AttributeDescriptor>,
     pub state: SessionState,
+    /// Nanosecond timestamp of last activity (control message or motion datagram).
+    pub last_activity_ns: u64,
 }
 
 struct ActiveRecording {
@@ -552,6 +554,25 @@ impl ServerHandle {
                         let now = now_ns();
                         state.runtime.scheduler_tick(now);
                         state.tick_playback(now);
+
+                        // Evict sessions that have been idle beyond the configured timeout (4.4).
+                        let idle_timeout = state.config.lease.session_idle_timeout_ns;
+                        if idle_timeout > 0 {
+                            let expired: Vec<Uuid> = state.sessions.values()
+                                .filter(|s| {
+                                    s.state != SessionState::Closed
+                                        && s.state != SessionState::Discovered
+                                        && now.saturating_sub(s.last_activity_ns) >= idle_timeout
+                                })
+                                .map(|s| s.device_id)
+                                .collect();
+                            for device_id in expired {
+                                warn!(%device_id, "session idle timeout; closing");
+                                state.runtime.register_device_disconnected(device_id, now);
+                                let _ = state.change_session_state(device_id, SessionState::Closed);
+                            }
+                        }
+
                         state.metrics.scheduler_ticks += 1;
                         trace!(scheduler_ticks = state.metrics.scheduler_ticks, "scheduler tick");
                     }
@@ -654,6 +675,7 @@ impl ServerHandle {
                 features: Vec::new(),
                 advertised_attributes: Vec::new(),
                 state: SessionState::Discovered,
+                last_activity_ns: now_ns(),
             },
         );
         debug!(%device_id, device_name = %device_name, "session discovered");
@@ -807,6 +829,13 @@ impl ServerHandle {
                 });
         }
         Ok(())
+    }
+
+    pub async fn touch_session_activity(&self, device_id: Uuid) {
+        let mut state = self.state.write().await;
+        if let Some(session) = state.sessions.get_mut(&device_id) {
+            session.last_activity_ns = now_ns();
+        }
     }
 
     pub async fn close_session(
@@ -2234,6 +2263,8 @@ async fn handle_quic_peer(
     loop {
         tokio::select! {
             ctrl = control.recv() => {
+                // Touch session activity on every control message (idle timeout 4.4).
+                server.touch_session_activity(client_hello.device_id).await;
                 match ctrl {
                     Ok(ControlMessage::Ping) => {
                         control.send(&ControlMessage::Pong).await.map_err(|err| ServerError::Runtime(err.to_string()))?;
@@ -2334,6 +2365,8 @@ async fn handle_quic_peer(
                 }
             }
             datagram = peer.recv_motion_datagram() => {
+                // Touch session activity on motion datagrams (idle timeout 4.4).
+                server.touch_session_activity(client_hello.device_id).await;
                 match datagram {
                     Ok(frame) => {
                         if let Err(err) = server.ingest_motion_datagram(frame).await {
