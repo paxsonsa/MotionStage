@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tokio.workspace = true
 uuid.workspace = true
 motionstage-protocol.workspace = true
-motionstage-transport-quic.workspace = true
+motionstage-transport-quic = { workspace = true, features = ["insecure"] }
 
 [dev-dependencies]
 motionstage-server.workspace = true

@@ -359,6 +359,8 @@ pub struct ServerMetrics {
 
 pub struct QuicRuntime {
     pub local_addr: SocketAddr,
+    /// SHA-256 hex fingerprint of the server's TLS certificate.
+    pub cert_fingerprint_hex: String,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
 }
@@ -440,6 +442,7 @@ impl ServerHandle {
             protocol_minor: PROTOCOL_MINOR,
             features,
             security_mode,
+            cert_fingerprint: Some(quic_runtime.cert_fingerprint_hex.clone()),
         };
 
         let discovery = if enable_discovery {
@@ -614,6 +617,7 @@ impl ServerHandle {
         let local_addr = quic
             .local_addr()
             .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        let cert_fingerprint_hex = quic.cert_fingerprint_hex();
         let runtime_server = self.clone();
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -640,6 +644,7 @@ impl ServerHandle {
 
         Ok(QuicRuntime {
             local_addr,
+            cert_fingerprint_hex,
             shutdown_tx,
             join,
         })

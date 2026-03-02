@@ -229,6 +229,30 @@ public final class MotionStageClient: @unchecked Sendable {
         eventContinuation.yield(.connected(sessionID: sessionID ?? "unknown"))
     }
 
+    /// Async connect with certificate pinning (TOFU / 3.1).
+    /// `fingerprint` is the 64-char hex SHA-256 of the server's DER certificate,
+    /// typically obtained from mDNS discovery.
+    public func connect(
+        serverAddress: String,
+        fingerprint: String,
+        pairingToken: String? = nil,
+        apiKey: String? = nil
+    ) throws {
+        try serverAddress.withCString { serverAddrPtr in
+            try fingerprint.withCString { fpPtr in
+                try withOptionalCString(pairingToken) { pairingTokenPtr in
+                    try withOptionalCString(apiKey) { apiKeyPtr in
+                        let status = motionstage_swift_client_connect_pinned(
+                            rawClient, serverAddrPtr, pairingTokenPtr, apiKeyPtr, fpPtr
+                        )
+                        try checkStatus(status)
+                    }
+                }
+            }
+        }
+        eventContinuation.yield(.connected(sessionID: sessionID ?? "unknown"))
+    }
+
     /// Synchronous connect (deprecated — prefer the async overload).
     @available(*, deprecated, message: "Use async connect(serverAddress:pairingToken:apiKey:) instead")
     public func connectSync(

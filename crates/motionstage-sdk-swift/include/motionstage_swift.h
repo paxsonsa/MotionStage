@@ -174,6 +174,18 @@ void motionstage_swift_client_connect_async(
     void *context               /* passed through to callback */
 );
 
+/**
+ * Connect using a pinned certificate fingerprint (TOFU / 3.1).
+ * fingerprint_hex: 64-char hex SHA-256 of the server's DER certificate.
+ */
+int32_t motionstage_swift_client_connect_pinned(
+    void *client,
+    const char *server_addr,
+    const char *pairing_token,  /* NULL = none */
+    const char *api_key,        /* NULL = none */
+    const char *fingerprint_hex
+);
+
 int32_t motionstage_swift_client_disconnect(void *client);
 
 /* General batch send (2.1) */

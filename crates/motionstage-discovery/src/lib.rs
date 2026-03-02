@@ -17,11 +17,13 @@ pub struct DiscoveryAdvertisement {
     pub protocol_minor: u16,
     pub features: Vec<Feature>,
     pub security_mode: String,
+    /// SHA-256 hex fingerprint of the server's TLS certificate (TOFU).
+    pub cert_fingerprint: Option<String>,
 }
 
 impl DiscoveryAdvertisement {
     pub fn to_txt_records(&self) -> Vec<String> {
-        vec![
+        let mut records = vec![
             format!("port={}", self.bind_port),
             format!("name={}", self.service_name),
             format!("proto_major={}", self.protocol_major),
@@ -35,7 +37,11 @@ impl DiscoveryAdvertisement {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
-        ]
+        ];
+        if let Some(fp) = &self.cert_fingerprint {
+            records.push(format!("cert_fp={fp}"));
+        }
+        records
     }
 
     pub fn default_for(name: impl Into<String>, port: u16) -> Self {
@@ -54,6 +60,7 @@ impl DiscoveryAdvertisement {
                 Feature::SdrFallback,
             ],
             security_mode: "trusted_lan".into(),
+            cert_fingerprint: None,
         }
     }
 
@@ -199,6 +206,8 @@ pub struct DiscoveredService {
     pub port: u16,
     pub protocol_major: Option<u16>,
     pub protocol_minor: Option<u16>,
+    /// SHA-256 hex fingerprint of the server's TLS certificate (TOFU).
+    pub cert_fingerprint: Option<String>,
 }
 
 impl DiscoveredService {
@@ -217,6 +226,9 @@ impl DiscoveredService {
         let protocol_minor = info
             .get_property_val_str("proto_minor")
             .and_then(|v| v.parse::<u16>().ok());
+        let cert_fingerprint = info
+            .get_property_val_str("cert_fp")
+            .map(str::to_owned);
 
         Self {
             service_name,
@@ -226,6 +238,7 @@ impl DiscoveredService {
             port: info.get_port(),
             protocol_major,
             protocol_minor,
+            cert_fingerprint,
         }
     }
 }

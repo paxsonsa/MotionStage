@@ -1660,6 +1660,7 @@ mod tests {
             port: 7788,
             protocol_major: Some(1),
             protocol_minor: Some(2),
+            cert_fingerprint: None,
         };
 
         let endpoint = select_preferred_endpoint(&service).unwrap();

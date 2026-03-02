@@ -20,7 +20,8 @@ use motionstage_protocol::{
     PROTOCOL_MINOR,
 };
 use motionstage_transport_quic::{
-    AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient, QuicPeer,
+    hex_decode_fingerprint, AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient,
+    QuicPeer,
 };
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
@@ -457,11 +458,34 @@ async fn connect_impl(
     api_key: Option<String>,
     handshake_timeout: Duration,
 ) -> Result<ConnectedSession, String> {
-    let server_addr_parsed = SocketAddr::from_str(&server_addr)
-        .map_err(|err| format!("invalid server address `{server_addr}`: {err}"))?;
-
     let endpoint = QuicClient::new_insecure_for_local_dev()
         .map_err(|err| format!("failed to create QUIC client endpoint: {err}"))?;
+    connect_with_endpoint(
+        endpoint,
+        device_id,
+        device_name,
+        qualified_outputs,
+        server_addr,
+        pairing_token,
+        api_key,
+        handshake_timeout,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_endpoint(
+    endpoint: QuicClient,
+    device_id: Uuid,
+    device_name: String,
+    qualified_outputs: Vec<AttributeDescriptor>,
+    server_addr: String,
+    pairing_token: Option<String>,
+    api_key: Option<String>,
+    handshake_timeout: Duration,
+) -> Result<ConnectedSession, String> {
+    let server_addr_parsed = SocketAddr::from_str(&server_addr)
+        .map_err(|err| format!("invalid server address `{server_addr}`: {err}"))?;
 
     let peer = endpoint
         .connect(server_addr_parsed)
@@ -1272,6 +1296,112 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
             }
         }
     });
+}
+
+/// Connect using a pinned certificate fingerprint (TOFU).
+/// `fingerprint_hex` must be a 64-character hex string (SHA-256 of the server's DER cert).
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_connect_pinned(
+    client: *mut c_void,
+    server_addr: *const c_char,
+    pairing_token: *const c_char,
+    api_key: *const c_char,
+    fingerprint_hex: *const c_char,
+) -> i32 {
+    let server_addr = match unsafe { read_required_cstr(server_addr, "server_addr") } {
+        Ok(value) => value,
+        Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+    };
+    let pairing_token = match unsafe { read_optional_cstr(pairing_token, "pairing_token") } {
+        Ok(value) => value,
+        Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+    };
+    let api_key = match unsafe { read_optional_cstr(api_key, "api_key") } {
+        Ok(value) => value,
+        Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+    };
+    let fp_hex = match unsafe { read_required_cstr(fingerprint_hex, "fingerprint_hex") } {
+        Ok(value) => value,
+        Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+    };
+    let fingerprint = match hex_decode_fingerprint(&fp_hex) {
+        Some(fp) => fp,
+        None => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+    };
+
+    let (device_id, device_name, qualified_outputs, handshake_timeout) = {
+        let mut inner = match lock_client(client) {
+            Ok(c) => c,
+            Err(status) => return status,
+        };
+        if inner.session.is_some() {
+            inner.fail(
+                MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                "client is already connected",
+            );
+            return MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED;
+        }
+        (
+            inner.device_id,
+            inner.device_name.clone(),
+            inner.qualified_outputs.clone(),
+            inner.handshake_timeout,
+        )
+    };
+
+    let endpoint = match QuicClient::new_with_pinned_cert(fingerprint) {
+        Ok(ep) => ep,
+        Err(err) => {
+            let mut inner = match lock_client(client) {
+                Ok(c) => c,
+                Err(status) => return status,
+            };
+            return inner.fail(
+                MOTIONSTAGE_SWIFT_STATUS_TRANSPORT,
+                format!("failed to create pinned QUIC client: {err}"),
+            );
+        }
+    };
+
+    let result = get_runtime().block_on(connect_with_endpoint(
+        endpoint,
+        device_id,
+        device_name,
+        qualified_outputs,
+        server_addr,
+        pairing_token,
+        api_key,
+        handshake_timeout,
+    ));
+
+    let mut inner = match lock_client(client) {
+        Ok(c) => c,
+        Err(status) => return status,
+    };
+
+    match result {
+        Ok(session) => {
+            inner.session = Some(session);
+            inner.clear_error();
+            drop(inner);
+
+            let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+            client_ref.ping_shutdown.store(false, Ordering::Relaxed);
+            client_ref.last_send_ns.store(0, Ordering::Relaxed);
+            let handle = start_ping_thread(
+                client as usize,
+                Arc::clone(&client_ref.last_send_ns),
+                Arc::clone(&client_ref.ping_shutdown),
+            );
+            *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) => {
+            let status = map_connect_error(&err);
+            inner.fail(status, err)
+        }
+    }
 }
 
 #[no_mangle]
