@@ -50,11 +50,11 @@ The codebase is **architecturally sound and production-grade** in its core layer
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 1.1 | Typed attribute schema (`AttributeDescriptor` in `ClientHello`) | High | Large | `TODO` |
-| 1.2 | Graceful disconnect message (`ClientGoodbye`) | Medium | Small | `TODO` |
-| 1.3 | Decouple mode intent from mode state (`DataFlowState` × `RecordingState`) | Medium | Medium | `TODO` |
-| 1.4 | Remove per-datagram protocol version revalidation | Low | Small | `TODO` |
-| 1.5 | Field mask extensibility (addressed in Track 2 FFI) | High | Medium | `TODO` |
+| 1.1 | Typed attribute schema (`AttributeDescriptor` in `ClientHello`) | High | Large | `DONE` |
+| 1.2 | Graceful disconnect message (`ClientGoodbye`) | Medium | Small | `DONE` |
+| 1.3 | Decouple mode intent from mode state (`DataFlowState` × `RecordingState`) | Medium | Medium | `DONE` |
+| 1.4 | Remove per-datagram protocol version revalidation | Low | Small | `DONE` |
+| 1.5 | Field mask extensibility (addressed in Track 2 FFI) | High | Medium | `PARTIAL` |
 
 **1.1 Typed Attribute Schema**
 - **Problem:** Attributes are free strings throughout. Typos (`"focal_lenght"`) produce zero mappings with no error — validation only happens at mapping time on the server. `ClientHello.advertised_attributes: Vec<String>` is the injection point.
@@ -83,11 +83,11 @@ The codebase is **architecturally sound and production-grade** in its core layer
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 2.1 | Remove `MotionFrameFFI` positional coupling; add general batch update API | Critical | Medium | `TODO` |
-| 2.2 | Replace CSV attribute API with array API | High | Small | `TODO` |
-| 2.3 | Shared Tokio runtime across clients | Medium | Medium | `TODO` |
-| 2.4 | Proper async Swift surface via C callbacks + continuations | High | Medium | `TODO` |
-| 2.5 | C string ownership documentation in header | Medium | Small | `TODO` |
+| 2.1 | Remove `MotionFrameFFI` positional coupling; add general batch update API | Critical | Medium | `DONE` |
+| 2.2 | Replace CSV attribute API with array API | High | Small | `DONE` |
+| 2.3 | Shared Tokio runtime across clients | Medium | Medium | `DONE` |
+| 2.4 | Proper async Swift surface via C callbacks + continuations | High | Medium | `DONE` |
+| 2.5 | C string ownership documentation in header | Medium | Small | `DONE` |
 
 **2.1 Remove MotionFrameFFI Positional Coupling**
 - **Problem:** `MotionFrameFFI` is camera-specific with implicit positional coupling (position=index 0, rotation=1, etc.). A hand-tracking or body-tracking developer has no generalization path. The `AttributeUpdateFrame` system in the transport layer is already general — only the FFI shim has positional semantics.
@@ -161,8 +161,8 @@ The codebase is **architecturally sound and production-grade** in its core layer
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
 | 3.1 | Certificate pinning / TOFU via mDNS fingerprint | High | Large | `TODO` |
-| 3.2 | Harden default auth mode (no silent fallback token) | Medium | Small | `TODO` |
-| 3.3 | Session ID → UUID v4 | Low | Small | `TODO` |
+| 3.2 | Harden default auth mode (no silent fallback token) | Medium | Small | `DONE` |
+| 3.3 | Session ID → UUID v4 | Low | Small | `DONE` |
 
 > **Note on QUIC + TLS:** QUIC mandates TLS 1.3 — traffic **is** encrypted. The security gap is `SkipServerVerification` which bypasses certificate identity validation. The fix is certificate pinning, not adding TLS (which is already there).
 
@@ -192,10 +192,10 @@ The codebase is **architecturally sound and production-grade** in its core layer
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 4.1 | Configurable timeouts via `ClientConfig` | Medium | Small | `TODO` |
-| 4.2 | Reconnection logic with exponential backoff | High | Large | `TODO` |
-| 4.3 | Application-layer `Ping` heartbeat from SDK | Medium | Small | `TODO` |
-| 4.4 | Session idle timeout in `LeaseConfig` | Low | Small | `TODO` |
+| 4.1 | Configurable timeouts via `ClientConfig` | Medium | Small | `DONE` |
+| 4.2 | Reconnection logic with exponential backoff | High | Large | `DONE` |
+| 4.3 | Application-layer `Ping` heartbeat from SDK | Medium | Small | `DONE` |
+| 4.4 | Session idle timeout in `LeaseConfig` | Low | Small | `DONE` |
 
 **4.1 Configurable Timeouts**
 - **Problem:** `HANDSHAKE_TIMEOUT`, `MODE_REPLY_TIMEOUT`, `RESET_SCENE_TIMEOUT` are hardcoded `Duration::from_secs(5)` in the FFI crate. Busy LAN conditions cause spurious failures.
@@ -223,10 +223,10 @@ The codebase is **architecturally sound and production-grade** in its core layer
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 5.1 | Typed attribute namespace (`Attribute.Motion.position`, `Attribute.Camera.focalLength`) | High | Medium | `TODO` |
-| 5.2 | Typed error enum (replace raw `statusCode: Int32`) | Medium | Small | `TODO` |
-| 5.3 | State change `AsyncStream` events (connection state, mode) | Medium | Medium | `TODO` |
-| 5.4 | Decouple camera from SDK core; `CameraMotionFrame` as opt-in extension | Medium | Medium | `TODO` |
+| 5.1 | Typed attribute namespace (`Attribute.Motion.position`, `Attribute.Camera.focalLength`) | High | Medium | `DONE` |
+| 5.2 | Typed error enum (replace raw `statusCode: Int32`) | Medium | Small | `DONE` |
+| 5.3 | State change `AsyncStream` events (connection state, mode) | Medium | Medium | `DONE` |
+| 5.4 | Decouple camera from SDK core; `CameraMotionFrame` as opt-in extension | Medium | Medium | `DONE` |
 
 **5.1 Typed Attribute Namespace**
 - **Recommendation:**
@@ -265,11 +265,11 @@ public enum MotionStageError: Error {
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 6.1 | Fix CoreMotion velocity semantics (bug: using acceleration as velocity) | Critical | Small | `TODO` |
+| 6.1 | Fix CoreMotion velocity semantics (bug: using acceleration as velocity) | Critical | Small | `DONE` |
 | 6.2 | Dynamic field mask (only send changed camera scalars) | Medium | Small | `TODO` |
-| 6.3 | Discovery: read port from mDNS TXT records (eliminates NWConnection probe) | Medium | Small | `TODO` |
-| 6.4 | Frame send error surfacing (rolling error counter → connection error state) | Medium | Small | `TODO` |
-| 6.5 | Remove duplicate `import ARKit` in MotionTrackingService.swift | Low | Small | `TODO` |
+| 6.3 | Discovery: read port from mDNS TXT records (eliminates NWConnection probe) | Medium | Small | `DONE` |
+| 6.4 | Frame send error surfacing (rolling error counter → connection error state) | Medium | Small | `DONE` |
+| 6.5 | Remove duplicate `import ARKit` in MotionTrackingService.swift | Low | Small | `DONE` |
 
 **6.1 Fix CoreMotion Velocity (Bug)**
 - **Problem:** `handleCoreMotion()` uses `motion.userAcceleration` (units of g, not integrated) as "velocity." This is physically wrong — any DCC tool treating it as velocity in m/s will produce bad results.
@@ -293,11 +293,11 @@ public enum MotionStageError: Error {
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 7.1 | Mapping lookup indexing + deduplicate `source_output_matches` | Medium | Small | `TODO` |
-| 7.2 | Control message handler decomposition (extract from monolithic match) | Medium | Medium | `TODO` |
-| 7.3 | Remove `bevy_ecs` from RuntimeCore (single unused resource) | Low | Medium | `TODO` |
+| 7.1 | Mapping lookup indexing + deduplicate `source_output_matches` | Medium | Small | `DONE` |
+| 7.2 | Control message handler decomposition (extract from monolithic match) | Medium | Medium | `DONE` |
+| 7.3 | Remove `bevy_ecs` from RuntimeCore (single unused resource) | Low | Medium | `DONE` |
 | 7.4 | ServerState substructure (only after profiling confirms contention) | Low | Large | `DEFERRED` |
-| 7.5 | Session event recording markers (`ClientJoined`, `ClientLeft`) | Low | Small | `TODO` |
+| 7.5 | Session event recording markers (`ClientJoined`, `ClientLeft`) | Low | Small | `DONE` |
 | 7.6 | Snapshot clone cost (only after profiling) | Low | Small | `DEFERRED` |
 
 **7.1 Mapping Lookup Indexing**
@@ -318,10 +318,10 @@ public enum MotionStageError: Error {
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 8.1 | Typed return types + `.pyi` stubs | High | Medium | `TODO` |
-| 8.2 | Attribute value type disambiguation (explicit type tags) | Medium | Small | `TODO` |
+| 8.1 | Typed return types + `.pyi` stubs | High | Medium | `PARTIAL` |
+| 8.2 | Attribute value type disambiguation (explicit type tags) | Medium | Small | `DONE` |
 | 8.3 | Streaming/event API + `TakeBakeCursor` as iterator | Medium | Large | `TODO` |
-| 8.4 | Dict spec validation with descriptive Python errors | Medium | Small | `TODO` |
+| 8.4 | Dict spec validation with descriptive Python errors | Medium | Small | `PARTIAL` |
 
 **8.1 Typed Return Types**
 - **Problem:** All methods return raw tuples with mixed types and undocumented positions. No type stubs, no type checking support.
@@ -341,9 +341,9 @@ public enum MotionStageError: Error {
 
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
-| 9.1 | USD typed time-sampled output (replace custom string metadata) | Medium | Large | `TODO` |
+| 9.1 | USD typed time-sampled output (replace custom string metadata) | Medium | Large | `DONE` |
 | 9.2 | Export from live stream snapshots | Low | Medium | `TODO` |
-| 9.3 | Export customization options (fps, attribute filter, object filter) | Low | Small | `TODO` |
+| 9.3 | Export customization options (fps, attribute filter, object filter) | Low | Small | `PARTIAL` |
 
 **9.1 USD Export Quality**
 - **Problem:** Current exporter outputs attributes as `custom string` metadata rather than typed USD properties with time samples. Not USD-schema-compliant; DCC tools expecting typed time-sampled attributes won't work with the output.
@@ -361,13 +361,7 @@ public enum MotionStageError: Error {
 | # | Item | Priority | Effort | Status |
 |---|------|----------|--------|--------|
 | 10.1 | Codec negotiation (`VideoCodec` field in `VideoStreamDescriptor`) | Medium | Medium | `TODO` |
-| 10.3 | Port in mDNS TXT records (enables iOS discovery fix 6.3) | Medium | Small | `TODO` |
-| 10.4 | H.264 encoder in `motionstage-media` (OpenH264, RGBA→I420→NAL) | High | Medium | `DONE` |
-| 10.5 | WebRTC track storage + `write_sample` on `WebRtcSession` | High | Small | `DONE` |
-| 10.6 | Server `push_video_frame` to all connected video peers | High | Small | `DONE` |
-| 10.7 | PyO3 video bindings (`set_master_video_descriptor`, `push_video_frame`, `video_peer_count`) | High | Medium | `DONE` |
-| 10.8 | Python SDK video methods on `MotionStageServer` | High | Small | `DONE` |
-| 10.9 | Blender viewport capture (`GPUOffScreen`) + video streaming UI | High | Medium | `DONE` |
+| 10.3 | Port in mDNS TXT records (enables iOS discovery fix 6.3) | Medium | Small | `DONE` |
 
 > **Note:** STUN/TURN configuration (10.2) is **not needed** — this system runs on LAN only.
 
@@ -380,18 +374,6 @@ public enum MotionStageError: Error {
 - **Recommendation:** Add `format!("port={}", self.bind_port)` to `to_txt_records()`.
 - **File:** `crates/motionstage-discovery/src/lib.rs`
 
-**10.4–10.9 Video Streaming Pipeline (DONE)**
-- **Problem:** WebRTC signaling and track setup existed, but three critical gaps prevented actual video: (1) no H.264 encoder, (2) no mechanism to write encoded frames to tracks, (3) no video methods exposed to Python/Blender.
-- **Implementation:**
-  - `motionstage-media/src/encoder.rs`: `H264Encoder` wrapping OpenH264 0.9 (BSD-2-Clause). Uses built-in `RgbaSliceU8` for RGBA→YUV conversion with reusable `YUVBuffer`.
-  - `motionstage-webrtc`: `WebRtcSession` stores `Arc<TrackLocalStaticSample>` from `add_h264_track()`, exposes `write_sample(data, duration)` and `has_track()`.
-  - `motionstage-server`: `push_video_frame(data, duration)` iterates video peers with tracks, writes samples (per-peer error isolation). `video_peer_count()` for UI.
-  - `motionstage-sdk-python`: `set_master_video_descriptor(w, h, fps)` creates encoder + sets server descriptor. `push_video_frame(rgba, ts)` encodes in-process (zero-copy via PyO3 buffer protocol) and pushes to WebRTC. `video_peer_count()`.
-  - `python/motionstage_sdk/server.py`: Thin wrapper methods delegating to native extension.
-  - `motionstage-blender/capture.py`: `ViewportCapture` using `gpu.types.GPUOffScreen` for offscreen rendering at fixed resolution with explicit camera matrices (independent of viewport pane size). Runs in `SpaceView3D.draw_handler` (GPU context required).
-  - `motionstage-blender/addon.py`: Video Streaming sub-panel (resolution, fps, start/stop, viewer count), `MOTIONSTAGE_OT_toggle_video_streaming` operator, draw-handler-based capture with fps throttling.
-- **Files:** `crates/motionstage-media/`, `crates/motionstage-webrtc/`, `crates/motionstage-server/`, `crates/motionstage-sdk-python/`, `python/motionstage_sdk/server.py`, `motionstage-blender/motionstage_blender/{capture,service,addon}.py`
-
 ---
 
 ## Phase Execution Plan
@@ -399,46 +381,46 @@ public enum MotionStageError: Error {
 ### Phase 1 — Correctness & Quick Wins
 *No breaking changes. No protocol version bump required.*
 
-- [ ] **6.1** Fix CoreMotion velocity bug (`.zero` in CoreMotion mode)
-- [ ] **6.5** Remove duplicate `import ARKit`
-- [ ] **6.4** Frame send error surfacing (rolling counter)
+- [x] **6.1** Fix CoreMotion velocity bug (`.zero` in CoreMotion mode)
+- [x] **6.5** Remove duplicate `import ARKit`
+- [x] **6.4** Frame send error surfacing (rolling counter)
 - [ ] **6.2** Dynamic field mask in MotionPipeline
-- [ ] **5.2** Typed Swift error enum
-- [ ] **2.5** C string ownership docs in header
-- [ ] **3.2** Harden default auth mode
-- [ ] **3.3** Session ID → UUID v4
-- [ ] **7.3** Remove `bevy_ecs` from RuntimeCore
-- [ ] **7.1** Mapping index + deduplicate `source_output_matches`
-- [ ] **4.1** Configurable timeouts via `ClientConfig`
-- [ ] **10.3** Port in mDNS TXT records (server-side prereq for 6.3)
-- [ ] **6.3** iOS discovery reads port from TXT (eliminates NWConnection probe)
+- [x] **5.2** Typed Swift error enum
+- [x] **2.5** C string ownership docs in header
+- [x] **3.2** Harden default auth mode
+- [x] **3.3** Session ID → UUID v4
+- [x] **7.3** Remove `bevy_ecs` from RuntimeCore
+- [x] **7.1** Mapping index + deduplicate `source_output_matches`
+- [x] **4.1** Configurable timeouts via `ClientConfig`
+- [x] **10.3** Port in mDNS TXT records (server-side prereq for 6.3)
+- [x] **6.3** iOS discovery reads port from TXT (eliminates NWConnection probe)
 
 ### Phase 2 — FFI Generalization
 *New APIs alongside deprecated existing ones.*
 
-- [ ] **2.2** Array-based attribute API (`_new_v2`), deprecate CSV constructor
-- [ ] **2.3** Shared Tokio runtime (`OnceLock<Runtime>`)
-- [ ] **2.4** Async Swift surface via C callbacks + `withCheckedThrowingContinuation`
-- [ ] **5.1** Typed attribute namespace in Swift SDK
-- [ ] **5.3** `AsyncStream` connection state events
-- [ ] **2.1** General `send_batch` API; `MotionFrameFFI` kept as deprecated shim
-- [ ] **5.4** `CameraMotionFrame` as Swift extension target, decoupled from SDK core
-- [ ] **7.2** Extract control message handlers from monolithic match
-- [ ] **8.1** Python SDK typed return types + `.pyi` stubs
-- [ ] **8.2** Attribute type disambiguation
-- [ ] **8.4** Dict spec validation
+- [x] **2.2** Array-based attribute API (`_new_v2`), deprecate CSV constructor
+- [x] **2.3** Shared Tokio runtime (`OnceLock<Runtime>`)
+- [x] **2.4** Async Swift surface via C callbacks + `withCheckedThrowingContinuation`
+- [x] **5.1** Typed attribute namespace in Swift SDK
+- [x] **5.3** `AsyncStream` connection state events
+- [x] **2.1** General `send_batch` API; `MotionFrameFFI` kept as deprecated shim
+- [x] **5.4** `CameraMotionFrame` as Swift extension target, decoupled from SDK core
+- [x] **7.2** Extract control message handlers from monolithic match
+- [~] **8.1** Python SDK typed return types + `.pyi` stubs (stubs exist; returns still raw tuples)
+- [x] **8.2** Attribute type disambiguation
+- [~] **8.4** Dict spec validation (type/missing-key errors done; no extraneous-key detection)
 
 ### Phase 3 — Protocol Evolution (Protocol 2.0)
 *Coordinated client + server updates. No backwards compat needed.*
 
-- [ ] **1.2** `ClientGoodbye` message
-- [ ] **1.4** Remove per-datagram version header from `MotionDatagramEnvelope`
-- [ ] **1.1** `AttributeDescriptor` in `ClientHello.advertised_attributes`
-- [ ] **1.3** Mode decoupling (`DataFlowState` × `RecordingState`)
-- [ ] **4.3** Application-layer `Ping` heartbeat from SDK client
-- [ ] **4.2** Reconnection logic with `ReconnectPolicy`
-- [ ] **7.5** Session event recording markers (`ClientJoined`/`ClientLeft`)
-- [ ] **4.4** Session idle timeout in `LeaseConfig`
+- [x] **1.2** `ClientGoodbye` message
+- [x] **1.4** Remove per-datagram version header from `MotionDatagramEnvelope`
+- [x] **1.1** `AttributeDescriptor` in `ClientHello.advertised_attributes`
+- [x] **1.3** Mode decoupling (`DataFlowState` × `RecordingState`)
+- [x] **4.3** Application-layer `Ping` heartbeat from SDK client
+- [x] **4.2** Reconnection logic with `ReconnectPolicy`
+- [x] **7.5** Session event recording markers (`ClientJoined`/`ClientLeft`)
+- [x] **4.4** Session idle timeout in `LeaseConfig`
 
 ### Phase 4 — Security Hardening
 *Requires iOS UI changes for TOFU pairing flow.*
@@ -449,15 +431,9 @@ public enum MotionStageError: Error {
 *Long-term structural improvements. Requires careful coordination.*
 
 - [ ] **8.3** Python streaming/event API + `TakeBakeCursor` iterator
-- [ ] **9.1** USD typed time-sampled export
+- [x] **9.1** USD typed time-sampled export
 - [ ] **9.2** Export from live stream snapshots
-- [ ] **9.3** Export customization options
-- [x] **10.4** H.264 encoder in `motionstage-media` (OpenH264)
-- [x] **10.5** WebRTC track storage + `write_sample`
-- [x] **10.6** Server `push_video_frame` to video peers
-- [x] **10.7** PyO3 video bindings (encode + push in-process)
-- [x] **10.8** Python SDK video methods
-- [x] **10.9** Blender viewport capture + video streaming UI
+- [~] **9.3** Export customization options (fps/up_axis done; attribute/object filters missing)
 - [ ] **10.1** Video codec negotiation
 - [ ] **7.4** `ServerState` substructure *(only if profiling confirms contention)*
 - [ ] **7.6** Snapshot `Arc` clone optimization *(only if profiling confirms cost)*
