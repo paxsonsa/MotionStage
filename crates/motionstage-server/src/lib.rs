@@ -9,7 +9,7 @@ use std::{
 
 use motionstage_core::{
     AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId, MappingRequest, ObjectId,
-    RuntimeCore, RuntimeSnapshot, Scene, SceneId,
+    RuntimeCore, RuntimeSnapshot, Scene, SceneId, source_output_matches,
 };
 use motionstage_discovery::{DiscoveryAdvertisement, DiscoveryPublisher};
 use motionstage_media::{
@@ -174,7 +174,7 @@ impl ServerState {
         let session = self
             .sessions
             .get_mut(&device_id)
-            .ok_or_else(|| ServerError::SessionNotFound(device_id))?;
+            .ok_or(ServerError::SessionNotFound(device_id))?;
 
         if !session.state.can_transition_to(next) {
             return Err(ServerError::Protocol(ProtocolError::InvalidTransition {
@@ -191,30 +191,30 @@ impl ServerState {
         match self.config.security_mode {
             SecurityMode::TrustedLan => Ok(()),
             SecurityMode::PairingRequired => {
-                let expected = self
-                    .config
-                    .pairing_token
-                    .as_deref()
-                    .unwrap_or("motionstage");
+                let Some(expected) = self.config.pairing_token.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match req.pairing_token.as_deref() {
                     Some(token) if token == expected => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
                 }
             }
             SecurityMode::ApiKey => {
-                let expected = self.config.api_key.as_deref().unwrap_or("motionstage");
+                let Some(expected) = self.config.api_key.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match req.api_key.as_deref() {
                     Some(key) if key == expected => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
                 }
             }
             SecurityMode::ApiKeyPlusPairing => {
-                let pair = self
-                    .config
-                    .pairing_token
-                    .as_deref()
-                    .unwrap_or("motionstage");
-                let key = self.config.api_key.as_deref().unwrap_or("motionstage");
+                let Some(pair) = self.config.pairing_token.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
+                let Some(key) = self.config.api_key.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match (req.pairing_token.as_deref(), req.api_key.as_deref()) {
                     (Some(p), Some(k)) if p == pair && k == key => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
@@ -769,7 +769,7 @@ impl ServerHandle {
             }));
         }
 
-        let session_id = Uuid::now_v7();
+        let session_id = Uuid::new_v4();
         session.session_id = Some(session_id);
         state.change_session_state(device_id, SessionState::Registered)?;
         state.metrics.accepted_sessions += 1;
@@ -2236,24 +2236,6 @@ fn map_server_error_to_reject(err: &ServerError) -> RejectCode {
         | ServerError::Take(_) => RejectCode::ServerBusy,
         ServerError::Discovery(_) | ServerError::Runtime(_) => RejectCode::ServerBusy,
     }
-}
-
-fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
-    if mapping_output == update_output {
-        return true;
-    }
-    let prefix = format!("{device_id}.");
-    if let Some(stripped) = mapping_output.strip_prefix(&prefix) {
-        if stripped == update_output {
-            return true;
-        }
-    }
-    if let Some(stripped) = update_output.strip_prefix(&prefix) {
-        if mapping_output == stripped {
-            return true;
-        }
-    }
-    false
 }
 
 fn take_bake_total_frames(recording: &RecordingFile, sampling_mode: SamplingMode) -> u64 {
