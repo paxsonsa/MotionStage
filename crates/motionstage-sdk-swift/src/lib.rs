@@ -7,7 +7,7 @@ use std::{
     os::raw::{c_char, c_void},
     ptr,
     str::FromStr,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +46,25 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RESET_SCENE_TIMEOUT: Duration = Duration::from_secs(5);
 
+// ---------------------------------------------------------------------------
+// Global shared Tokio runtime (2.3)
+// ---------------------------------------------------------------------------
+
+static GLOBAL_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+fn get_runtime() -> &'static Runtime {
+    GLOBAL_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create global Tokio runtime")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// C-visible types
+// ---------------------------------------------------------------------------
+
 #[repr(C)]
 pub struct MotionStageClientConfig {
     /// Timeout in milliseconds for the initial handshake. 0 = use default (5000 ms).
@@ -82,6 +101,7 @@ impl MotionStageClientConfig {
     }
 }
 
+/// Camera-specific legacy motion frame (retained for backwards compatibility).
 #[repr(C)]
 pub struct MotionFrameFFI {
     pub position: [f32; 3],
@@ -93,12 +113,31 @@ pub struct MotionFrameFFI {
     pub field_mask: u32,
 }
 
+/// General-purpose attribute update for `send_batch` (2.1).
+/// `component_count`: 1=Float32, 2=Vec2f, 3=Vec3f, 4=Quatf, 16=Mat4f
+#[repr(C)]
+pub struct MotionAttributeUpdateC {
+    pub attribute: *const c_char,
+    pub data: *const f32,
+    pub component_count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Callback type for async connect (2.4)
+// ---------------------------------------------------------------------------
+
+pub type MotionStageConnectCallback =
+    unsafe extern "C" fn(status: i32, error: *const c_char, context: *mut c_void);
+
+// ---------------------------------------------------------------------------
+// Internal client structs
+// ---------------------------------------------------------------------------
+
 pub struct MotionStageSwiftClient {
     inner: Mutex<MotionStageSwiftClientInner>,
 }
 
 struct MotionStageSwiftClientInner {
-    runtime: Runtime,
     device_id: Uuid,
     device_name: String,
     _source_outputs: Vec<String>,
@@ -131,100 +170,6 @@ impl MotionStageSwiftClientInner {
         if let Some(mut session) = self.session.take() {
             let _ = session.control.finish();
         }
-    }
-
-    fn connect(
-        &mut self,
-        server_addr: &str,
-        pairing_token: Option<&str>,
-        api_key: Option<&str>,
-    ) -> Result<(), String> {
-        if self.session.is_some() {
-            return Err("client is already connected".to_owned());
-        }
-
-        let server_addr = SocketAddr::from_str(server_addr)
-            .map_err(|err| format!("invalid server address `{server_addr}`: {err}"))?;
-
-        let (endpoint, peer, mut control) = self.runtime.block_on(async {
-            let endpoint = QuicClient::new_insecure_for_local_dev()
-                .map_err(|err| format!("failed to create QUIC client endpoint: {err}"))?;
-            let peer = endpoint
-                .connect(server_addr)
-                .await
-                .map_err(|err| format!("failed to connect QUIC client to {server_addr}: {err}"))?;
-            let control = peer
-                .accept_control_stream()
-                .await
-                .map_err(|err| format!("failed to accept control stream: {err}"))?;
-            Ok::<(QuicClient, QuicPeer, ControlChannel), String>((endpoint, peer, control))
-        })?;
-
-        let first_message = self.runtime.block_on(async {
-            timeout(self.handshake_timeout, control.recv())
-                .await
-                .map_err(|_| "timed out waiting for ServerHello".to_owned())?
-                .map_err(|err| format!("failed to receive ServerHello: {err}"))
-        })?;
-
-        match first_message {
-            ControlMessage::ServerHello(_) => {}
-            other => {
-                return Err(format!(
-                    "expected ServerHello as first control message, got {other:?}"
-                ));
-            }
-        }
-
-        self.runtime
-            .block_on(control.send(&ControlMessage::ClientHello(ClientHello {
-                protocol_major: PROTOCOL_MAJOR,
-                protocol_minor: PROTOCOL_MINOR,
-                device_id: self.device_id,
-                device_name: self.device_name.clone(),
-                roles: vec![ClientRole::MotionSource, ClientRole::Operator],
-                features: vec![Feature::Motion, Feature::Mapping, Feature::Recording],
-                advertised_attributes: self.qualified_outputs.clone(),
-            })))
-            .map_err(|err| format!("failed to send ClientHello: {err}"))?;
-
-        self.runtime
-            .block_on(
-                control.send(&ControlMessage::RegisterRequest(RegisterRequest {
-                    pairing_token: pairing_token.map(ToOwned::to_owned),
-                    api_key: api_key.map(ToOwned::to_owned),
-                })),
-            )
-            .map_err(|err| format!("failed to send RegisterRequest: {err}"))?;
-
-        let register_message = self.runtime.block_on(async {
-            timeout(self.handshake_timeout, control.recv())
-                .await
-                .map_err(|_| "timed out waiting for registration response".to_owned())?
-                .map_err(|err| format!("failed to receive registration response: {err}"))
-        })?;
-
-        let session_id = match register_message {
-            ControlMessage::RegisterAccepted(accepted) => accepted.session_id,
-            ControlMessage::RegisterRejected(rejected) => {
-                return Err(format!(
-                    "registration rejected: code={:?} reason={}",
-                    rejected.code, rejected.reason
-                ));
-            }
-            other => {
-                return Err(format!("expected registration result, got {other:?}"));
-            }
-        };
-
-        self.session = Some(ConnectedSession {
-            _endpoint: endpoint,
-            peer,
-            control,
-            session_id,
-        });
-
-        Ok(())
     }
 
     fn send_vec3f(&mut self, x: f32, y: f32, z: f32) -> Result<(), String> {
@@ -358,7 +303,7 @@ impl MotionStageSwiftClientInner {
             .as_mut()
             .ok_or_else(|| "client is not connected".to_owned())?;
 
-        self.runtime
+        get_runtime()
             .block_on(
                 session
                     .control
@@ -366,9 +311,10 @@ impl MotionStageSwiftClientInner {
             )
             .map_err(|err| format!("failed to send ResetSceneToBaseline: {err}"))?;
 
-        self.runtime.block_on(async {
+        let reset_scene_timeout = self.reset_scene_timeout;
+        get_runtime().block_on(async {
             loop {
-                let message = timeout(self.reset_scene_timeout, session.control.recv())
+                let message = timeout(reset_scene_timeout, session.control.recv())
                     .await
                     .map_err(|_| "timed out waiting for baseline reset response".to_owned())?
                     .map_err(|err| format!("failed to receive reset response: {err}"))?;
@@ -398,7 +344,7 @@ impl MotionStageSwiftClientInner {
             .as_mut()
             .ok_or_else(|| "client is not connected".to_owned())?;
 
-        self.runtime
+        get_runtime()
             .block_on(
                 session
                     .control
@@ -406,9 +352,10 @@ impl MotionStageSwiftClientInner {
             )
             .map_err(|err| format!("failed to send mode request: {err}"))?;
 
-        let active_mode = self.runtime.block_on(async {
+        let mode_reply_timeout = self.mode_reply_timeout;
+        let active_mode = get_runtime().block_on(async {
             loop {
-                let message = timeout(self.mode_reply_timeout, session.control.recv())
+                let message = timeout(mode_reply_timeout, session.control.recv())
                     .await
                     .map_err(|_| "timed out waiting for mode response".to_owned())?
                     .map_err(|err| format!("failed to receive mode response: {err}"))?;
@@ -431,6 +378,112 @@ impl MotionStageSwiftClientInner {
         Ok(active_mode)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async connect implementation (2.4)
+// ---------------------------------------------------------------------------
+
+async fn connect_impl(
+    device_id: Uuid,
+    device_name: String,
+    qualified_outputs: Vec<String>,
+    server_addr: String,
+    pairing_token: Option<String>,
+    api_key: Option<String>,
+    handshake_timeout: Duration,
+) -> Result<ConnectedSession, String> {
+    let server_addr_parsed = SocketAddr::from_str(&server_addr)
+        .map_err(|err| format!("invalid server address `{server_addr}`: {err}"))?;
+
+    let endpoint = QuicClient::new_insecure_for_local_dev()
+        .map_err(|err| format!("failed to create QUIC client endpoint: {err}"))?;
+
+    let peer = endpoint
+        .connect(server_addr_parsed)
+        .await
+        .map_err(|err| format!("failed to connect QUIC client to {server_addr_parsed}: {err}"))?;
+
+    let mut control = peer
+        .accept_control_stream()
+        .await
+        .map_err(|err| format!("failed to accept control stream: {err}"))?;
+
+    let first_message = timeout(handshake_timeout, control.recv())
+        .await
+        .map_err(|_| "timed out waiting for ServerHello".to_owned())?
+        .map_err(|err| format!("failed to receive ServerHello: {err}"))?;
+
+    match first_message {
+        ControlMessage::ServerHello(_) => {}
+        other => {
+            return Err(format!(
+                "expected ServerHello as first control message, got {other:?}"
+            ));
+        }
+    }
+
+    control
+        .send(&ControlMessage::ClientHello(ClientHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            device_id,
+            device_name,
+            roles: vec![ClientRole::MotionSource, ClientRole::Operator],
+            features: vec![Feature::Motion, Feature::Mapping, Feature::Recording],
+            advertised_attributes: qualified_outputs,
+        }))
+        .await
+        .map_err(|err| format!("failed to send ClientHello: {err}"))?;
+
+    control
+        .send(&ControlMessage::RegisterRequest(RegisterRequest {
+            pairing_token,
+            api_key,
+        }))
+        .await
+        .map_err(|err| format!("failed to send RegisterRequest: {err}"))?;
+
+    let register_message = timeout(handshake_timeout, control.recv())
+        .await
+        .map_err(|_| "timed out waiting for registration response".to_owned())?
+        .map_err(|err| format!("failed to receive registration response: {err}"))?;
+
+    let session_id = match register_message {
+        ControlMessage::RegisterAccepted(accepted) => accepted.session_id,
+        ControlMessage::RegisterRejected(rejected) => {
+            return Err(format!(
+                "registration rejected: code={:?} reason={}",
+                rejected.code, rejected.reason
+            ));
+        }
+        other => {
+            return Err(format!("expected registration result, got {other:?}"));
+        }
+    };
+
+    Ok(ConnectedSession {
+        _endpoint: endpoint,
+        peer,
+        control,
+        session_id,
+    })
+}
+
+fn map_connect_error(err: &str) -> i32 {
+    if err.contains("already connected") {
+        MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED
+    } else if err.contains("invalid server address") {
+        MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT
+    } else if err.contains("registration rejected") {
+        MOTIONSTAGE_SWIFT_STATUS_PROTOCOL
+    } else {
+        MOTIONSTAGE_SWIFT_STATUS_TRANSPORT
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn parse_mode(mode: i32) -> Result<Mode, String> {
     match mode {
@@ -475,10 +528,8 @@ fn make_client_inner(
     source_outputs: Vec<String>,
     config: Option<&MotionStageClientConfig>,
 ) -> Result<MotionStageSwiftClientInner, String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
+    // Ensure the global runtime is initialized.
+    let _ = get_runtime();
 
     let device_id = Uuid::now_v7();
     let qualified_outputs: Vec<String> = source_outputs
@@ -497,7 +548,6 @@ fn make_client_inner(
         .unwrap_or(DEFAULT_RESET_SCENE_TIMEOUT);
 
     Ok(MotionStageSwiftClientInner {
-        runtime,
         device_id,
         device_name,
         _source_outputs: source_outputs,
@@ -564,6 +614,27 @@ fn into_c_string_ptr(value: &str) -> *mut c_char {
 }
 
 // ---------------------------------------------------------------------------
+// FFI: Runtime (2.3)
+// ---------------------------------------------------------------------------
+
+/// Pre-initialize the shared Tokio runtime with a specific thread count.
+/// If not called, the runtime is initialized on first use with default settings.
+/// Has no effect if called after the runtime is already initialized.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_runtime_init(thread_count: u32) {
+    let _ = GLOBAL_RUNTIME.get_or_init(|| {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if thread_count > 0 {
+            builder.worker_threads(thread_count as usize);
+        }
+        builder
+            .build()
+            .expect("failed to create global Tokio runtime")
+    });
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Client lifecycle
 // ---------------------------------------------------------------------------
 
@@ -594,6 +665,7 @@ pub extern "C" fn motionstage_swift_client_new(
     Box::into_raw(Box::new(client)).cast::<c_void>()
 }
 
+/// Deprecated: prefer `motionstage_swift_client_new_v2` which takes an explicit array.
 #[no_mangle]
 pub extern "C" fn motionstage_swift_client_new_multi(
     device_name: *const c_char,
@@ -673,6 +745,43 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
     Box::into_raw(Box::new(client)).cast::<c_void>()
 }
 
+/// Array-based constructor (2.2). Prefer over `_new_multi`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_new_v2(
+    device_name: *const c_char,
+    attribute_count: u32,
+    attribute_names: *const *const c_char,
+) -> *mut c_void {
+    let device_name = match unsafe { read_required_cstr(device_name, "device_name") } {
+        Ok(value) => value,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    if attribute_names.is_null() || attribute_count == 0 {
+        return ptr::null_mut();
+    }
+
+    let mut source_outputs = Vec::with_capacity(attribute_count as usize);
+    for i in 0..attribute_count as usize {
+        let ptr = unsafe { *attribute_names.add(i) };
+        match unsafe { read_required_cstr(ptr, "attribute_names[i]") } {
+            Ok(s) => source_outputs.push(s),
+            Err(_) => return ptr::null_mut(),
+        }
+    }
+
+    let inner = match make_client_inner(device_name, source_outputs, None) {
+        Ok(inner) => inner,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let client = MotionStageSwiftClient {
+        inner: Mutex::new(inner),
+    };
+
+    Box::into_raw(Box::new(client)).cast::<c_void>()
+}
+
 #[no_mangle]
 pub extern "C" fn motionstage_swift_client_free(client: *mut c_void) {
     if client.is_null() {
@@ -708,27 +817,170 @@ pub extern "C" fn motionstage_swift_client_connect(
         Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
     };
 
-    let mut client = match lock_client(client) {
-        Ok(client) => client,
+    // Lock briefly to extract params and check state.
+    let (device_id, device_name, qualified_outputs, handshake_timeout) = {
+        let mut inner = match lock_client(client) {
+            Ok(c) => c,
+            Err(status) => return status,
+        };
+        if inner.session.is_some() {
+            inner.fail(
+                MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                "client is already connected",
+            );
+            return MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED;
+        }
+        (
+            inner.device_id,
+            inner.device_name.clone(),
+            inner.qualified_outputs.clone(),
+            inner.handshake_timeout,
+        )
+    };
+
+    // Perform async connect without holding the lock.
+    let result = get_runtime().block_on(connect_impl(
+        device_id,
+        device_name,
+        qualified_outputs,
+        server_addr,
+        pairing_token,
+        api_key,
+        handshake_timeout,
+    ));
+
+    // Lock briefly to store result.
+    let mut inner = match lock_client(client) {
+        Ok(c) => c,
         Err(status) => return status,
     };
 
-    match client.connect(&server_addr, pairing_token.as_deref(), api_key.as_deref()) {
-        Ok(()) => {
-            client.clear_error();
+    match result {
+        Ok(session) => {
+            inner.session = Some(session);
+            inner.clear_error();
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
-        Err(err) if err.contains("already connected") => {
-            client.fail(MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED, err)
+        Err(err) => {
+            let status = map_connect_error(&err);
+            inner.fail(status, err)
         }
-        Err(err) if err.contains("invalid server address") => {
-            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
-        }
-        Err(err) if err.contains("registration rejected") => {
-            client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err)
-        }
-        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
     }
+}
+
+/// Async connect: calls `callback(status, error_cstr, context)` on completion.
+/// The callback is invoked from a Tokio worker thread.
+/// `pairing_token` and `api_key` may be NULL.
+/// Safety: `client` must remain valid until the callback is called.
+#[no_mangle]
+pub unsafe extern "C" fn motionstage_swift_client_connect_async(
+    client: *mut c_void,
+    server_addr: *const c_char,
+    pairing_token: *const c_char,
+    api_key: *const c_char,
+    callback: MotionStageConnectCallback,
+    context: *mut c_void,
+) {
+    let server_addr = match unsafe { read_required_cstr(server_addr, "server_addr") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            return;
+        }
+    };
+    let pairing_token = match unsafe { read_optional_cstr(pairing_token, "pairing_token") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            return;
+        }
+    };
+    let api_key = match unsafe { read_optional_cstr(api_key, "api_key") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            return;
+        }
+    };
+
+    // Lock briefly to extract params and check state.
+    let (device_id, device_name, qualified_outputs, handshake_timeout) = {
+        let mut inner = match lock_client(client) {
+            Ok(c) => c,
+            Err(status) => {
+                unsafe { callback(status, ptr::null(), context) };
+                return;
+            }
+        };
+        if inner.session.is_some() {
+            let msg = CString::new("client is already connected").unwrap_or_default();
+            inner.fail(
+                MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                "client is already connected",
+            );
+            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED, msg.as_ptr(), context) };
+            return;
+        }
+        (
+            inner.device_id,
+            inner.device_name.clone(),
+            inner.qualified_outputs.clone(),
+            inner.handshake_timeout,
+        )
+    };
+
+    // Cast raw pointers to usize so they are `Send` and can be moved into the async task.
+    // Safety: caller guarantees the client and context remain valid until the callback fires.
+    let client_addr = client as usize;
+    let context_addr = context as usize;
+
+    get_runtime().spawn(async move {
+        let result = connect_impl(
+            device_id,
+            device_name,
+            qualified_outputs,
+            server_addr,
+            pairing_token,
+            api_key,
+            handshake_timeout,
+        )
+        .await;
+
+        let ctx = context_addr as *mut c_void;
+
+        match result {
+            Ok(session) => {
+                // Lock briefly to store session.
+                let client_ref =
+                    unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.session = Some(session);
+                inner.clear_error();
+                drop(inner);
+                unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_OK, ptr::null(), ctx) };
+            }
+            Err(err) => {
+                let status = map_connect_error(&err);
+                // Lock briefly to store error.
+                let client_ref =
+                    unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.fail(status, &err);
+                drop(inner);
+                let c_err = CString::new(err).unwrap_or_default();
+                unsafe { callback(status, c_err.as_ptr(), ctx) };
+            }
+        }
+    });
 }
 
 #[no_mangle]
@@ -741,6 +993,83 @@ pub extern "C" fn motionstage_swift_client_disconnect(client: *mut c_void) -> i3
     client.disconnect();
     client.clear_error();
     MOTIONSTAGE_SWIFT_STATUS_OK
+}
+
+// ---------------------------------------------------------------------------
+// FFI: General batch send (2.1)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn motionstage_swift_client_send_batch(
+    client: *mut c_void,
+    updates: *const MotionAttributeUpdateC,
+    update_count: u32,
+) -> i32 {
+    if updates.is_null() || update_count == 0 {
+        return MOTIONSTAGE_SWIFT_STATUS_OK;
+    }
+
+    let inner = match lock_client(client) {
+        Ok(c) => c,
+        Err(status) => return status,
+    };
+
+    let mut frames: Vec<AttributeUpdateFrame> = Vec::with_capacity(update_count as usize);
+
+    for i in 0..update_count as usize {
+        let update = unsafe { &*updates.add(i) };
+
+        let attr_str = match unsafe { read_required_cstr(update.attribute, "attribute") } {
+            Ok(s) => s,
+            Err(_) => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+        };
+
+        let qualified = qualify_source_output(inner.device_id, &attr_str);
+
+        if update.data.is_null() {
+            return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+        }
+
+        let value = match update.component_count {
+            1 => {
+                let v = unsafe { *update.data };
+                AttributeValueFrame::Float32(v)
+            }
+            2 => {
+                let s = unsafe { std::slice::from_raw_parts(update.data, 2) };
+                AttributeValueFrame::Vec2f([s[0], s[1]])
+            }
+            3 => {
+                let s = unsafe { std::slice::from_raw_parts(update.data, 3) };
+                AttributeValueFrame::Vec3f([s[0], s[1], s[2]])
+            }
+            4 => {
+                let s = unsafe { std::slice::from_raw_parts(update.data, 4) };
+                AttributeValueFrame::Quatf([s[0], s[1], s[2], s[3]])
+            }
+            16 => {
+                let s = unsafe { std::slice::from_raw_parts(update.data, 16) };
+                AttributeValueFrame::Mat4f([
+                    [s[0], s[1], s[2], s[3]],
+                    [s[4], s[5], s[6], s[7]],
+                    [s[8], s[9], s[10], s[11]],
+                    [s[12], s[13], s[14], s[15]],
+                ])
+            }
+            _ => return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+        };
+
+        frames.push(AttributeUpdateFrame {
+            output_attribute: qualified,
+            value,
+        });
+    }
+
+    match inner.send_datagram_ref(&frames) {
+        Ok(()) => MOTIONSTAGE_SWIFT_STATUS_OK,
+        Err(err) if err.contains("not connected") => MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED,
+        Err(_) => MOTIONSTAGE_SWIFT_STATUS_TRANSPORT,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,5 +1464,21 @@ mod tests {
 
         motionstage_swift_client_free(client);
         rt.block_on(server.stop()).expect("server stops");
+    }
+
+    #[test]
+    fn ffi_new_v2_creates_client() {
+        let device_name = CString::new("test-device").unwrap();
+        let attr1 = CString::new("motion.position").unwrap();
+        let attr2 = CString::new("motion.rotation").unwrap();
+        let names: &[*const c_char] = &[attr1.as_ptr(), attr2.as_ptr()];
+
+        let client = motionstage_swift_client_new_v2(
+            device_name.as_ptr(),
+            2,
+            names.as_ptr(),
+        );
+        assert!(!client.is_null());
+        motionstage_swift_client_free(client);
     }
 }

@@ -28,6 +28,7 @@ extern "C" {
 #define MOTIONSTAGE_SWIFT_FIELD_FOCUS_DISTANCE 0x10
 #define MOTIONSTAGE_SWIFT_FIELD_APERTURE      0x20
 
+/* Legacy camera-specific motion frame (deprecated — use send_batch instead). */
 typedef struct {
     float position[3];
     float rotation[4];
@@ -44,6 +45,41 @@ typedef struct {
     uint32_t reset_scene_timeout_ms; /* 0 = use default (5000) */
 } MotionStageClientConfig;
 
+/**
+ * General-purpose attribute update entry for motionstage_swift_client_send_batch.
+ *
+ * component_count encodes the value type:
+ *   1  = Float32  (1 float)
+ *   2  = Vec2f    (2 floats)
+ *   3  = Vec3f    (3 floats)
+ *   4  = Quatf    (4 floats: x y z w)
+ *   16 = Mat4f    (16 floats, row-major)
+ */
+typedef struct {
+    const char *attribute;      /* attribute path, e.g. "motion.position" */
+    const float *data;          /* packed float values */
+    uint32_t component_count;   /* number of floats pointed to by data */
+} MotionAttributeUpdateC;
+
+/**
+ * Callback invoked when an async connect completes.
+ * status: MOTIONSTAGE_SWIFT_STATUS_* code.
+ * error:  human-readable error string (NULL on success). Do NOT free this pointer.
+ * context: the opaque pointer passed to motionstage_swift_client_connect_async.
+ * The callback is called from a Tokio worker thread.
+ */
+typedef void (*MotionStageConnectCallback)(int32_t status, const char *error, void *context);
+
+/* Runtime (2.3) */
+
+/**
+ * Pre-initialize the shared Tokio runtime with a custom worker thread count.
+ * Call before creating any client if you want a specific thread count.
+ * thread_count=0 uses the Tokio default (number of CPU cores).
+ * Has no effect if the runtime is already initialized.
+ */
+void motionstage_swift_runtime_init(uint32_t thread_count);
+
 /* Client lifecycle */
 
 void *motionstage_swift_client_new(
@@ -51,6 +87,7 @@ void *motionstage_swift_client_new(
     const char *output_attribute
 );
 
+/* Deprecated: prefer motionstage_swift_client_new_v2 */
 void *motionstage_swift_client_new_multi(
     const char *device_name,
     const char *output_attributes_csv
@@ -60,6 +97,16 @@ void *motionstage_swift_client_new_multi_with_config(
     const char *device_name,
     const char *output_attributes_csv,
     const MotionStageClientConfig *config  /* NULL = use defaults */
+);
+
+/**
+ * Array-based constructor (2.2). Preferred over motionstage_swift_client_new_multi.
+ * attribute_names: array of attribute_count null-terminated C strings.
+ */
+void *motionstage_swift_client_new_v2(
+    const char *device_name,
+    uint32_t attribute_count,
+    const char *const *attribute_names
 );
 
 void motionstage_swift_client_free(void *client);
@@ -73,7 +120,33 @@ int32_t motionstage_swift_client_connect(
     const char *api_key
 );
 
+/**
+ * Non-blocking connect. Spawns an async task; calls callback when done.
+ * pairing_token and api_key may be NULL.
+ * client must remain valid until callback is called.
+ */
+void motionstage_swift_client_connect_async(
+    void *client,
+    const char *server_addr,
+    const char *pairing_token,  /* NULL = none */
+    const char *api_key,        /* NULL = none */
+    MotionStageConnectCallback callback,
+    void *context               /* passed through to callback */
+);
+
 int32_t motionstage_swift_client_disconnect(void *client);
+
+/* General batch send (2.1) */
+
+/**
+ * Send multiple attribute updates in a single datagram.
+ * updates: array of update_count MotionAttributeUpdateC entries.
+ */
+int32_t motionstage_swift_client_send_batch(
+    void *client,
+    const MotionAttributeUpdateC *updates,
+    uint32_t update_count
+);
 
 /* Motion data (legacy single-attribute) */
 
