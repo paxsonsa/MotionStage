@@ -6,7 +6,7 @@ use std::{
 };
 
 use motionstage_core::{AttributeUpdate, AttributeValue};
-use motionstage_protocol::{ControlMessage, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use motionstage_protocol::ControlMessage;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, UnixTime};
 use thiserror::Error;
@@ -123,12 +123,7 @@ impl QuicPeer {
     }
 
     pub fn send_motion_datagram(&self, datagram: MotionDatagram) -> Result<(), QuicTransportError> {
-        let envelope = MotionDatagramEnvelope {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            datagram,
-        };
-        let bytes = bincode::serialize(&envelope)
+        let bytes = bincode::serialize(&datagram)
             .map_err(|err| QuicTransportError::Serialization(err.to_string()))?;
         self.connection
             .send_datagram(bytes.into())
@@ -142,10 +137,9 @@ impl QuicPeer {
             .read_datagram()
             .await
             .map_err(|err| QuicTransportError::Connection(err.to_string()))?;
-        let envelope: MotionDatagramEnvelope = bincode::deserialize(&bytes)
+        let datagram: MotionDatagram = bincode::deserialize(&bytes)
             .map_err(|err| QuicTransportError::Serialization(err.to_string()))?;
-        validate_wire_version(envelope.protocol_major, envelope.protocol_minor)?;
-        Ok(envelope.datagram)
+        Ok(datagram)
     }
 }
 
@@ -156,12 +150,7 @@ pub struct ControlChannel {
 
 impl ControlChannel {
     pub async fn send(&mut self, message: &ControlMessage) -> Result<(), QuicTransportError> {
-        let envelope = ControlEnvelope {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            message: message.clone(),
-        };
-        let bytes = bincode::serialize(&envelope)
+        let bytes = bincode::serialize(message)
             .map_err(|err| QuicTransportError::Serialization(err.to_string()))?;
         let len = bytes.len() as u32;
         self.send
@@ -196,17 +185,9 @@ async fn read_control_message(recv: &mut RecvStream) -> Result<ControlMessage, Q
     recv.read_exact(&mut bytes)
         .await
         .map_err(|err| QuicTransportError::Read(err.to_string()))?;
-    let envelope: ControlEnvelope = bincode::deserialize(&bytes)
+    let message: ControlMessage = bincode::deserialize(&bytes)
         .map_err(|err| QuicTransportError::Serialization(err.to_string()))?;
-    validate_wire_version(envelope.protocol_major, envelope.protocol_minor)?;
-    Ok(envelope.message)
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ControlEnvelope {
-    protocol_major: u16,
-    protocol_minor: u16,
-    message: ControlMessage,
+    Ok(message)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -214,13 +195,6 @@ pub struct MotionDatagram {
     pub device_id: Uuid,
     pub timestamp_ns: u64,
     pub updates: Vec<AttributeUpdateFrame>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct MotionDatagramEnvelope {
-    protocol_major: u16,
-    protocol_minor: u16,
-    datagram: MotionDatagram,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -319,15 +293,6 @@ pub enum QuicTransportError {
     Crypto(String),
     #[error("handshake: {0}")]
     Handshake(String),
-    #[error(
-        "unsupported protocol version {major}.{minor} (supported <= {supported_major}.{supported_minor})"
-    )]
-    UnsupportedProtocolVersion {
-        major: u16,
-        minor: u16,
-        supported_major: u16,
-        supported_minor: u16,
-    },
 }
 
 #[derive(Debug)]
@@ -392,28 +357,13 @@ fn default_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(transport)
 }
 
-fn validate_wire_version(major: u16, minor: u16) -> Result<(), QuicTransportError> {
-    if major != PROTOCOL_MAJOR || minor > PROTOCOL_MINOR {
-        return Err(QuicTransportError::UnsupportedProtocolVersion {
-            major,
-            minor,
-            supported_major: PROTOCOL_MAJOR,
-            supported_minor: PROTOCOL_MINOR,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use motionstage_core::AttributeValue;
     use motionstage_protocol::ControlMessage;
     use uuid::Uuid;
 
-    use crate::{
-        validate_wire_version, AttributeUpdateFrame, MotionDatagram, QuicClient, QuicServer,
-        QuicTransportError,
-    };
+    use crate::{AttributeUpdateFrame, MotionDatagram, QuicClient, QuicServer};
 
     #[tokio::test]
     async fn control_stream_roundtrip() {
@@ -470,18 +420,4 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    #[test]
-    fn version_gate_rejects_major_or_newer_minor() {
-        let err = validate_wire_version(2, 0).unwrap_err();
-        assert!(matches!(
-            err,
-            QuicTransportError::UnsupportedProtocolVersion { .. }
-        ));
-
-        let err = validate_wire_version(1, 99).unwrap_err();
-        assert!(matches!(
-            err,
-            QuicTransportError::UnsupportedProtocolVersion { .. }
-        ));
-    }
 }
