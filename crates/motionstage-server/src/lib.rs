@@ -2131,6 +2131,15 @@ async fn handle_quic_peer(
                             .map_err(|err| ServerError::Runtime(err.to_string()))?;
                     }
                     Ok(ControlMessage::Pong) => {}
+                    Ok(ControlMessage::ClientGoodbye { reason }) => {
+                        info!(
+                            device_id = %client_hello.device_id,
+                            reason = reason.as_deref().unwrap_or("none"),
+                            "client sent goodbye"
+                        );
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        break;
+                    }
                     Ok(ControlMessage::SetMode(mode)) => {
                         match handle_set_mode(&mut control, &server, &client_hello, mode).await? {
                             ControlFlow::Break(()) => break,

@@ -302,6 +302,9 @@ pub enum ControlMessage {
     },
     Ping,
     Pong,
+    ClientGoodbye {
+        reason: Option<String>,
+    },
     SetMode(Mode),
     ModeState(Mode),
     ResetSceneToBaseline {

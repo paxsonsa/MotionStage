@@ -251,7 +251,7 @@ mod tests {
         let adv = DiscoveryAdvertisement::default_for("cine", 7788);
         let txt = adv.to_txt_records();
         assert!(txt.iter().any(|s| s.contains("port=7788")));
-        assert!(txt.iter().any(|s| s.contains("proto_major=1")));
+        assert!(txt.iter().any(|s| s.contains("proto_major=2")));
         assert!(txt.iter().any(|s| s.contains("security=trusted_lan")));
     }
 

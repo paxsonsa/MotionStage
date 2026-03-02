@@ -168,6 +168,12 @@ impl MotionStageSwiftClientInner {
 
     fn disconnect(&mut self) {
         if let Some(mut session) = self.session.take() {
+            // Best-effort goodbye — ignore errors (connection may already be broken).
+            let _ = get_runtime().block_on(session.control.send(
+                &ControlMessage::ClientGoodbye {
+                    reason: Some("client disconnect".into()),
+                },
+            ));
             let _ = session.control.finish();
         }
     }
