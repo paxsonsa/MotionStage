@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     net::SocketAddr,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -1680,6 +1681,371 @@ impl ServerHandle {
     }
 }
 
+// Break = exit session loop; Continue = keep looping
+type HandlerOutcome = ControlFlow<()>;
+
+async fn handle_set_mode(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    requested_mode: Mode,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match server.set_mode(requested_mode).await {
+        Ok(()) => {
+            let active_mode = server.mode().await;
+            control
+                .send(&ControlMessage::ModeState(active_mode))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_baseline_control(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::ResetSceneToBaseline { .. } => "operator role is required to reset baseline",
+        ControlMessage::CommitSceneBaseline { .. } => "operator role is required to commit scene baseline",
+        ControlMessage::CommitObjectBaseline { .. } => "operator role is required to commit object baseline",
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    let result: Result<(BaselineAction, u32), ServerError> = match msg {
+        ControlMessage::ResetSceneToBaseline { scene_id } => {
+            server.reset_scene_to_baseline(scene_id).await.map(|n| (BaselineAction::ResetScene, n))
+        }
+        ControlMessage::CommitSceneBaseline { scene_id } => {
+            server.commit_scene_baseline(scene_id).await.map(|n| (BaselineAction::CommitScene, n))
+        }
+        ControlMessage::CommitObjectBaseline { scene_id, object_id } => {
+            server.commit_object_baseline(scene_id, object_id).await.map(|n| (BaselineAction::CommitObject, n))
+        }
+        _ => unreachable!(),
+    };
+    match result {
+        Ok((action, changed_attributes)) => {
+            control
+                .send(&ControlMessage::BaselineActionApplied { action, changed_attributes })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_take_management(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::ListTakes { .. } => "operator role is required to list takes",
+        ControlMessage::SelectTake { .. } => "operator role is required to select takes",
+        ControlMessage::DeleteTake { .. } => "operator role is required to delete takes",
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match msg {
+        ControlMessage::ListTakes { scene_id } => {
+            let takes = server.list_takes(scene_id).await;
+            control
+                .send(&ControlMessage::TakeList { takes })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        ControlMessage::SelectTake { take_id } => {
+            match server.select_take(take_id).await {
+                Ok(selected) => {
+                    control
+                        .send(&ControlMessage::TakeSelected { take_id: selected.take_id })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::DeleteTake { take_id } => {
+            match server.delete_take(take_id).await {
+                Ok(()) => {
+                    control
+                        .send(&ControlMessage::TakeDeleted { take_id })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_playback_control(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    take_id: Uuid,
+    action: PlaybackAction,
+    seek_ns: Option<u64>,
+    looping: bool,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to control playback".into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    let result = match action {
+        PlaybackAction::Play => server.playback_play(take_id, looping).await,
+        PlaybackAction::Pause => server.playback_pause(take_id).await,
+        PlaybackAction::Stop => server.playback_stop(take_id).await,
+        PlaybackAction::Seek => {
+            let seek = seek_ns.unwrap_or_default();
+            server.playback_seek(take_id, seek, looping).await
+        }
+    };
+    match result {
+        Ok((state, playhead_ns, looping)) => {
+            control
+                .send(&ControlMessage::PlaybackState { take_id, state, playhead_ns, looping })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_bake_cursor(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::OpenTakeBakeCursor { .. } => "operator role is required to open bake cursors",
+        ControlMessage::ReadTakeBakeFrame { .. } => "operator role is required to read bake frames",
+        ControlMessage::SeekTakeBakeFrame { .. } => "operator role is required to seek bake frames",
+        ControlMessage::CloseTakeBakeCursor { .. } => "operator role is required to close bake cursors",
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match msg {
+        ControlMessage::OpenTakeBakeCursor { take_id, sampling_mode } => {
+            match server.open_take_bake_cursor(take_id, sampling_mode).await {
+                Ok((cursor_id, total_frames)) => {
+                    control
+                        .send(&ControlMessage::TakeBakeCursorOpened { cursor_id, total_frames })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::ReadTakeBakeFrame { cursor_id } => {
+            match server.read_take_bake_frame(cursor_id).await {
+                Ok(Some((frame_index, timestamp_ns, attributes))) => {
+                    control
+                        .send(&ControlMessage::TakeBakeFrame { cursor_id, frame_index, timestamp_ns, attributes })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Ok(None) => {
+                    if send_protocol_error(control, RejectCode::ServerBusy, "bake cursor reached end of stream".into()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::SeekTakeBakeFrame { cursor_id, frame_index } => {
+            match server.seek_take_bake_frame(cursor_id, frame_index).await {
+                Ok(Some((resolved_index, timestamp_ns, attributes))) => {
+                    control
+                        .send(&ControlMessage::TakeBakeFrame { cursor_id, frame_index: resolved_index, timestamp_ns, attributes })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Ok(None) => {
+                    if send_protocol_error(control, RejectCode::ServerBusy, "bake seek was out of range".into()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::CloseTakeBakeCursor { cursor_id } => {
+            match server.close_take_bake_cursor(cursor_id).await {
+                Ok(()) => {
+                    control
+                        .send(&ControlMessage::TakeBakeCursorClosed { cursor_id })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_video_signaling(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    match msg {
+        ControlMessage::CreateVideoOffer { stream_id, track_id } => {
+            match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
+                Ok(offer) => {
+                    control
+                        .send(&ControlMessage::VideoOffer(offer))
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::VideoSignal(signal) => {
+            if signal.from_device != client_hello.device_id {
+                if send_protocol_error(control, RejectCode::RoleDenied, "signal from_device does not match active session".into()).await.is_err() {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+                return Ok(ControlFlow::Continue(()));
+            }
+            if signal.to_device == client_hello.device_id {
+                match server.handle_video_signal(client_hello.device_id, signal.payload).await {
+                    Ok(Some(answer)) => {
+                        control
+                            .send(&ControlMessage::VideoOffer(answer))
+                            .await
+                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                }
+            } else if let Err(err) = server.push_signaling_message(signal).await {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        ControlMessage::DrainSignals => {
+            match server.drain_signaling_messages(client_hello.device_id).await {
+                Ok(messages) => {
+                    control
+                        .send(&ControlMessage::SignalsBatch(messages))
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 async fn handle_quic_peer(
     server: ServerHandle,
     peer: motionstage_transport_quic::QuicPeer,
@@ -1765,403 +2131,49 @@ async fn handle_quic_peer(
                             .map_err(|err| ServerError::Runtime(err.to_string()))?;
                     }
                     Ok(ControlMessage::Pong) => {}
-                    Ok(ControlMessage::SetMode(requested_mode)) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.set_mode(requested_mode).await {
-                            Ok(()) => {
-                                let active_mode = server.mode().await;
-                                control
-                                    .send(&ControlMessage::ModeState(active_mode))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(ControlMessage::SetMode(mode)) => {
+                        match handle_set_mode(&mut control, &server, &client_hello, mode).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::ResetSceneToBaseline { scene_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to reset baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.reset_scene_to_baseline(scene_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::ResetScene,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::ResetSceneToBaseline { .. }
+                        | ControlMessage::CommitSceneBaseline { .. }
+                        | ControlMessage::CommitObjectBaseline { .. })) => {
+                        match handle_baseline_control(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::CommitSceneBaseline { scene_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit scene baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.commit_scene_baseline(scene_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::CommitScene,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::ListTakes { .. }
+                        | ControlMessage::SelectTake { .. }
+                        | ControlMessage::DeleteTake { .. })) => {
+                        match handle_take_management(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::CommitObjectBaseline {
-                        scene_id,
-                        object_id,
-                    }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit object baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.commit_object_baseline(scene_id, object_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::CommitObject,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(ControlMessage::PlaybackControl { take_id, action, seek_ns, looping }) => {
+                        match handle_playback_control(&mut control, &server, &client_hello, take_id, action, seek_ns, looping).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::ListTakes { scene_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to list takes".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        let takes = server.list_takes(scene_id).await;
-                        control
-                            .send(&ControlMessage::TakeList { takes })
-                            .await
-                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                    }
-                    Ok(ControlMessage::SelectTake { take_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to select takes".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.select_take(take_id).await {
-                            Ok(selected) => {
-                                control
-                                    .send(&ControlMessage::TakeSelected {
-                                        take_id: selected.take_id,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::OpenTakeBakeCursor { .. }
+                        | ControlMessage::ReadTakeBakeFrame { .. }
+                        | ControlMessage::SeekTakeBakeFrame { .. }
+                        | ControlMessage::CloseTakeBakeCursor { .. })) => {
+                        match handle_bake_cursor(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::PlaybackControl {
-                        take_id,
-                        action,
-                        seek_ns,
-                        looping,
-                    }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to control playback".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        let result = match action {
-                            PlaybackAction::Play => server.playback_play(take_id, looping).await,
-                            PlaybackAction::Pause => server.playback_pause(take_id).await,
-                            PlaybackAction::Stop => server.playback_stop(take_id).await,
-                            PlaybackAction::Seek => {
-                                let seek = seek_ns.unwrap_or_default();
-                                server.playback_seek(take_id, seek, looping).await
-                            }
-                        };
-                        match result {
-                            Ok((state, playhead_ns, looping)) => {
-                                control
-                                    .send(&ControlMessage::PlaybackState {
-                                        take_id,
-                                        state,
-                                        playhead_ns,
-                                        looping,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::DeleteTake { take_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to delete takes".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.delete_take(take_id).await {
-                            Ok(()) => {
-                                control
-                                    .send(&ControlMessage::TakeDeleted { take_id })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::OpenTakeBakeCursor {
-                        take_id,
-                        sampling_mode,
-                    }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to open bake cursors".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.open_take_bake_cursor(take_id, sampling_mode).await {
-                            Ok((cursor_id, total_frames)) => {
-                                control
-                                    .send(&ControlMessage::TakeBakeCursorOpened {
-                                        cursor_id,
-                                        total_frames,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::ReadTakeBakeFrame { cursor_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to read bake frames".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.read_take_bake_frame(cursor_id).await {
-                            Ok(Some((frame_index, timestamp_ns, attributes))) => {
-                                control
-                                    .send(&ControlMessage::TakeBakeFrame {
-                                        cursor_id,
-                                        frame_index,
-                                        timestamp_ns,
-                                        attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Ok(None) => {
-                                if send_protocol_error(&mut control, RejectCode::ServerBusy, "bake cursor reached end of stream".into()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::SeekTakeBakeFrame {
-                        cursor_id,
-                        frame_index,
-                    }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to seek bake frames".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.seek_take_bake_frame(cursor_id, frame_index).await {
-                            Ok(Some((resolved_index, timestamp_ns, attributes))) => {
-                                control
-                                    .send(&ControlMessage::TakeBakeFrame {
-                                        cursor_id,
-                                        frame_index: resolved_index,
-                                        timestamp_ns,
-                                        attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Ok(None) => {
-                                if send_protocol_error(&mut control, RejectCode::ServerBusy, "bake seek was out of range".into()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::CloseTakeBakeCursor { cursor_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to close bake cursors".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.close_take_bake_cursor(cursor_id).await {
-                            Ok(()) => {
-                                control
-                                    .send(&ControlMessage::TakeBakeCursorClosed { cursor_id })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::CreateVideoOffer { stream_id, track_id }) => {
-                        match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
-                            Ok(offer) => {
-                                control
-                                    .send(&ControlMessage::VideoOffer(offer))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::VideoSignal(signal)) => {
-                        if signal.from_device != client_hello.device_id {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "signal from_device does not match active session".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-
-                        if signal.to_device == client_hello.device_id {
-                            match server
-                                .handle_video_signal(client_hello.device_id, signal.payload)
-                                .await
-                            {
-                                Ok(Some(answer)) => {
-                                    control
-                                        .send(&ControlMessage::VideoOffer(answer))
-                                        .await
-                                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                        break;
-                                    }
-                                }
-                            }
-                        } else if let Err(err) = server.push_signaling_message(signal).await {
-                            if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(ControlMessage::DrainSignals) => {
-                        match server.drain_signaling_messages(client_hello.device_id).await {
-                            Ok(messages) => {
-                                control
-                                    .send(&ControlMessage::SignalsBatch(messages))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::CreateVideoOffer { .. }
+                        | ControlMessage::VideoSignal(_)
+                        | ControlMessage::DrainSignals)) => {
+                        match handle_video_signaling(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
                     Ok(ControlMessage::SignalsBatch(_))
