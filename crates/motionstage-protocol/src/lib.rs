@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MAJOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -375,22 +375,22 @@ mod tests {
 
     #[test]
     fn version_negotiation_accepts_backward_minor() {
-        let result = negotiate_version(ProtocolVersion::new(1, 4), ProtocolVersion::new(1, 1))
+        let result = negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 0))
             .expect("compatible versions should negotiate");
-        assert_eq!(result.selected, ProtocolVersion::new(1, 1));
+        assert_eq!(result.selected, ProtocolVersion::new(2, 0));
     }
 
     #[test]
     fn version_negotiation_rejects_major_mismatch() {
         let err =
-            negotiate_version(ProtocolVersion::new(1, 1), ProtocolVersion::new(2, 0)).unwrap_err();
+            negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(1, 0)).unwrap_err();
         assert!(format!("{err}").contains("unsupported major"));
     }
 
     #[test]
     fn version_negotiation_rejects_client_newer_minor() {
         let err =
-            negotiate_version(ProtocolVersion::new(1, 1), ProtocolVersion::new(1, 2)).unwrap_err();
+            negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 1)).unwrap_err();
         assert!(format!("{err}").contains("client minor version is newer"));
     }
 
