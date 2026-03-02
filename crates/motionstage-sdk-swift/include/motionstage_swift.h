@@ -38,6 +38,18 @@ extern "C" {
 #define MOTIONSTAGE_SWIFT_FIELD_FOCUS_DISTANCE 0x10
 #define MOTIONSTAGE_SWIFT_FIELD_APERTURE      0x20
 
+/* Connection state (4.2) */
+#define MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED  0
+#define MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED     1
+#define MOTIONSTAGE_SWIFT_CONNECTION_RECONNECTING  2
+#define MOTIONSTAGE_SWIFT_CONNECTION_FAILED        3
+
+/* Connection event (4.2) */
+#define MOTIONSTAGE_SWIFT_EVENT_CONNECTED          0
+#define MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED       1
+#define MOTIONSTAGE_SWIFT_EVENT_RECONNECTING       2
+#define MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED   3
+
 /* Legacy camera-specific motion frame (deprecated — use send_batch instead). */
 typedef struct {
     float position[3];
@@ -99,6 +111,16 @@ typedef struct {
  * The callback is called from a Tokio worker thread.
  */
 typedef void (*MotionStageConnectCallback)(int32_t status, const char *error, void *context);
+
+/**
+ * Connection event callback (4.2).
+ * event: MOTIONSTAGE_SWIFT_EVENT_* constant.
+ * attempt: reconnect attempt number (0 if not applicable).
+ * message: human-readable string (NULL when not applicable). Do NOT free.
+ * context: the opaque pointer passed to motionstage_swift_client_set_connection_event_callback.
+ */
+typedef void (*MotionStageConnectionEventCallback)(
+    int32_t event, uint32_t attempt, const char *message, void *context);
 
 /* Runtime (2.3) */
 
@@ -277,6 +299,36 @@ int32_t motionstage_swift_client_set_mode(
     int32_t requested_mode,
     int32_t *active_mode_out
 );
+
+/* Reconnection (4.2) */
+
+/**
+ * Set the auto-reconnect policy.
+ * max_attempts=0 disables auto-reconnect.
+ * backoff_factor_x100: multiplier * 100 (e.g. 200 = 2.0x).
+ */
+int32_t motionstage_swift_client_set_reconnect_policy(
+    void *client,
+    uint32_t max_attempts,
+    uint32_t initial_delay_ms,
+    uint32_t max_delay_ms,
+    uint32_t backoff_factor_x100
+);
+
+/**
+ * Register a callback for connection state events.
+ * Set callback to NULL to clear.
+ */
+int32_t motionstage_swift_client_set_connection_event_callback(
+    void *client,
+    MotionStageConnectionEventCallback callback,  /* NULL = clear */
+    void *context
+);
+
+/**
+ * Returns the current connection state (MOTIONSTAGE_SWIFT_CONNECTION_* constant).
+ */
+int32_t motionstage_swift_client_connection_state(void *client);
 
 /* Accessors */
 

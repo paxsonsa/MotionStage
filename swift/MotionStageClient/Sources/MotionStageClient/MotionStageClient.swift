@@ -75,12 +75,44 @@ public struct FieldMask: OptionSet, Sendable {
     public static let all: FieldMask = [.allMotion, .allCamera]
 }
 
-// MARK: - ConnectionEvent (5.3)
+// MARK: - ConnectionEvent (5.3 + 4.2)
 
 public enum ConnectionEvent: Sendable {
     case connected(sessionID: String)
     case disconnected
+    case reconnecting(attempt: UInt32)
+    case reconnectFailed(message: String)
     case error(MotionStageError)
+}
+
+// MARK: - ReconnectPolicy (4.2)
+
+public struct ReconnectPolicy: Sendable {
+    public var maxAttempts: UInt32
+    public var initialDelay: Duration
+    public var maxDelay: Duration
+    public var backoffFactor: Double
+
+    public init(
+        maxAttempts: UInt32 = 5,
+        initialDelay: Duration = .milliseconds(500),
+        maxDelay: Duration = .seconds(30),
+        backoffFactor: Double = 2.0
+    ) {
+        self.maxAttempts = maxAttempts
+        self.initialDelay = initialDelay
+        self.maxDelay = maxDelay
+        self.backoffFactor = backoffFactor
+    }
+}
+
+// MARK: - ConnectionState (4.2)
+
+public enum ConnectionState: Int32, Sendable {
+    case disconnected  = 0
+    case connected     = 1
+    case reconnecting  = 2
+    case failed        = 3
 }
 
 // MARK: - Legacy MotionFrame (deprecated — use CameraMotionFrame)
@@ -122,15 +154,23 @@ private final class ContinuationBox<T>: @unchecked Sendable {
     init(_ cont: CheckedContinuation<T, Error>) { self.cont = cont }
 }
 
+/// Wraps an `AsyncStream.Continuation` so it can be passed as a `void *` to C event callbacks.
+private final class EventContinuationBox: @unchecked Sendable {
+    let cont: AsyncStream<ConnectionEvent>.Continuation
+    init(_ cont: AsyncStream<ConnectionEvent>.Continuation) { self.cont = cont }
+}
+
 // MARK: - MotionStageClient
 
 public final class MotionStageClient: @unchecked Sendable {
     private let rawClient: UnsafeMutableRawPointer
 
-    // MARK: Connection events (5.3)
+    // MARK: Connection events (5.3 + 4.2)
 
     private let eventContinuation: AsyncStream<ConnectionEvent>.Continuation
     public let events: AsyncStream<ConnectionEvent>
+    /// Retained box so the C callback can reference the continuation without captures.
+    private let eventBox: Unmanaged<EventContinuationBox>
 
     // MARK: - Init: legacy single-attribute
 
@@ -156,6 +196,10 @@ public final class MotionStageClient: @unchecked Sendable {
         (self.events, self.eventContinuation) = AsyncStream<ConnectionEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(16)
         )
+        self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        motionstage_swift_client_set_connection_event_callback(
+            raw, connectionEventCallback, self.eventBox.toOpaque()
+        )
     }
 
     // MARK: - Init: typed [AttributeKey] (5.1)
@@ -172,6 +216,10 @@ public final class MotionStageClient: @unchecked Sendable {
         self.rawClient = raw
         (self.events, self.eventContinuation) = AsyncStream<ConnectionEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(16)
+        )
+        self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        motionstage_swift_client_set_connection_event_callback(
+            raw, connectionEventCallback, self.eventBox.toOpaque()
         )
     }
 
@@ -191,12 +239,19 @@ public final class MotionStageClient: @unchecked Sendable {
         (self.events, self.eventContinuation) = AsyncStream<ConnectionEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(16)
         )
+        self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        motionstage_swift_client_set_connection_event_callback(
+            raw, connectionEventCallback, self.eventBox.toOpaque()
+        )
     }
 
     deinit {
+        // Clear the event callback before freeing so no stale pointer is called.
+        motionstage_swift_client_set_connection_event_callback(rawClient, nil, nil)
         _ = motionstage_swift_client_disconnect(rawClient)
         motionstage_swift_client_free(rawClient)
         eventContinuation.finish()
+        eventBox.release()
     }
 
     // MARK: - Connection
@@ -275,6 +330,29 @@ public final class MotionStageClient: @unchecked Sendable {
     public func disconnect() {
         _ = motionstage_swift_client_disconnect(rawClient)
         eventContinuation.yield(.disconnected)
+    }
+
+    // MARK: - Reconnection (4.2)
+
+    /// Configure auto-reconnect behaviour. Pass `nil` to disable.
+    public func setReconnectPolicy(_ policy: ReconnectPolicy?) {
+        if let policy {
+            let initialMs = UInt32(clamping: Int64(policy.initialDelay.components.seconds) * 1000
+                + policy.initialDelay.components.attoseconds / 1_000_000_000_000_000)
+            let maxMs = UInt32(clamping: Int64(policy.maxDelay.components.seconds) * 1000
+                + policy.maxDelay.components.attoseconds / 1_000_000_000_000_000)
+            let factorX100 = UInt32(clamping: Int64(policy.backoffFactor * 100.0))
+            _ = motionstage_swift_client_set_reconnect_policy(
+                rawClient, policy.maxAttempts, initialMs, maxMs, factorX100
+            )
+        } else {
+            _ = motionstage_swift_client_set_reconnect_policy(rawClient, 0, 0, 0, 0)
+        }
+    }
+
+    /// The current connection state.
+    public var connectionState: ConnectionState {
+        ConnectionState(rawValue: motionstage_swift_client_connection_state(rawClient)) ?? .disconnected
     }
 
     // MARK: - General batch send (2.1)
@@ -528,6 +606,28 @@ private let connectCallback: MotionStageConnectCallback = { status, errorPtr, ct
             ?? "connect failed with status \(status)"
         box.cont.resume(throwing: makeError(status: status, message: msg))
     }
+}
+
+/// Top-level callback for connection events (4.2).
+/// Uses `ctx` as a non-retained `EventContinuationBox`.
+private let connectionEventCallback: MotionStageConnectionEventCallback = { event, attempt, messagePtr, ctx in
+    guard let ctx else { return }
+    let box = Unmanaged<EventContinuationBox>.fromOpaque(ctx).takeUnretainedValue()
+    let connectionEvent: ConnectionEvent
+    switch event {
+    case MOTIONSTAGE_SWIFT_EVENT_CONNECTED:
+        connectionEvent = .connected(sessionID: "reconnected")
+    case MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED:
+        connectionEvent = .disconnected
+    case MOTIONSTAGE_SWIFT_EVENT_RECONNECTING:
+        connectionEvent = .reconnecting(attempt: attempt)
+    case MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED:
+        let msg = messagePtr.map { String(cString: $0) } ?? "reconnection failed"
+        connectionEvent = .reconnectFailed(message: msg)
+    default:
+        return
+    }
+    box.cont.yield(connectionEvent)
 }
 
 // MARK: - Free helpers

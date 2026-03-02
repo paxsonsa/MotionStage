@@ -55,6 +55,18 @@ pub const MOTIONSTAGE_SWIFT_FIELD_FOCAL_LENGTH: u32 = 0x08;
 pub const MOTIONSTAGE_SWIFT_FIELD_FOCUS_DISTANCE: u32 = 0x10;
 pub const MOTIONSTAGE_SWIFT_FIELD_APERTURE: u32 = 0x20;
 
+/// Connection state constants (4.2)
+pub const MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED: i32 = 0;
+pub const MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED: i32 = 1;
+pub const MOTIONSTAGE_SWIFT_CONNECTION_RECONNECTING: i32 = 2;
+pub const MOTIONSTAGE_SWIFT_CONNECTION_FAILED: i32 = 3;
+
+/// Connection event constants (4.2)
+pub const MOTIONSTAGE_SWIFT_EVENT_CONNECTED: i32 = 0;
+pub const MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED: i32 = 1;
+pub const MOTIONSTAGE_SWIFT_EVENT_RECONNECTING: i32 = 2;
+pub const MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED: i32 = 3;
+
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RESET_SCENE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,18 +163,76 @@ pub struct MotionAttributeUpdateC {
 pub type MotionStageConnectCallback =
     unsafe extern "C" fn(status: i32, error: *const c_char, context: *mut c_void);
 
+/// Connection event callback (4.2).
+/// `event`: MOTIONSTAGE_SWIFT_EVENT_* constant.
+/// `attempt`: reconnect attempt number (0 for connected/disconnected events).
+/// `message`: optional human-readable message (NULL if none). Do NOT free.
+pub type MotionStageConnectionEventCallback =
+    unsafe extern "C" fn(event: i32, attempt: u32, message: *const c_char, context: *mut c_void);
+
+// ---------------------------------------------------------------------------
+// Reconnect policy (4.2)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ReconnectPolicy {
+    max_attempts: u32,
+    initial_delay: Duration,
+    max_delay: Duration,
+    backoff_factor: f64,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            backoff_factor: 2.0,
+        }
+    }
+}
+
+/// Saved connection parameters for reconnection.
+#[derive(Clone)]
+struct ConnectParams {
+    server_addr: String,
+    pairing_token: Option<String>,
+    api_key: Option<String>,
+    /// If `Some`, use pinned cert; otherwise use insecure.
+    fingerprint: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+enum ConnectionState {
+    Disconnected = 0,
+    Connected = 1,
+    Reconnecting = 2,
+    Failed = 3,
+}
+
 // ---------------------------------------------------------------------------
 // Internal client structs
 // ---------------------------------------------------------------------------
 
 pub struct MotionStageSwiftClient {
     inner: Mutex<MotionStageSwiftClientInner>,
-    /// Nanosecond timestamp of the last motion datagram send. Shared with ping thread.
+    /// Nanosecond timestamp of the last motion datagram send. Shared with monitor thread.
     last_send_ns: Arc<AtomicU64>,
-    /// Signal to stop the ping thread.
+    /// Signal to stop the connection monitor thread.
     ping_shutdown: Arc<AtomicBool>,
-    /// Join handle for the background ping thread (set after connect).
+    /// Join handle for the background connection monitor thread (set after connect).
     ping_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Current connection state (atomic for lock-free reads).
+    connection_state: Arc<std::sync::atomic::AtomicI32>,
+    /// Reconnection policy (protected by mutex for thread-safe mutation).
+    reconnect_policy: Mutex<Option<ReconnectPolicy>>,
+    /// Saved connection parameters for reconnection.
+    connect_params: Mutex<Option<ConnectParams>>,
+    /// Connection event callback and context.
+    event_callback: Mutex<Option<(MotionStageConnectionEventCallback, usize)>>,
 }
 
 struct MotionStageSwiftClientInner {
@@ -759,67 +829,229 @@ fn into_c_string_ptr(value: &str) -> *mut c_char {
 }
 
 // ---------------------------------------------------------------------------
-// Ping heartbeat thread (4.3)
+// Connection monitor thread (4.3 + 4.2)
 // ---------------------------------------------------------------------------
 
 const PING_INTERVAL: Duration = Duration::from_secs(3);
 const PING_IDLE_THRESHOLD_NS: u64 = 2_000_000_000; // 2 seconds
 
-fn start_ping_thread(
+fn start_connection_monitor(
     client_ptr: usize,
     last_send_ns: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("motionstage-ping".into())
+        .name("motionstage-monitor".into())
         .spawn(move || {
-            loop {
-                std::thread::sleep(PING_INTERVAL);
+            'outer: loop {
+                // --- Ping loop ---
+                loop {
+                    std::thread::sleep(PING_INTERVAL);
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+
+                    // Only send a ping if no motion datagram was sent recently.
+                    let last = last_send_ns.load(Ordering::Relaxed);
+                    let now = now_ns();
+                    if last > 0 && now.saturating_sub(last) < PING_IDLE_THRESHOLD_NS {
+                        continue;
+                    }
+
+                    let client_ref =
+                        unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+                    let mut inner = client_ref
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                    let send_ok = if let Some(session) = inner.session.as_mut() {
+                        get_runtime()
+                            .block_on(session.control.send(&ControlMessage::Ping))
+                            .is_ok()
+                    } else {
+                        false
+                    };
+                    drop(inner);
+
+                    if !send_ok {
+                        // Connection may be broken — attempt reconnection if policy is set.
+                        break;
+                    }
+                }
 
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // Only send a ping if no motion datagram was sent recently.
-                let last = last_send_ns.load(Ordering::Relaxed);
-                let now = now_ns();
-                if last > 0 && now.saturating_sub(last) < PING_IDLE_THRESHOLD_NS {
-                    continue;
+                // --- Reconnect loop ---
+                let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+
+                let policy = client_ref
+                    .reconnect_policy
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let params = client_ref
+                    .connect_params
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+
+                let (policy, params) = match (policy, params) {
+                    (Some(p), Some(c)) => (p, c),
+                    _ => {
+                        // No reconnect policy or no saved params — stop monitoring.
+                        client_ref.connection_state.store(
+                            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+                            Ordering::Relaxed,
+                        );
+                        fire_event(client_ref, MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED, 0, None);
+                        break;
+                    }
+                };
+
+                // Disconnect the old session.
+                {
+                    let mut inner = client_ref
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    inner.disconnect();
                 }
 
-                // Lock client briefly to send Ping via the control channel.
-                let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
-                let mut inner = client_ref
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                client_ref
+                    .connection_state
+                    .store(MOTIONSTAGE_SWIFT_CONNECTION_RECONNECTING, Ordering::Relaxed);
 
-                let send_ok = if let Some(session) = inner.session.as_mut() {
-                    get_runtime()
-                        .block_on(session.control.send(&ControlMessage::Ping))
-                        .is_ok()
-                } else {
-                    // No session — nothing to ping.
-                    false
-                };
-                drop(inner);
+                let mut delay = policy.initial_delay;
+                let mut reconnected = false;
 
-                if !send_ok && inner_has_session(client_ptr) {
-                    // Connection is broken; stop pinging.
+                for attempt in 1..=policy.max_attempts {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+
+                    fire_event(
+                        client_ref,
+                        MOTIONSTAGE_SWIFT_EVENT_RECONNECTING,
+                        attempt,
+                        None,
+                    );
+
+                    std::thread::sleep(delay);
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+
+                    // Try to reconnect.
+                    let inner = client_ref
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let device_id = inner.device_id;
+                    let device_name = inner.device_name.clone();
+                    let qualified_outputs = inner.qualified_outputs.clone();
+                    let handshake_timeout = inner.handshake_timeout;
+                    drop(inner);
+
+                    let endpoint = if let Some(fp) = params.fingerprint {
+                        QuicClient::new_with_pinned_cert(fp)
+                    } else {
+                        QuicClient::new_insecure_for_local_dev()
+                    };
+
+                    let endpoint = match endpoint {
+                        Ok(ep) => ep,
+                        Err(_) => {
+                            delay = next_delay(delay, policy.backoff_factor, policy.max_delay);
+                            continue;
+                        }
+                    };
+
+                    let result = get_runtime().block_on(connect_with_endpoint(
+                        endpoint,
+                        device_id,
+                        device_name,
+                        qualified_outputs,
+                        params.server_addr.clone(),
+                        params.pairing_token.clone(),
+                        params.api_key.clone(),
+                        handshake_timeout,
+                    ));
+
+                    match result {
+                        Ok(session) => {
+                            let mut inner = client_ref
+                                .inner
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            inner.session = Some(session);
+                            inner.clear_error();
+                            drop(inner);
+
+                            client_ref.connection_state.store(
+                                MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED,
+                                Ordering::Relaxed,
+                            );
+                            client_ref.last_send_ns.store(0, Ordering::Relaxed);
+                            fire_event(
+                                client_ref,
+                                MOTIONSTAGE_SWIFT_EVENT_CONNECTED,
+                                attempt,
+                                None,
+                            );
+                            reconnected = true;
+                            break;
+                        }
+                        Err(_) => {
+                            delay = next_delay(delay, policy.backoff_factor, policy.max_delay);
+                        }
+                    }
+                }
+
+                if !reconnected {
+                    client_ref.connection_state.store(
+                        MOTIONSTAGE_SWIFT_CONNECTION_FAILED,
+                        Ordering::Relaxed,
+                    );
+                    fire_event(
+                        client_ref,
+                        MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED,
+                        policy.max_attempts,
+                        Some("max reconnect attempts exhausted"),
+                    );
                     break;
                 }
+
+                // Reconnected — loop back to ping.
             }
         })
-        .expect("failed to spawn ping thread")
+        .expect("failed to spawn connection monitor thread")
 }
 
-fn inner_has_session(client_ptr: usize) -> bool {
-    let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
-    let inner = client_ref
-        .inner
+fn next_delay(current: Duration, factor: f64, max: Duration) -> Duration {
+    let next = Duration::from_secs_f64(current.as_secs_f64() * factor);
+    next.min(max)
+}
+
+fn fire_event(
+    client_ref: &MotionStageSwiftClient,
+    event: i32,
+    attempt: u32,
+    message: Option<&str>,
+) {
+    let guard = client_ref
+        .event_callback
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    inner.session.is_some()
+    if let Some((callback, ctx)) = *guard {
+        let c_msg = message.and_then(|m| CString::new(m).ok());
+        let msg_ptr = c_msg.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+        unsafe { callback(event, attempt, msg_ptr, ctx as *mut c_void) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +1113,10 @@ pub extern "C" fn motionstage_swift_client_new(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -926,6 +1162,10 @@ pub extern "C" fn motionstage_swift_client_new_multi(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -977,6 +1217,10 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -1021,6 +1265,10 @@ pub extern "C" fn motionstage_swift_client_new_v2(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -1067,6 +1315,10 @@ pub extern "C" fn motionstage_swift_client_new_v3(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
     };
 
     Box::into_raw(Box::new(client)).cast::<c_void>()
@@ -1129,6 +1381,14 @@ pub extern "C" fn motionstage_swift_client_connect(
         )
     };
 
+    // Clone connect params before they are consumed by connect_impl.
+    let saved_params = ConnectParams {
+        server_addr: server_addr.clone(),
+        pairing_token: pairing_token.clone(),
+        api_key: api_key.clone(),
+        fingerprint: None,
+    };
+
     // Perform async connect without holding the lock.
     let result = get_runtime().block_on(connect_impl(
         device_id,
@@ -1152,11 +1412,13 @@ pub extern "C" fn motionstage_swift_client_connect(
             inner.clear_error();
             drop(inner);
 
-            // Start ping heartbeat thread.
             let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
-            client_ref.ping_shutdown.store(false, Ordering::Relaxed);
-            client_ref.last_send_ns.store(0, Ordering::Relaxed);
-            let handle = start_ping_thread(
+            // Save connect params for reconnection.
+            *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(saved_params);
+            client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+
+            let handle = start_connection_monitor(
                 client as usize,
                 Arc::clone(&client_ref.last_send_ns),
                 Arc::clone(&client_ref.ping_shutdown),
@@ -1241,6 +1503,14 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
     let client_addr = client as usize;
     let context_addr = context as usize;
 
+    // Clone connect params for reconnection before they are moved into the async task.
+    let saved_params = ConnectParams {
+        server_addr: server_addr.clone(),
+        pairing_token: pairing_token.clone(),
+        api_key: api_key.clone(),
+        fingerprint: None,
+    };
+
     get_runtime().spawn(async move {
         let result = connect_impl(
             device_id,
@@ -1268,10 +1538,15 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
                 inner.clear_error();
                 drop(inner);
 
-                // Start ping heartbeat thread.
+                // Save connect params for reconnection.
+                *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(saved_params);
+                client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+
+                // Start connection monitor thread.
                 client_ref.ping_shutdown.store(false, Ordering::Relaxed);
                 client_ref.last_send_ns.store(0, Ordering::Relaxed);
-                let handle = start_ping_thread(
+                let handle = start_connection_monitor(
                     client_addr,
                     Arc::clone(&client_ref.last_send_ns),
                     Arc::clone(&client_ref.ping_shutdown),
@@ -1363,6 +1638,14 @@ pub extern "C" fn motionstage_swift_client_connect_pinned(
         }
     };
 
+    // Clone connect params before they are consumed by connect_with_endpoint.
+    let saved_params = ConnectParams {
+        server_addr: server_addr.clone(),
+        pairing_token: pairing_token.clone(),
+        api_key: api_key.clone(),
+        fingerprint: Some(fingerprint),
+    };
+
     let result = get_runtime().block_on(connect_with_endpoint(
         endpoint,
         device_id,
@@ -1386,9 +1669,15 @@ pub extern "C" fn motionstage_swift_client_connect_pinned(
             drop(inner);
 
             let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+
+            // Save connect params for reconnection.
+            *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(saved_params);
+            client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+
             client_ref.ping_shutdown.store(false, Ordering::Relaxed);
             client_ref.last_send_ns.store(0, Ordering::Relaxed);
-            let handle = start_ping_thread(
+            let handle = start_connection_monitor(
                 client as usize,
                 Arc::clone(&client_ref.last_send_ns),
                 Arc::clone(&client_ref.ping_shutdown),
@@ -1410,9 +1699,10 @@ pub extern "C" fn motionstage_swift_client_disconnect(client: *mut c_void) -> i3
         return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
     }
 
-    // Signal ping thread to stop.
+    // Signal connection monitor thread to stop.
     let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
     client_ref.ping_shutdown.store(true, Ordering::Relaxed);
+    client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED, Ordering::Relaxed);
     // Take the thread handle (don't join — it'll exit on next sleep cycle).
     let _ = client_ref
         .ping_thread
@@ -1828,6 +2118,78 @@ fn classify_mode_error(client: &mut MotionStageSwiftClientInner, err: String) ->
     } else {
         client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// FFI: Reconnection (4.2)
+// ---------------------------------------------------------------------------
+
+/// Configure the reconnection policy.
+/// backoff_factor_x100: backoff multiplier * 100 (e.g. 200 = 2.0x).
+/// Set max_attempts=0 to disable auto-reconnect.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_reconnect_policy(
+    client: *mut c_void,
+    max_attempts: u32,
+    initial_delay_ms: u32,
+    max_delay_ms: u32,
+    backoff_factor_x100: u32,
+) -> i32 {
+    if client.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+
+    let policy = if max_attempts == 0 {
+        None
+    } else {
+        Some(ReconnectPolicy {
+            max_attempts,
+            initial_delay: Duration::from_millis(initial_delay_ms as u64),
+            max_delay: Duration::from_millis(max_delay_ms as u64),
+            backoff_factor: backoff_factor_x100 as f64 / 100.0,
+        })
+    };
+
+    *client_ref
+        .reconnect_policy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+
+    MOTIONSTAGE_SWIFT_STATUS_OK
+}
+
+/// Register a callback for connection state change events.
+/// Set callback to NULL to clear.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_connection_event_callback(
+    client: *mut c_void,
+    callback: Option<MotionStageConnectionEventCallback>,
+    context: *mut c_void,
+) -> i32 {
+    if client.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+
+    let mut guard = client_ref
+        .event_callback
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    *guard = callback.map(|cb| (cb, context as usize));
+
+    MOTIONSTAGE_SWIFT_STATUS_OK
+}
+
+/// Returns the current connection state (MOTIONSTAGE_SWIFT_CONNECTION_* constant).
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_connection_state(client: *mut c_void) -> i32 {
+    if client.is_null() {
+        return MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED;
+    }
+    let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+    client_ref.connection_state.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
