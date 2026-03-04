@@ -1396,6 +1396,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 
@@ -1442,6 +1443,8 @@ dependencies = [
  "motionstage-protocol",
  "motionstage-server",
  "motionstage-transport-quic",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

@@ -11,20 +11,20 @@ use std::{
 use bytes::Bytes;
 
 use motionstage_core::{
-    AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId, MappingRequest, ObjectId,
-    RuntimeCore, RuntimeSnapshot, Scene, SceneId, source_output_matches,
+    source_output_matches, AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId,
+    MappingRequest, ObjectId, RuntimeCore, RuntimeSnapshot, Scene, SceneId,
 };
 use motionstage_discovery::{DiscoveryAdvertisement, DiscoveryPublisher};
 use motionstage_media::{
-    negotiate_stream, NegotiatedVideoStream, SignalingHub, VideoClientCapability,
+    negotiate_stream, NegotiatedVideoStream, SignalingHub, VideoClientCapability, VideoCodec,
     VideoStreamDescriptor,
 };
 use motionstage_protocol::{
     negotiate_version, AttributeDescriptor, BakeAttributeValue, BaselineAction, ClientHello,
-    ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction,
-    PlaybackRuntimeState, ProtocolError, ProtocolVersion, RecordingState, RegisterAccepted,
-    RegisterRejected, RegisterRequest, RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello,
-    SessionState, SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo, PROTOCOL_MAJOR,
+    ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction, PlaybackRuntimeState,
+    ProtocolError, ProtocolVersion, RecordingState, RegisterAccepted, RegisterRejected,
+    RegisterRequest, RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello, SessionState,
+    SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo, VideoStreamStatus, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
 use motionstage_recording::{
@@ -34,7 +34,7 @@ use motionstage_recording::{
 use motionstage_transport_quic::{MotionDatagram, QuicServer};
 use motionstage_webrtc::WebRtcSession;
 use thiserror::Error;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
@@ -164,12 +164,16 @@ struct ServerState {
     take_catalog: TakeCatalog,
     bake_cursors: BTreeMap<Uuid, TakeBakeCursor>,
     master_video_descriptor: Option<VideoStreamDescriptor>,
+    last_video_frame_ns: Option<u64>,
+    video_keyframe_needed: bool,
     signaling: SignalingHub,
     video_peers: BTreeMap<Uuid, VideoPeerSession>,
     runtime_resources: Option<RuntimeResources>,
     active_advertisement: Option<DiscoveryAdvertisement>,
     last_published_snapshot: Option<RuntimeSnapshot>,
 }
+
+const VIDEO_STREAM_ACTIVITY_WINDOW_NS: u64 = 2_000_000_000;
 
 impl ServerState {
     fn change_session_state(
@@ -346,6 +350,7 @@ impl ServerState {
 #[derive(Clone)]
 pub struct ServerHandle {
     state: Arc<RwLock<ServerState>>,
+    mode_updates: broadcast::Sender<Mode>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -379,6 +384,7 @@ impl QuicRuntime {
 
 impl ServerHandle {
     pub fn new(config: ServerConfig) -> Self {
+        let (mode_updates, _mode_updates_rx) = broadcast::channel(64);
         let state = ServerState {
             runtime: RuntimeCore::new(config.lease),
             sessions: BTreeMap::new(),
@@ -399,6 +405,8 @@ impl ServerHandle {
             ),
             bake_cursors: BTreeMap::new(),
             master_video_descriptor: None,
+            last_video_frame_ns: None,
+            video_keyframe_needed: false,
             signaling: SignalingHub::default(),
             video_peers: BTreeMap::new(),
             runtime_resources: None,
@@ -409,6 +417,7 @@ impl ServerHandle {
 
         Self {
             state: Arc::new(RwLock::new(state)),
+            mode_updates,
         }
     }
 
@@ -827,13 +836,11 @@ impl ServerHandle {
             .map(|s| s.device_name.clone())
             .unwrap_or_default();
         if let Some(recording) = state.active_recording.as_mut() {
-            recording
-                .writer
-                .push_marker(RecordingMarker::ClientJoined {
-                    timestamp_ns: now_ns(),
-                    device_id,
-                    device_name,
-                });
+            recording.writer.push_marker(RecordingMarker::ClientJoined {
+                timestamp_ns: now_ns(),
+                device_id,
+                device_name,
+            });
         }
         Ok(())
     }
@@ -845,12 +852,9 @@ impl ServerHandle {
         }
     }
 
-    pub async fn close_session(
-        &self,
-        device_id: Uuid,
-        now_ns: u64,
-    ) -> Result<(), ServerError> {
-        self.close_session_with_reason(device_id, now_ns, None).await
+    pub async fn close_session(&self, device_id: Uuid, now_ns: u64) -> Result<(), ServerError> {
+        self.close_session_with_reason(device_id, now_ns, None)
+            .await
     }
 
     pub async fn close_session_with_reason(
@@ -861,13 +865,11 @@ impl ServerHandle {
     ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         if let Some(recording) = state.active_recording.as_mut() {
-            recording
-                .writer
-                .push_marker(RecordingMarker::ClientLeft {
-                    timestamp_ns: now_ns,
-                    device_id,
-                    reason,
-                });
+            recording.writer.push_marker(RecordingMarker::ClientLeft {
+                timestamp_ns: now_ns,
+                device_id,
+                reason,
+            });
         }
         state
             .runtime
@@ -909,6 +911,7 @@ impl ServerHandle {
                     to,
                 });
         }
+        let _ = self.mode_updates.send(to);
         Ok(())
     }
 
@@ -924,14 +927,18 @@ impl ServerHandle {
             state.active_playback = None;
         }
         if let Some(rec) = state.active_recording.as_mut() {
-            rec.writer
-                .push_marker(RecordingMarker::ModeTransition {
-                    timestamp_ns: now_ns(),
-                    from,
-                    to,
-                });
+            rec.writer.push_marker(RecordingMarker::ModeTransition {
+                timestamp_ns: now_ns(),
+                from,
+                to,
+            });
         }
+        let _ = self.mode_updates.send(to);
         Ok(())
+    }
+
+    pub fn subscribe_mode_updates(&self) -> broadcast::Receiver<Mode> {
+        self.mode_updates.subscribe()
     }
 
     /// Convenience: set both axes of the composite mode in one call.
@@ -1619,13 +1626,22 @@ impl ServerHandle {
                 .unwrap_or(true)
         };
         if needs_track {
-            peer.add_h264_track(stream_id, track_id)
+            let codec = {
+                let state = self.state.read().await;
+                state
+                    .master_video_descriptor
+                    .as_ref()
+                    .map(|d| d.codec)
+                    .unwrap_or(VideoCodec::H264)
+            };
+            peer.add_video_track(codec, stream_id, track_id)
                 .await
                 .map_err(|err| ServerError::WebRtc(err.to_string()))?;
             let mut state = self.state.write().await;
             if let Some(entry) = state.video_peers.get_mut(&device_id) {
                 entry.track_added = true;
             }
+            state.video_keyframe_needed = true;
         }
 
         peer.create_offer()
@@ -1657,13 +1673,22 @@ impl ServerHandle {
                 };
                 if needs_track {
                     let stream_id = format!("motionstage-{device_id}");
-                    peer.add_h264_track(&stream_id, "video")
+                    let codec = {
+                        let state = self.state.read().await;
+                        state
+                            .master_video_descriptor
+                            .as_ref()
+                            .map(|d| d.codec)
+                            .unwrap_or(VideoCodec::H264)
+                    };
+                    peer.add_video_track(codec, &stream_id, "video")
                         .await
                         .map_err(|err| ServerError::WebRtc(err.to_string()))?;
                     let mut state = self.state.write().await;
                     if let Some(entry) = state.video_peers.get_mut(&device_id) {
                         entry.track_added = true;
                     }
+                    state.video_keyframe_needed = true;
                 }
 
                 let answer = peer
@@ -1694,14 +1719,16 @@ impl ServerHandle {
         data: Bytes,
         duration: Duration,
     ) -> Result<(), ServerError> {
-        let state = self.state.read().await;
-        let peers_with_tracks: Vec<Arc<WebRtcSession>> = state
-            .video_peers
-            .values()
-            .filter(|entry| entry.track_added)
-            .map(|entry| Arc::clone(&entry.peer))
-            .collect();
-        drop(state);
+        let peers_with_tracks: Vec<Arc<WebRtcSession>> = {
+            let mut state = self.state.write().await;
+            state.last_video_frame_ns = Some(now_ns());
+            state
+                .video_peers
+                .values()
+                .filter(|entry| entry.track_added)
+                .map(|entry| Arc::clone(&entry.peer))
+                .collect()
+        };
 
         for peer in peers_with_tracks {
             if let Err(err) = peer.write_sample(data.clone(), duration).await {
@@ -1709,6 +1736,40 @@ impl ServerHandle {
             }
         }
         Ok(())
+    }
+
+    /// Returns `true` (once) if a new video peer was added since the last call.
+    /// The caller should force an IDR keyframe so the new peer can start decoding.
+    pub async fn take_keyframe_needed(&self) -> bool {
+        let mut state = self.state.write().await;
+        let needed = state.video_keyframe_needed;
+        state.video_keyframe_needed = false;
+        needed
+    }
+
+    pub async fn video_stream_status(&self) -> VideoStreamStatus {
+        let state = self.state.read().await;
+        let descriptor_set = state.master_video_descriptor.is_some();
+        let peer_count = state
+            .video_peers
+            .values()
+            .filter(|entry| entry.track_added)
+            .count() as u32;
+        let now = now_ns();
+        let last_frame_age_ms = state
+            .last_video_frame_ns
+            .map(|last| now.saturating_sub(last) / 1_000_000);
+        let recent_frame = state
+            .last_video_frame_ns
+            .map(|last| now.saturating_sub(last) <= VIDEO_STREAM_ACTIVITY_WINDOW_NS)
+            .unwrap_or(false);
+
+        VideoStreamStatus {
+            available: descriptor_set && recent_frame,
+            descriptor_set,
+            peer_count,
+            last_frame_age_ms,
+        }
     }
 
     pub async fn video_peer_count(&self) -> u32 {
@@ -1840,7 +1901,14 @@ async fn handle_set_data_flow(
     state: DataFlowState,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to change mode".into(),
+        )
+        .await
+        .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
@@ -1855,7 +1923,10 @@ async fn handle_set_data_flow(
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
         Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
                 let _ = server.close_session(client_hello.device_id, now_ns()).await;
                 return Ok(ControlFlow::Break(()));
             }
@@ -1871,7 +1942,14 @@ async fn handle_set_recording(
     state: RecordingState,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to change mode".into(),
+        )
+        .await
+        .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
@@ -1886,7 +1964,10 @@ async fn handle_set_recording(
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
         Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
                 let _ = server.close_session(client_hello.device_id, now_ns()).await;
                 return Ok(ControlFlow::Break(()));
             }
@@ -1902,39 +1983,60 @@ async fn handle_baseline_control(
     msg: ControlMessage,
 ) -> Result<HandlerOutcome, ServerError> {
     let reject_reason = match &msg {
-        ControlMessage::ResetSceneToBaseline { .. } => "operator role is required to reset baseline",
-        ControlMessage::CommitSceneBaseline { .. } => "operator role is required to commit scene baseline",
-        ControlMessage::CommitObjectBaseline { .. } => "operator role is required to commit object baseline",
+        ControlMessage::ResetSceneToBaseline { .. } => {
+            "operator role is required to reset baseline"
+        }
+        ControlMessage::CommitSceneBaseline { .. } => {
+            "operator role is required to commit scene baseline"
+        }
+        ControlMessage::CommitObjectBaseline { .. } => {
+            "operator role is required to commit object baseline"
+        }
         _ => unreachable!(),
     };
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
         return Ok(ControlFlow::Continue(()));
     }
     let result: Result<(BaselineAction, u32), ServerError> = match msg {
-        ControlMessage::ResetSceneToBaseline { scene_id } => {
-            server.reset_scene_to_baseline(scene_id).await.map(|n| (BaselineAction::ResetScene, n))
-        }
-        ControlMessage::CommitSceneBaseline { scene_id } => {
-            server.commit_scene_baseline(scene_id).await.map(|n| (BaselineAction::CommitScene, n))
-        }
-        ControlMessage::CommitObjectBaseline { scene_id, object_id } => {
-            server.commit_object_baseline(scene_id, object_id).await.map(|n| (BaselineAction::CommitObject, n))
-        }
+        ControlMessage::ResetSceneToBaseline { scene_id } => server
+            .reset_scene_to_baseline(scene_id)
+            .await
+            .map(|n| (BaselineAction::ResetScene, n)),
+        ControlMessage::CommitSceneBaseline { scene_id } => server
+            .commit_scene_baseline(scene_id)
+            .await
+            .map(|n| (BaselineAction::CommitScene, n)),
+        ControlMessage::CommitObjectBaseline {
+            scene_id,
+            object_id,
+        } => server
+            .commit_object_baseline(scene_id, object_id)
+            .await
+            .map(|n| (BaselineAction::CommitObject, n)),
         _ => unreachable!(),
     };
     match result {
         Ok((action, changed_attributes)) => {
             control
-                .send(&ControlMessage::BaselineActionApplied { action, changed_attributes })
+                .send(&ControlMessage::BaselineActionApplied {
+                    action,
+                    changed_attributes,
+                })
                 .await
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
         Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
                 let _ = server.close_session(client_hello.device_id, now_ns()).await;
                 return Ok(ControlFlow::Break(()));
             }
@@ -1956,7 +2058,10 @@ async fn handle_take_management(
         _ => unreachable!(),
     };
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
@@ -1970,38 +2075,42 @@ async fn handle_take_management(
                 .await
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
-        ControlMessage::SelectTake { take_id } => {
-            match server.select_take(take_id).await {
-                Ok(selected) => {
-                    control
-                        .send(&ControlMessage::TakeSelected { take_id: selected.take_id })
-                        .await
-                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                }
-                Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                        return Ok(ControlFlow::Break(()));
-                    }
+        ControlMessage::SelectTake { take_id } => match server.select_take(take_id).await {
+            Ok(selected) => {
+                control
+                    .send(&ControlMessage::TakeSelected {
+                        take_id: selected.take_id,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
                 }
             }
-        }
-        ControlMessage::DeleteTake { take_id } => {
-            match server.delete_take(take_id).await {
-                Ok(()) => {
-                    control
-                        .send(&ControlMessage::TakeDeleted { take_id })
-                        .await
-                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                }
-                Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                        return Ok(ControlFlow::Break(()));
-                    }
+        },
+        ControlMessage::DeleteTake { take_id } => match server.delete_take(take_id).await {
+            Ok(()) => {
+                control
+                    .send(&ControlMessage::TakeDeleted { take_id })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
                 }
             }
-        }
+        },
         _ => unreachable!(),
     }
     Ok(ControlFlow::Continue(()))
@@ -2017,7 +2126,14 @@ async fn handle_playback_control(
     looping: bool,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, "operator role is required to control playback".into()).await.is_err() {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to control playback".into(),
+        )
+        .await
+        .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
@@ -2035,12 +2151,20 @@ async fn handle_playback_control(
     match result {
         Ok((state, playhead_ns, looping)) => {
             control
-                .send(&ControlMessage::PlaybackState { take_id, state, playhead_ns, looping })
+                .send(&ControlMessage::PlaybackState {
+                    take_id,
+                    state,
+                    playhead_ns,
+                    looping,
+                })
                 .await
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
         Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
                 let _ = server.close_session(client_hello.device_id, now_ns()).await;
                 return Ok(ControlFlow::Break(()));
             }
@@ -2056,80 +2180,129 @@ async fn handle_bake_cursor(
     msg: ControlMessage,
 ) -> Result<HandlerOutcome, ServerError> {
     let reject_reason = match &msg {
-        ControlMessage::OpenTakeBakeCursor { .. } => "operator role is required to open bake cursors",
+        ControlMessage::OpenTakeBakeCursor { .. } => {
+            "operator role is required to open bake cursors"
+        }
         ControlMessage::ReadTakeBakeFrame { .. } => "operator role is required to read bake frames",
         ControlMessage::SeekTakeBakeFrame { .. } => "operator role is required to seek bake frames",
-        ControlMessage::CloseTakeBakeCursor { .. } => "operator role is required to close bake cursors",
+        ControlMessage::CloseTakeBakeCursor { .. } => {
+            "operator role is required to close bake cursors"
+        }
         _ => unreachable!(),
     };
     if !client_hello.roles.contains(&ClientRole::Operator) {
-        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into()).await.is_err() {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Ok(ControlFlow::Break(()));
         }
         return Ok(ControlFlow::Continue(()));
     }
     match msg {
-        ControlMessage::OpenTakeBakeCursor { take_id, sampling_mode } => {
-            match server.open_take_bake_cursor(take_id, sampling_mode).await {
-                Ok((cursor_id, total_frames)) => {
-                    control
-                        .send(&ControlMessage::TakeBakeCursorOpened { cursor_id, total_frames })
-                        .await
-                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                }
-                Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                        return Ok(ControlFlow::Break(()));
-                    }
+        ControlMessage::OpenTakeBakeCursor {
+            take_id,
+            sampling_mode,
+        } => match server.open_take_bake_cursor(take_id, sampling_mode).await {
+            Ok((cursor_id, total_frames)) => {
+                control
+                    .send(&ControlMessage::TakeBakeCursorOpened {
+                        cursor_id,
+                        total_frames,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
                 }
             }
-        }
+        },
         ControlMessage::ReadTakeBakeFrame { cursor_id } => {
             match server.read_take_bake_frame(cursor_id).await {
                 Ok(Some((frame_index, timestamp_ns, attributes))) => {
                     control
-                        .send(&ControlMessage::TakeBakeFrame { cursor_id, frame_index, timestamp_ns, attributes })
+                        .send(&ControlMessage::TakeBakeFrame {
+                            cursor_id,
+                            frame_index,
+                            timestamp_ns,
+                            attributes,
+                        })
                         .await
                         .map_err(|err| ServerError::Runtime(err.to_string()))?;
                 }
                 Ok(None) => {
-                    if send_protocol_error(control, RejectCode::ServerBusy, "bake cursor reached end of stream".into()).await.is_err() {
+                    if send_protocol_error(
+                        control,
+                        RejectCode::ServerBusy,
+                        "bake cursor reached end of stream".into(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         return Ok(ControlFlow::Break(()));
                     }
                 }
                 Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         return Ok(ControlFlow::Break(()));
                     }
                 }
             }
         }
-        ControlMessage::SeekTakeBakeFrame { cursor_id, frame_index } => {
-            match server.seek_take_bake_frame(cursor_id, frame_index).await {
-                Ok(Some((resolved_index, timestamp_ns, attributes))) => {
-                    control
-                        .send(&ControlMessage::TakeBakeFrame { cursor_id, frame_index: resolved_index, timestamp_ns, attributes })
-                        .await
-                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                }
-                Ok(None) => {
-                    if send_protocol_error(control, RejectCode::ServerBusy, "bake seek was out of range".into()).await.is_err() {
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                        return Ok(ControlFlow::Break(()));
-                    }
+        ControlMessage::SeekTakeBakeFrame {
+            cursor_id,
+            frame_index,
+        } => match server.seek_take_bake_frame(cursor_id, frame_index).await {
+            Ok(Some((resolved_index, timestamp_ns, attributes))) => {
+                control
+                    .send(&ControlMessage::TakeBakeFrame {
+                        cursor_id,
+                        frame_index: resolved_index,
+                        timestamp_ns,
+                        attributes,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Ok(None) => {
+                if send_protocol_error(
+                    control,
+                    RejectCode::ServerBusy,
+                    "bake seek was out of range".into(),
+                )
+                .await
+                .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
                 }
             }
-        }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        },
         ControlMessage::CloseTakeBakeCursor { cursor_id } => {
             match server.close_take_bake_cursor(cursor_id).await {
                 Ok(()) => {
@@ -2139,7 +2312,14 @@ async fn handle_bake_cursor(
                         .map_err(|err| ServerError::Runtime(err.to_string()))?;
                 }
                 Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         return Ok(ControlFlow::Break(()));
                     }
@@ -2158,8 +2338,21 @@ async fn handle_video_signaling(
     msg: ControlMessage,
 ) -> Result<HandlerOutcome, ServerError> {
     match msg {
-        ControlMessage::CreateVideoOffer { stream_id, track_id } => {
-            match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
+        ControlMessage::GetVideoStreamStatus => {
+            let status = server.video_stream_status().await;
+            control
+                .send(&ControlMessage::VideoStreamStatus(status))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        ControlMessage::CreateVideoOffer {
+            stream_id,
+            track_id,
+        } => {
+            match server
+                .create_video_offer(client_hello.device_id, &stream_id, &track_id)
+                .await
+            {
                 Ok(offer) => {
                     control
                         .send(&ControlMessage::VideoOffer(offer))
@@ -2167,7 +2360,14 @@ async fn handle_video_signaling(
                         .map_err(|err| ServerError::Runtime(err.to_string()))?;
                 }
                 Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         return Ok(ControlFlow::Break(()));
                     }
@@ -2176,14 +2376,24 @@ async fn handle_video_signaling(
         }
         ControlMessage::VideoSignal(signal) => {
             if signal.from_device != client_hello.device_id {
-                if send_protocol_error(control, RejectCode::RoleDenied, "signal from_device does not match active session".into()).await.is_err() {
+                if send_protocol_error(
+                    control,
+                    RejectCode::RoleDenied,
+                    "signal from_device does not match active session".into(),
+                )
+                .await
+                .is_err()
+                {
                     let _ = server.close_session(client_hello.device_id, now_ns()).await;
                     return Ok(ControlFlow::Break(()));
                 }
                 return Ok(ControlFlow::Continue(()));
             }
             if signal.to_device == client_hello.device_id {
-                match server.handle_video_signal(client_hello.device_id, signal.payload).await {
+                match server
+                    .handle_video_signal(client_hello.device_id, signal.payload)
+                    .await
+                {
                     Ok(Some(answer)) => {
                         control
                             .send(&ControlMessage::VideoOffer(answer))
@@ -2192,21 +2402,34 @@ async fn handle_video_signaling(
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                        if send_protocol_error(
+                            control,
+                            map_server_error_to_reject(&err),
+                            err.to_string(),
+                        )
+                        .await
+                        .is_err()
+                        {
                             let _ = server.close_session(client_hello.device_id, now_ns()).await;
                             return Ok(ControlFlow::Break(()));
                         }
                     }
                 }
             } else if let Err(err) = server.push_signaling_message(signal).await {
-                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
                     let _ = server.close_session(client_hello.device_id, now_ns()).await;
                     return Ok(ControlFlow::Break(()));
                 }
             }
         }
         ControlMessage::DrainSignals => {
-            match server.drain_signaling_messages(client_hello.device_id).await {
+            match server
+                .drain_signaling_messages(client_hello.device_id)
+                .await
+            {
                 Ok(messages) => {
                     control
                         .send(&ControlMessage::SignalsBatch(messages))
@@ -2214,7 +2437,14 @@ async fn handle_video_signaling(
                         .map_err(|err| ServerError::Runtime(err.to_string()))?;
                 }
                 Err(err) => {
-                    if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
                         return Ok(ControlFlow::Break(()));
                     }
@@ -2297,6 +2527,7 @@ async fn handle_quic_peer(
 
     server.scene_synced(client_hello.device_id).await?;
     server.activate(client_hello.device_id).await?;
+    let mut mode_updates = server.subscribe_mode_updates();
 
     loop {
         tokio::select! {
@@ -2366,6 +2597,7 @@ async fn handle_quic_peer(
                         }
                     }
                     Ok(msg @ (ControlMessage::CreateVideoOffer { .. }
+                        | ControlMessage::GetVideoStreamStatus
                         | ControlMessage::VideoSignal(_)
                         | ControlMessage::DrainSignals)) => {
                         match handle_video_signaling(&mut control, &server, &client_hello, msg).await? {
@@ -2375,6 +2607,7 @@ async fn handle_quic_peer(
                     }
                     Ok(ControlMessage::SignalsBatch(_))
                     | Ok(ControlMessage::VideoOffer(_))
+                    | Ok(ControlMessage::VideoStreamStatus(_))
                     | Ok(ControlMessage::ModeState(_))
                     | Ok(ControlMessage::BaselineActionApplied { .. })
                     | Ok(ControlMessage::TakeList { .. })
@@ -2414,6 +2647,22 @@ async fn handle_quic_peer(
                     Err(_) => {
                         warn!(device_id = %client_hello.device_id, "motion datagram channel closed; ending session");
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        break;
+                    }
+                }
+            }
+            mode_update = mode_updates.recv() => {
+                match mode_update {
+                    Ok(active_mode) => {
+                        if control.send(&ControlMessage::ModeState(active_mode)).await.is_err() {
+                            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
                         break;
                     }
                 }
@@ -2581,14 +2830,15 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, time::Duration};
 
     use motionstage_core::{
         AttributeUpdate, AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject,
     };
     use motionstage_media::{
         ColorPrimaries, DynamicRange, IceCandidate, SdpMessage, SdpType, SignalMessage,
-        SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoStreamDescriptor,
+        SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoCodec,
+        VideoStreamDescriptor,
     };
     use motionstage_protocol::{
         AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole,
@@ -2629,7 +2879,10 @@ mod tests {
                 roles: vec![role],
                 features: vec![feature],
                 advertised_attributes: if role == ClientRole::MotionSource {
-                    vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }]
+                    vec![AttributeDescriptor {
+                        path: "pose_pos".into(),
+                        value_type: AttributeKind::Vec3f,
+                    }]
                 } else {
                     Vec::new()
                 },
@@ -2666,7 +2919,10 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -2696,7 +2952,10 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -2732,7 +2991,10 @@ mod tests {
                     device_name: "ipad".into(),
                     roles: vec![ClientRole::MotionSource],
                     features: vec![Feature::Motion],
-                    advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                    advertised_attributes: vec![AttributeDescriptor {
+                        path: "pose_pos".into(),
+                        value_type: AttributeKind::Vec3f,
+                    }],
                 })
                 .await
                 .unwrap();
@@ -2826,7 +3088,10 @@ mod tests {
         assert!(recording.markers.iter().any(|marker| matches!(
             marker,
             RecordingMarker::ModeTransition {
-                to: Mode { recording: RecordingState::Recording, .. },
+                to: Mode {
+                    recording: RecordingState::Recording,
+                    ..
+                },
                 ..
             }
         )));
@@ -2855,7 +3120,10 @@ mod tests {
                 device_name: "controller".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -2888,6 +3156,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2898,6 +3167,7 @@ mod tests {
                 max_width: 1920,
                 max_height: 1080,
                 max_fps: 24,
+                supported_codecs: vec![VideoCodec::H264],
             })
             .await
             .unwrap();
@@ -2920,6 +3190,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2975,6 +3246,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -3081,7 +3353,10 @@ mod tests {
                     roles: vec![role],
                     features: vec![feature],
                     advertised_attributes: if role == ClientRole::MotionSource {
-                        vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }]
+                        vec![AttributeDescriptor {
+                            path: "pose_pos".into(),
+                            value_type: AttributeKind::Vec3f,
+                        }]
                     } else {
                         Vec::new()
                     },
@@ -3163,7 +3438,10 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap_err();
@@ -3206,6 +3484,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -3234,6 +3513,72 @@ mod tests {
                 assert!(!sdp.sdp.is_empty());
             }
             other => panic!("expected video offer response, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_control_can_query_video_stream_status() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+        let device_id = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::VideoSink,
+            Feature::Video,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::GetVideoStreamStatus)
+            .await
+            .unwrap();
+        let initial = control.recv().await.unwrap();
+        match initial {
+            ControlMessage::VideoStreamStatus(status) => {
+                assert!(!status.available);
+                assert!(!status.descriptor_set);
+                assert_eq!(status.peer_count, 0);
+                assert_eq!(status.last_frame_age_ms, None);
+            }
+            other => panic!("expected VideoStreamStatus response, got {other:?}"),
+        }
+
+        server
+            .set_master_video_descriptor(VideoStreamDescriptor {
+                width: 1920,
+                height: 1080,
+                fps: 24,
+                dynamic_range: DynamicRange::Hdr10,
+                color_primaries: ColorPrimaries::Bt2020,
+                transfer: TransferFunction::Pq,
+                bit_depth: 10,
+                codec: VideoCodec::Vp9,
+            })
+            .await
+            .unwrap();
+        server
+            .push_video_frame(bytes::Bytes::from_static(b"frame"), Duration::from_millis(33))
+            .await
+            .unwrap();
+
+        control
+            .send(&ControlMessage::GetVideoStreamStatus)
+            .await
+            .unwrap();
+        let active = control.recv().await.unwrap();
+        match active {
+            ControlMessage::VideoStreamStatus(status) => {
+                assert!(status.available);
+                assert!(status.descriptor_set);
+                assert_eq!(status.peer_count, 0);
+                assert!(status.last_frame_age_ms.is_some());
+            }
+            other => panic!("expected VideoStreamStatus response, got {other:?}"),
         }
 
         runtime.shutdown().await.unwrap();
@@ -3294,6 +3639,49 @@ mod tests {
             ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_change_is_broadcast_to_other_active_clients() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer_a, mut control_a) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+        let (_peer_b, mut control_b) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control_b
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
+            .await
+            .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), control_b.recv())
+            .await
+            .expect("requesting client should get mode ack")
+            .unwrap();
+        assert!(matches!(ack, ControlMessage::ModeState(Mode::LIVE)));
+
+        let pushed = tokio::time::timeout(Duration::from_secs(1), control_a.recv())
+            .await
+            .expect("other active client should get mode broadcast")
+            .unwrap();
+        assert!(matches!(pushed, ControlMessage::ModeState(Mode::LIVE)));
 
         runtime.shutdown().await.unwrap();
     }
@@ -3498,7 +3886,10 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec![AttributeDescriptor { path: "pose_pos".into(), value_type: AttributeKind::Vec3f }],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             }))
             .await
             .unwrap();

@@ -423,6 +423,9 @@ class MotionStageServer:
     def push_video_frame(self, frame_data: bytes, timestamp_ns: int) -> None:
         self._native.push_video_frame(frame_data, timestamp_ns)
 
+    def push_video_frame_bgra(self, frame_data: bytes, timestamp_ns: int) -> None:
+        self._native.push_video_frame_bgra(frame_data, timestamp_ns)
+
     def video_peer_count(self) -> int:
         return self._native.video_peer_count()
 

@@ -20,4 +20,5 @@ The script writes the required artifact to:
 - `connect(serverAddress:pairingToken:apiKey:)`
 - `sendPosition(x:y:z:)`
 - `setMode(_:)`
+- `videoStreamStatus()`
 - `sessionID`, `deviceID`, `lastErrorMessage`

@@ -13,6 +13,8 @@ tokio.workspace = true
 uuid.workspace = true
 motionstage-protocol.workspace = true
 motionstage-transport-quic = { workspace = true, features = ["insecure"] }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 motionstage-server.workspace = true

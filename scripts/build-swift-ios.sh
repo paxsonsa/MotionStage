@@ -8,6 +8,7 @@ HEADER_DIR="$ROOT_DIR/crates/motionstage-sdk-swift/include"
 BUILD_DIR="$ROOT_DIR/target/swift-ios"
 DIST_XCFRAMEWORK="$ROOT_DIR/dist/MotionStageSwiftFFI.xcframework"
 SPM_XCFRAMEWORK="$ROOT_DIR/swift/MotionStageClient/Artifacts/MotionStageSwiftFFI.xcframework"
+IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-26.0}"
 
 IOS_TARGETS=(
   "aarch64-apple-ios"
@@ -30,8 +31,36 @@ done
 rustup target add "${IOS_TARGETS[@]}"
 
 for target in "${IOS_TARGETS[@]}"; do
+  case "$target" in
+    aarch64-apple-ios)
+      target_rustflags="-C link-arg=-miphoneos-version-min=$IOS_DEPLOYMENT_TARGET"
+      target_cflags="-miphoneos-version-min=$IOS_DEPLOYMENT_TARGET"
+      ;;
+    aarch64-apple-ios-sim|x86_64-apple-ios)
+      target_rustflags="-C link-arg=-mios-simulator-version-min=$IOS_DEPLOYMENT_TARGET"
+      target_cflags="-mios-simulator-version-min=$IOS_DEPLOYMENT_TARGET"
+      ;;
+    *)
+      target_rustflags=""
+      target_cflags=""
+      ;;
+  esac
+
+  if [[ -n "${RUSTFLAGS:-}" ]]; then
+    target_rustflags="${RUSTFLAGS} ${target_rustflags}"
+  fi
+
   echo "Building motionstage-sdk-swift for $target..."
-  cargo build \
+  target_env_suffix="${target//-/_}"
+  target_cflags_key="CFLAGS_${target_env_suffix}"
+  target_cxxflags_key="CXXFLAGS_${target_env_suffix}"
+
+  env \
+    "RUSTFLAGS=$target_rustflags" \
+    "IPHONEOS_DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET" \
+    "$target_cflags_key=$target_cflags" \
+    "$target_cxxflags_key=$target_cflags" \
+    cargo build \
     --manifest-path "$CRATE_MANIFEST" \
     --release \
     --target "$target" \

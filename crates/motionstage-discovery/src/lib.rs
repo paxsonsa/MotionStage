@@ -173,12 +173,19 @@ impl DiscoveryBrowser {
         &self,
         timeout: Duration,
     ) -> Result<Option<DiscoveredService>, DiscoveryError> {
-        let Some(event) = self.recv_timeout(timeout)? else {
-            return Ok(None);
-        };
-        match event {
-            ServiceEvent::ServiceResolved(info) => Ok(Some(DiscoveredService::from_info(&info))),
-            _ => Ok(None),
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline.duration_since(now);
+            let Some(event) = self.recv_timeout(remaining)? else {
+                return Ok(None);
+            };
+            if let ServiceEvent::ServiceResolved(info) = event {
+                return Ok(Some(DiscoveredService::from_info(&info)));
+            }
         }
     }
 
@@ -226,9 +233,7 @@ impl DiscoveredService {
         let protocol_minor = info
             .get_property_val_str("proto_minor")
             .and_then(|v| v.parse::<u16>().ok());
-        let cert_fingerprint = info
-            .get_property_val_str("cert_fp")
-            .map(str::to_owned);
+        let cert_fingerprint = info.get_property_val_str("cert_fp").map(str::to_owned);
 
         Self {
             service_name,

@@ -2,6 +2,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::{
+    collections::VecDeque,
     ffi::{CStr, CString},
     net::SocketAddr,
     os::raw::{c_char, c_void},
@@ -16,16 +17,17 @@ use std::{
 
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole, ControlMessage,
-    DataFlowState, Feature, Mode, RecordingState, RegisterRequest, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    DataFlowState, Feature, IceCandidate, Mode, RecordingState, RegisterRequest, SdpMessage,
+    SdpType, SignalMessage, SignalPayload, VideoStreamStatus, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_transport_quic::{
     hex_decode_fingerprint, AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient,
     QuicPeer,
 };
 use tokio::runtime::Runtime;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use uuid::Uuid;
+use serde::Serialize;
 
 pub const MOTIONSTAGE_SWIFT_STATUS_OK: i32 = 0;
 pub const MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -66,6 +68,9 @@ pub const MOTIONSTAGE_SWIFT_EVENT_CONNECTED: i32 = 0;
 pub const MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED: i32 = 1;
 pub const MOTIONSTAGE_SWIFT_EVENT_RECONNECTING: i32 = 2;
 pub const MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED: i32 = 3;
+
+pub const MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER: i32 = 0;
+pub const MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER: i32 = 1;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MODE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -154,6 +159,24 @@ pub struct MotionAttributeUpdateC {
     pub attribute: *const c_char,
     pub data: *const f32,
     pub component_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VideoSignalJson {
+    Sdp {
+        from_device: String,
+        to_device: String,
+        sdp_type: String,
+        sdp: String,
+    },
+    Ice {
+        from_device: String,
+        to_device: String,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +270,10 @@ struct MotionStageSwiftClientInner {
     reset_scene_timeout: Duration,
     /// Shared with the ping thread; stamped on each datagram send.
     last_send_ns: Arc<AtomicU64>,
+    pending_mode_states: VecDeque<Mode>,
+    pending_video_offers: VecDeque<SdpMessage>,
+    pending_video_signals: VecDeque<SignalMessage>,
+    pending_video_statuses: VecDeque<VideoStreamStatus>,
 }
 
 struct ConnectedSession {
@@ -257,6 +284,260 @@ struct ConnectedSession {
 }
 
 impl MotionStageSwiftClientInner {
+    fn stash_control_message(&mut self, message: ControlMessage) {
+        match message {
+            ControlMessage::ModeState(mode) => {
+                self.pending_mode_states.push_back(mode);
+            }
+            ControlMessage::VideoOffer(offer) => {
+                self.pending_video_offers.push_back(offer);
+            }
+            ControlMessage::SignalsBatch(signals) => {
+                self.pending_video_signals.extend(signals);
+            }
+            ControlMessage::VideoStreamStatus(status) => {
+                self.pending_video_statuses.push_back(status);
+            }
+            _ => {}
+        }
+    }
+
+    fn drain_control_backlog(&mut self) -> Result<(), String> {
+        let session = match self.session.as_mut() {
+            Some(session) => session,
+            None => return Ok(()),
+        };
+
+        let mut drained = Vec::new();
+        get_runtime().block_on(async {
+            loop {
+                let recv = timeout(Duration::from_millis(1), session.control.recv()).await;
+                match recv {
+                    Ok(Ok(message)) => drained.push(message),
+                    Ok(Err(err)) => {
+                        return Err(format!("failed to drain control backlog: {err}"));
+                    }
+                    Err(_) => return Ok(()),
+                }
+            }
+        })?;
+
+        for message in drained {
+            self.stash_control_message(message);
+        }
+        Ok(())
+    }
+
+    fn recv_control_with_timeout(&mut self, timeout_dur: Duration) -> Result<ControlMessage, String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime().block_on(async {
+            timeout(timeout_dur, session.control.recv())
+                .await
+                .map_err(|_| "timed out waiting for control response".to_owned())?
+                .map_err(|err| format!("failed to receive control response: {err}"))
+        })
+    }
+
+    fn pop_mode_state_matching<F>(&mut self, accept: F) -> Option<(i32, i32)>
+    where
+        F: Fn(&Mode) -> bool,
+    {
+        let index = self.pending_mode_states.iter().position(accept)?;
+        let mode = self.pending_mode_states.remove(index)?;
+        Some((mode_to_data_flow_i32(&mode), mode_to_recording_i32(&mode)))
+    }
+
+    fn sdp_type_to_i32(sdp_type: SdpType) -> i32 {
+        match sdp_type {
+            SdpType::Offer => MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER,
+            SdpType::Answer => MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER,
+        }
+    }
+
+    fn parse_sdp_type(raw: i32) -> Result<SdpType, String> {
+        match raw {
+            MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER => Ok(SdpType::Offer),
+            MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER => Ok(SdpType::Answer),
+            _ => Err(format!("invalid SDP type value `{raw}`")),
+        }
+    }
+
+    fn create_video_offer(&mut self, stream_id: &str, track_id: &str) -> Result<SdpMessage, String> {
+        self.drain_control_backlog()?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime()
+            .block_on(session.control.send(&ControlMessage::CreateVideoOffer {
+                stream_id: stream_id.to_owned(),
+                track_id: track_id.to_owned(),
+            }))
+            .map_err(|err| format!("failed to send CreateVideoOffer: {err}"))?;
+
+        if let Some(offer) = self.pending_video_offers.pop_front() {
+            return Ok(offer);
+        }
+
+        let deadline = Instant::now() + self.mode_reply_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for video offer".to_owned());
+            }
+            match self.recv_control_with_timeout(remaining)? {
+                ControlMessage::VideoOffer(offer) => return Ok(offer),
+                ControlMessage::Error { code, reason } => {
+                    return Err(format!("video offer request rejected: code={code:?} reason={reason}"));
+                }
+                ControlMessage::Pong => continue,
+                other => self.stash_control_message(other),
+            }
+        }
+    }
+
+    fn send_video_sdp(&mut self, sdp_type: i32, sdp: &str) -> Result<(), String> {
+        let payload = SignalPayload::Sdp(SdpMessage {
+            ty: Self::parse_sdp_type(sdp_type)?,
+            sdp: sdp.to_owned(),
+        });
+        self.send_video_signal(payload)
+    }
+
+    fn send_video_ice(
+        &mut self,
+        candidate: &str,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), String> {
+        let payload = SignalPayload::Ice(IceCandidate {
+            candidate: candidate.to_owned(),
+            sdp_mid,
+            sdp_mline_index,
+        });
+        self.send_video_signal(payload)
+    }
+
+    fn send_video_signal(&mut self, payload: SignalPayload) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime()
+            .block_on(session.control.send(&ControlMessage::VideoSignal(SignalMessage {
+                from_device: self.device_id,
+                to_device: self.device_id,
+                payload,
+            })))
+            .map_err(|err| format!("failed to send video signal: {err}"))
+    }
+
+    fn drain_video_signals(&mut self) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime()
+            .block_on(session.control.send(&ControlMessage::DrainSignals))
+            .map_err(|err| format!("failed to send DrainSignals: {err}"))?;
+
+        let deadline = Instant::now() + self.mode_reply_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for video signals batch".to_owned());
+            }
+            match self.recv_control_with_timeout(remaining)? {
+                ControlMessage::SignalsBatch(signals) => {
+                    self.pending_video_signals.extend(signals);
+                    return Ok(());
+                }
+                ControlMessage::Error { code, reason } => {
+                    return Err(format!("drain signals rejected: code={code:?} reason={reason}"));
+                }
+                ControlMessage::Pong => continue,
+                other => self.stash_control_message(other),
+            }
+        }
+    }
+
+    fn next_video_signal_json(&mut self) -> Result<Option<String>, String> {
+        if self.pending_video_signals.is_empty() {
+            self.drain_video_signals()?;
+        }
+
+        let Some(signal) = self.pending_video_signals.pop_front() else {
+            return Ok(None);
+        };
+
+        let json = match signal.payload {
+            SignalPayload::Sdp(sdp) => {
+                let sdp_type = match sdp.ty {
+                    SdpType::Offer => "offer".to_owned(),
+                    SdpType::Answer => "answer".to_owned(),
+                };
+                VideoSignalJson::Sdp {
+                    from_device: signal.from_device.to_string(),
+                    to_device: signal.to_device.to_string(),
+                    sdp_type,
+                    sdp: sdp.sdp,
+                }
+            }
+            SignalPayload::Ice(ice) => VideoSignalJson::Ice {
+                from_device: signal.from_device.to_string(),
+                to_device: signal.to_device.to_string(),
+                candidate: ice.candidate,
+                sdp_mid: ice.sdp_mid,
+                sdp_mline_index: ice.sdp_mline_index,
+            },
+        };
+
+        serde_json::to_string(&json)
+            .map(Some)
+            .map_err(|err| format!("failed to serialize video signal JSON: {err}"))
+    }
+
+    fn get_video_stream_status(&mut self) -> Result<VideoStreamStatus, String> {
+        self.drain_control_backlog()?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "client is not connected".to_owned())?;
+
+        get_runtime()
+            .block_on(session.control.send(&ControlMessage::GetVideoStreamStatus))
+            .map_err(|err| format!("failed to send GetVideoStreamStatus: {err}"))?;
+
+        if let Some(status) = self.pending_video_statuses.pop_front() {
+            return Ok(status);
+        }
+
+        let deadline = Instant::now() + self.mode_reply_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for video stream status".to_owned());
+            }
+            match self.recv_control_with_timeout(remaining)? {
+                ControlMessage::VideoStreamStatus(status) => return Ok(status),
+                ControlMessage::Error { code, reason } => {
+                    return Err(format!(
+                        "video stream status request rejected: code={code:?} reason={reason}"
+                    ));
+                }
+                ControlMessage::Pong => continue,
+                other => self.stash_control_message(other),
+            }
+        }
+    }
+
     fn clear_error(&mut self) {
         self.last_error = None;
     }
@@ -269,11 +550,9 @@ impl MotionStageSwiftClientInner {
     fn disconnect(&mut self) {
         if let Some(mut session) = self.session.take() {
             // Best-effort goodbye — ignore errors (connection may already be broken).
-            let _ = get_runtime().block_on(session.control.send(
-                &ControlMessage::ClientGoodbye {
-                    reason: Some("client disconnect".into()),
-                },
-            ));
+            let _ = get_runtime().block_on(session.control.send(&ControlMessage::ClientGoodbye {
+                reason: Some("client disconnect".into()),
+            }));
             let _ = session.control.finish();
         }
     }
@@ -407,111 +686,111 @@ impl MotionStageSwiftClientInner {
     }
 
     fn reset_scene(&mut self) -> Result<(), String> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| "client is not connected".to_owned())?;
+        self.drain_control_backlog()?;
+        {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| "client is not connected".to_owned())?;
 
-        get_runtime()
-            .block_on(
-                session
-                    .control
-                    .send(&ControlMessage::ResetSceneToBaseline { scene_id: None }),
-            )
-            .map_err(|err| format!("failed to send ResetSceneToBaseline: {err}"))?;
+            get_runtime()
+                .block_on(
+                    session
+                        .control
+                        .send(&ControlMessage::ResetSceneToBaseline { scene_id: None }),
+                )
+                .map_err(|err| format!("failed to send ResetSceneToBaseline: {err}"))?;
+        }
 
-        let reset_scene_timeout = self.reset_scene_timeout;
-        get_runtime().block_on(async {
-            loop {
-                let message = timeout(reset_scene_timeout, session.control.recv())
-                    .await
-                    .map_err(|_| "timed out waiting for baseline reset response".to_owned())?
-                    .map_err(|err| format!("failed to receive reset response: {err}"))?;
-
-                match message {
-                    ControlMessage::BaselineActionApplied {
-                        action: BaselineAction::ResetScene,
-                        ..
-                    } => return Ok(()),
-                    ControlMessage::Error { code, reason } => {
-                        return Err(format!(
-                            "reset scene rejected: code={code:?} reason={reason}"
-                        ))
-                    }
-                    ControlMessage::Pong => continue,
-                    _ => continue,
-                }
+        let deadline = Instant::now() + self.reset_scene_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for baseline reset response".to_owned());
             }
-        })
+
+            match self.recv_control_with_timeout(remaining)? {
+                ControlMessage::BaselineActionApplied {
+                    action: BaselineAction::ResetScene,
+                    ..
+                } => return Ok(()),
+                ControlMessage::Error { code, reason } => {
+                    return Err(format!(
+                        "reset scene rejected: code={code:?} reason={reason}"
+                    ))
+                }
+                ControlMessage::Pong => continue,
+                other => self.stash_control_message(other),
+            }
+        }
     }
 
     fn set_data_flow(&mut self, requested: i32) -> Result<(i32, i32), String> {
         let state = parse_data_flow_state(requested)?;
 
+        self.drain_control_backlog()?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| "client is not connected".to_owned())?;
-
         get_runtime()
-            .block_on(
-                session
-                    .control
-                    .send(&ControlMessage::SetDataFlow(state)),
-            )
+            .block_on(session.control.send(&ControlMessage::SetDataFlow(state)))
             .map_err(|err| format!("failed to send data-flow request: {err}"))?;
 
-        self.wait_for_mode_state()
+        self.wait_for_mode_state_matching(|mode| mode.data_flow == state)
     }
 
     fn set_recording(&mut self, requested: i32) -> Result<(i32, i32), String> {
         let state = parse_recording_state(requested)?;
 
+        self.drain_control_backlog()?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| "client is not connected".to_owned())?;
-
         get_runtime()
-            .block_on(
-                session
-                    .control
-                    .send(&ControlMessage::SetRecording(state)),
-            )
+            .block_on(session.control.send(&ControlMessage::SetRecording(state)))
             .map_err(|err| format!("failed to send recording request: {err}"))?;
 
-        self.wait_for_mode_state()
+        self.wait_for_mode_state_matching(|mode| mode.recording == state)
     }
 
-    /// Wait for a `ModeState` response and return `(data_flow_i32, recording_i32)`.
-    fn wait_for_mode_state(&mut self) -> Result<(i32, i32), String> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| "client is not connected".to_owned())?;
+    /// Wait for a `ModeState` response that satisfies `accept` and return
+    /// `(data_flow_i32, recording_i32)`.
+    fn wait_for_mode_state_matching<F>(&mut self, accept: F) -> Result<(i32, i32), String>
+    where
+        F: Fn(&Mode) -> bool,
+    {
+        if let Some(mode) = self.pop_mode_state_matching(&accept) {
+            return Ok(mode);
+        }
 
         let mode_reply_timeout = self.mode_reply_timeout;
-        get_runtime().block_on(async {
-            loop {
-                let message = timeout(mode_reply_timeout, session.control.recv())
-                    .await
-                    .map_err(|_| "timed out waiting for mode response".to_owned())?
-                    .map_err(|err| format!("failed to receive mode response: {err}"))?;
+        let deadline = Instant::now() + mode_reply_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for mode response".to_owned());
+            }
 
-                match message {
-                    ControlMessage::ModeState(mode) => {
-                        return Ok((mode_to_data_flow_i32(&mode), mode_to_recording_i32(&mode)))
+            match self.recv_control_with_timeout(remaining)? {
+                ControlMessage::ModeState(mode) => {
+                    if accept(&mode) {
+                        return Ok((mode_to_data_flow_i32(&mode), mode_to_recording_i32(&mode)));
                     }
-                    ControlMessage::Error { code, reason } => {
-                        return Err(format!(
-                            "mode request rejected: code={code:?} reason={reason}"
-                        ))
-                    }
-                    ControlMessage::Pong => continue,
-                    _ => continue,
+                    self.pending_mode_states.push_back(mode);
+                }
+                ControlMessage::Error { code, reason } => {
+                    return Err(format!(
+                        "mode request rejected: code={code:?} reason={reason}"
+                    ))
+                }
+                ControlMessage::Pong => continue,
+                other => {
+                    self.stash_control_message(other);
                 }
             }
-        })
+        }
     }
 }
 
@@ -587,8 +866,17 @@ async fn connect_with_endpoint(
             protocol_minor: PROTOCOL_MINOR,
             device_id,
             device_name,
-            roles: vec![ClientRole::MotionSource, ClientRole::Operator],
-            features: vec![Feature::Motion, Feature::Mapping, Feature::Recording],
+            roles: vec![
+                ClientRole::MotionSource,
+                ClientRole::Operator,
+                ClientRole::VideoSink,
+            ],
+            features: vec![
+                Feature::Motion,
+                Feature::Mapping,
+                Feature::Recording,
+                Feature::Video,
+            ],
             advertised_attributes: qualified_outputs,
         }))
         .await
@@ -772,6 +1060,10 @@ fn make_client_inner(
         mode_reply_timeout,
         reset_scene_timeout,
         last_send_ns,
+        pending_mode_states: VecDeque::new(),
+        pending_video_offers: VecDeque::new(),
+        pending_video_signals: VecDeque::new(),
+        pending_video_statuses: VecDeque::new(),
     })
 }
 
@@ -859,8 +1151,7 @@ fn start_connection_monitor(
                         continue;
                     }
 
-                    let client_ref =
-                        unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+                    let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
                     let mut inner = client_ref
                         .inner
                         .lock()
@@ -903,10 +1194,9 @@ fn start_connection_monitor(
                     (Some(p), Some(c)) => (p, c),
                     _ => {
                         // No reconnect policy or no saved params — stop monitoring.
-                        client_ref.connection_state.store(
-                            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-                            Ordering::Relaxed,
-                        );
+                        client_ref
+                            .connection_state
+                            .store(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED, Ordering::Relaxed);
                         fire_event(client_ref, MOTIONSTAGE_SWIFT_EVENT_DISCONNECTED, 0, None);
                         break;
                     }
@@ -992,10 +1282,9 @@ fn start_connection_monitor(
                             inner.clear_error();
                             drop(inner);
 
-                            client_ref.connection_state.store(
-                                MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED,
-                                Ordering::Relaxed,
-                            );
+                            client_ref
+                                .connection_state
+                                .store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
                             client_ref.last_send_ns.store(0, Ordering::Relaxed);
                             fire_event(
                                 client_ref,
@@ -1013,10 +1302,9 @@ fn start_connection_monitor(
                 }
 
                 if !reconnected {
-                    client_ref.connection_state.store(
-                        MOTIONSTAGE_SWIFT_CONNECTION_FAILED,
-                        Ordering::Relaxed,
-                    );
+                    client_ref
+                        .connection_state
+                        .store(MOTIONSTAGE_SWIFT_CONNECTION_FAILED, Ordering::Relaxed);
                     fire_event(
                         client_ref,
                         MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED,
@@ -1113,7 +1401,9 @@ pub extern "C" fn motionstage_swift_client_new(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
         reconnect_policy: Mutex::new(None),
         connect_params: Mutex::new(None),
         event_callback: Mutex::new(None),
@@ -1152,17 +1442,20 @@ pub extern "C" fn motionstage_swift_client_new_multi(
     }
 
     let last_send_ns = Arc::new(AtomicU64::new(0));
-    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
-        Ok(inner) => inner,
-        Err(_) => return ptr::null_mut(),
-    };
+    let inner =
+        match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
+            Ok(inner) => inner,
+            Err(_) => return ptr::null_mut(),
+        };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
         reconnect_policy: Mutex::new(None),
         connect_params: Mutex::new(None),
         event_callback: Mutex::new(None),
@@ -1207,7 +1500,12 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
     };
 
     let last_send_ns = Arc::new(AtomicU64::new(0));
-    let inner = match make_client_inner(device_name, source_outputs, config_ref, Arc::clone(&last_send_ns)) {
+    let inner = match make_client_inner(
+        device_name,
+        source_outputs,
+        config_ref,
+        Arc::clone(&last_send_ns),
+    ) {
         Ok(inner) => inner,
         Err(_) => return ptr::null_mut(),
     };
@@ -1217,7 +1515,9 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
         reconnect_policy: Mutex::new(None),
         connect_params: Mutex::new(None),
         event_callback: Mutex::new(None),
@@ -1255,17 +1555,20 @@ pub extern "C" fn motionstage_swift_client_new_v2(
     }
 
     let last_send_ns = Arc::new(AtomicU64::new(0));
-    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
-        Ok(inner) => inner,
-        Err(_) => return ptr::null_mut(),
-    };
+    let inner =
+        match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
+            Ok(inner) => inner,
+            Err(_) => return ptr::null_mut(),
+        };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
         reconnect_policy: Mutex::new(None),
         connect_params: Mutex::new(None),
         event_callback: Mutex::new(None),
@@ -1305,17 +1608,20 @@ pub extern "C" fn motionstage_swift_client_new_v3(
     }
 
     let last_send_ns = Arc::new(AtomicU64::new(0));
-    let inner = match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
-        Ok(inner) => inner,
-        Err(_) => return ptr::null_mut(),
-    };
+    let inner =
+        match make_client_inner(device_name, source_outputs, None, Arc::clone(&last_send_ns)) {
+            Ok(inner) => inner,
+            Err(_) => return ptr::null_mut(),
+        };
 
     let client = MotionStageSwiftClient {
         inner: Mutex::new(inner),
         last_send_ns,
         ping_shutdown: Arc::new(AtomicBool::new(false)),
         ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED)),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
         reconnect_policy: Mutex::new(None),
         connect_params: Mutex::new(None),
         event_callback: Mutex::new(None),
@@ -1414,16 +1720,23 @@ pub extern "C" fn motionstage_swift_client_connect(
 
             let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
             // Save connect params for reconnection.
-            *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(saved_params);
-            client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+            *client_ref
+                .connect_params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved_params);
+            client_ref
+                .connection_state
+                .store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
 
             let handle = start_connection_monitor(
                 client as usize,
                 Arc::clone(&client_ref.last_send_ns),
                 Arc::clone(&client_ref.ping_shutdown),
             );
-            *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+            *client_ref
+                .ping_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
@@ -1451,7 +1764,13 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
         Ok(value) => value,
         Err(err) => {
             let c = CString::new(err).unwrap_or_default();
-            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
             return;
         }
     };
@@ -1459,7 +1778,13 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
         Ok(value) => value,
         Err(err) => {
             let c = CString::new(err).unwrap_or_default();
-            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
             return;
         }
     };
@@ -1467,7 +1792,13 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
         Ok(value) => value,
         Err(err) => {
             let c = CString::new(err).unwrap_or_default();
-            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, c.as_ptr(), context) };
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
             return;
         }
     };
@@ -1487,7 +1818,13 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
                 MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
                 "client is already connected",
             );
-            unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED, msg.as_ptr(), context) };
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                    msg.as_ptr(),
+                    context,
+                )
+            };
             return;
         }
         (
@@ -1528,8 +1865,7 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
         match result {
             Ok(session) => {
                 // Lock briefly to store session.
-                let client_ref =
-                    unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let client_ref = unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
                 let mut inner = client_ref
                     .inner
                     .lock()
@@ -1539,9 +1875,13 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
                 drop(inner);
 
                 // Save connect params for reconnection.
-                *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(saved_params);
-                client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+                *client_ref
+                    .connect_params
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved_params);
+                client_ref
+                    .connection_state
+                    .store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
 
                 // Start connection monitor thread.
                 client_ref.ping_shutdown.store(false, Ordering::Relaxed);
@@ -1551,15 +1891,17 @@ pub unsafe extern "C" fn motionstage_swift_client_connect_async(
                     Arc::clone(&client_ref.last_send_ns),
                     Arc::clone(&client_ref.ping_shutdown),
                 );
-                *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                *client_ref
+                    .ping_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
                 unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_OK, ptr::null(), ctx) };
             }
             Err(err) => {
                 let status = map_connect_error(&err);
                 // Lock briefly to store error.
-                let client_ref =
-                    unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let client_ref = unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
                 let mut inner = client_ref
                     .inner
                     .lock()
@@ -1671,9 +2013,13 @@ pub extern "C" fn motionstage_swift_client_connect_pinned(
             let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
 
             // Save connect params for reconnection.
-            *client_ref.connect_params.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(saved_params);
-            client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+            *client_ref
+                .connect_params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved_params);
+            client_ref
+                .connection_state
+                .store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
 
             client_ref.ping_shutdown.store(false, Ordering::Relaxed);
             client_ref.last_send_ns.store(0, Ordering::Relaxed);
@@ -1682,7 +2028,10 @@ pub extern "C" fn motionstage_swift_client_connect_pinned(
                 Arc::clone(&client_ref.last_send_ns),
                 Arc::clone(&client_ref.ping_shutdown),
             );
-            *client_ref.ping_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+            *client_ref
+                .ping_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
@@ -1691,6 +2040,213 @@ pub extern "C" fn motionstage_swift_client_connect_pinned(
             inner.fail(status, err)
         }
     }
+}
+
+/// Async connect with certificate pinning (TOFU / 3.1).
+/// `fingerprint_hex` must be a 64-character hex string (SHA-256 of the server's DER cert).
+/// Calls `callback(status, error_cstr, context)` on completion from a Tokio worker thread.
+/// Safety: `client` must remain valid until the callback is called.
+#[no_mangle]
+pub unsafe extern "C" fn motionstage_swift_client_connect_async_pinned(
+    client: *mut c_void,
+    server_addr: *const c_char,
+    pairing_token: *const c_char,
+    api_key: *const c_char,
+    fingerprint_hex: *const c_char,
+    callback: MotionStageConnectCallback,
+    context: *mut c_void,
+) {
+    let server_addr = match unsafe { read_required_cstr(server_addr, "server_addr") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+    };
+    let pairing_token = match unsafe { read_optional_cstr(pairing_token, "pairing_token") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+    };
+    let api_key = match unsafe { read_optional_cstr(api_key, "api_key") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+    };
+    let fp_hex = match unsafe { read_required_cstr(fingerprint_hex, "fingerprint_hex") } {
+        Ok(value) => value,
+        Err(err) => {
+            let c = CString::new(err).unwrap_or_default();
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+    };
+    let fingerprint = match hex_decode_fingerprint(&fp_hex) {
+        Some(fp) => fp,
+        None => {
+            let c = CString::new("fingerprint_hex must be a 64-character hex string")
+                .unwrap_or_default();
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+                    c.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+    };
+
+    // Lock briefly to extract params and check state.
+    let (device_id, device_name, qualified_outputs, handshake_timeout) = {
+        let mut inner = match lock_client(client) {
+            Ok(c) => c,
+            Err(status) => {
+                unsafe { callback(status, ptr::null(), context) };
+                return;
+            }
+        };
+        if inner.session.is_some() {
+            let msg = CString::new("client is already connected").unwrap_or_default();
+            inner.fail(
+                MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                "client is already connected",
+            );
+            unsafe {
+                callback(
+                    MOTIONSTAGE_SWIFT_STATUS_ALREADY_CONNECTED,
+                    msg.as_ptr(),
+                    context,
+                )
+            };
+            return;
+        }
+        (
+            inner.device_id,
+            inner.device_name.clone(),
+            inner.qualified_outputs.clone(),
+            inner.handshake_timeout,
+        )
+    };
+
+    // Cast raw pointers to usize so they are `Send` and can be moved into the async task.
+    // Safety: caller guarantees the client and context remain valid until the callback fires.
+    let client_addr = client as usize;
+    let context_addr = context as usize;
+
+    // Clone connect params for reconnection.
+    let saved_params = ConnectParams {
+        server_addr: server_addr.clone(),
+        pairing_token: pairing_token.clone(),
+        api_key: api_key.clone(),
+        fingerprint: Some(fingerprint),
+    };
+
+    get_runtime().spawn(async move {
+        // Create pinned QUIC endpoint inside the async task.
+        let endpoint = match QuicClient::new_with_pinned_cert(fingerprint) {
+            Ok(ep) => ep,
+            Err(err) => {
+                let ctx = context_addr as *mut c_void;
+                let c_err = CString::new(format!("failed to create pinned QUIC client: {err}"))
+                    .unwrap_or_default();
+                unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, c_err.as_ptr(), ctx) };
+                return;
+            }
+        };
+
+        let result = connect_with_endpoint(
+            endpoint,
+            device_id,
+            device_name,
+            qualified_outputs,
+            server_addr,
+            pairing_token,
+            api_key,
+            handshake_timeout,
+        )
+        .await;
+
+        let ctx = context_addr as *mut c_void;
+
+        match result {
+            Ok(session) => {
+                let client_ref = unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.session = Some(session);
+                inner.clear_error();
+                drop(inner);
+
+                *client_ref
+                    .connect_params
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved_params);
+                client_ref
+                    .connection_state
+                    .store(MOTIONSTAGE_SWIFT_CONNECTION_CONNECTED, Ordering::Relaxed);
+
+                client_ref.ping_shutdown.store(false, Ordering::Relaxed);
+                client_ref.last_send_ns.store(0, Ordering::Relaxed);
+                let handle = start_connection_monitor(
+                    client_addr,
+                    Arc::clone(&client_ref.last_send_ns),
+                    Arc::clone(&client_ref.ping_shutdown),
+                );
+                *client_ref
+                    .ping_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+
+                unsafe { callback(MOTIONSTAGE_SWIFT_STATUS_OK, ptr::null(), ctx) };
+            }
+            Err(err) => {
+                let status = map_connect_error(&err);
+                let client_ref = unsafe { &*(client_addr as *mut MotionStageSwiftClient) };
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.fail(status, &err);
+                drop(inner);
+                let c_err = CString::new(err).unwrap_or_default();
+                unsafe { callback(status, c_err.as_ptr(), ctx) };
+            }
+        }
+    });
 }
 
 #[no_mangle]
@@ -1702,7 +2258,9 @@ pub extern "C" fn motionstage_swift_client_disconnect(client: *mut c_void) -> i3
     // Signal connection monitor thread to stop.
     let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
     client_ref.ping_shutdown.store(true, Ordering::Relaxed);
-    client_ref.connection_state.store(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED, Ordering::Relaxed);
+    client_ref
+        .connection_state
+        .store(MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED, Ordering::Relaxed);
     // Take the thread handle (don't join — it'll exit on next sleep cycle).
     let _ = client_ref
         .ping_thread
@@ -2062,7 +2620,9 @@ pub extern "C" fn motionstage_swift_client_set_mode(
             };
             // If data-flow didn't go Live, bail early with what we got.
             if df != MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE {
-                unsafe { *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE; }
+                unsafe {
+                    *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE;
+                }
                 client.clear_error();
                 return MOTIONSTAGE_SWIFT_STATUS_OK;
             }
@@ -2075,7 +2635,9 @@ pub extern "C" fn motionstage_swift_client_set_mode(
                 Err(err) => return classify_mode_error(&mut client, err),
             };
             if df != MOTIONSTAGE_SWIFT_DATA_FLOW_LIVE {
-                unsafe { *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE; }
+                unsafe {
+                    *active_mode_out = MOTIONSTAGE_SWIFT_MODE_LIVE;
+                }
                 client.clear_error();
                 return MOTIONSTAGE_SWIFT_STATUS_OK;
             }
@@ -2099,7 +2661,9 @@ pub extern "C" fn motionstage_swift_client_set_mode(
                     _ => RecordingState::Inactive,
                 },
             };
-            unsafe { *active_mode_out = mode_to_legacy_i32(&mode); }
+            unsafe {
+                *active_mode_out = mode_to_legacy_i32(&mode);
+            }
             client.clear_error();
             MOTIONSTAGE_SWIFT_STATUS_OK
         }
@@ -2107,9 +2671,245 @@ pub extern "C" fn motionstage_swift_client_set_mode(
     }
 }
 
+// ---------------------------------------------------------------------------
+// FFI: Video signaling
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_video_get_status(
+    client: *mut c_void,
+    out_available: *mut i32,
+    out_descriptor_set: *mut i32,
+    out_peer_count: *mut u32,
+    out_last_frame_age_ms: *mut i64,
+) -> i32 {
+    if out_available.is_null()
+        || out_descriptor_set.is_null()
+        || out_peer_count.is_null()
+        || out_last_frame_age_ms.is_null()
+    {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.get_video_stream_status() {
+        Ok(status) => {
+            unsafe {
+                *out_available = i32::from(status.available);
+                *out_descriptor_set = i32::from(status.descriptor_set);
+                *out_peer_count = status.peer_count;
+                *out_last_frame_age_ms = status
+                    .last_frame_age_ms
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+                    .unwrap_or(-1);
+            }
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("invalid") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_video_create_offer(
+    client: *mut c_void,
+    stream_id: *const c_char,
+    track_id: *const c_char,
+    out_sdp_type: *mut i32,
+    out_sdp: *mut *mut c_char,
+) -> i32 {
+    if out_sdp_type.is_null() || out_sdp.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let stream_id = match unsafe { read_required_cstr(stream_id, "stream_id") } {
+        Ok(value) => value,
+        Err(message) => {
+            let mut client = match lock_client(client) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message);
+        }
+    };
+    let track_id = match unsafe { read_required_cstr(track_id, "track_id") } {
+        Ok(value) => value,
+        Err(message) => {
+            let mut client = match lock_client(client) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message);
+        }
+    };
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.create_video_offer(&stream_id, &track_id) {
+        Ok(offer) => {
+            unsafe {
+                *out_sdp_type = MotionStageSwiftClientInner::sdp_type_to_i32(offer.ty);
+                *out_sdp = into_c_string_ptr(&offer.sdp);
+            }
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("invalid") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_video_send_sdp(
+    client: *mut c_void,
+    sdp_type: i32,
+    sdp: *const c_char,
+) -> i32 {
+    let sdp = match unsafe { read_required_cstr(sdp, "sdp") } {
+        Ok(value) => value,
+        Err(message) => {
+            let mut client = match lock_client(client) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message);
+        }
+    };
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.send_video_sdp(sdp_type, &sdp) {
+        Ok(()) => {
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("invalid") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_video_send_ice(
+    client: *mut c_void,
+    candidate: *const c_char,
+    sdp_mid: *const c_char,
+    sdp_mline_index: i32,
+) -> i32 {
+    let candidate = match unsafe { read_required_cstr(candidate, "candidate") } {
+        Ok(value) => value,
+        Err(message) => {
+            let mut client = match lock_client(client) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message);
+        }
+    };
+    let sdp_mid = match unsafe { read_optional_cstr(sdp_mid, "sdp_mid") } {
+        Ok(value) => value,
+        Err(message) => {
+            let mut client = match lock_client(client) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message);
+        }
+    };
+    if sdp_mline_index >= 0 && sdp_mline_index > u16::MAX as i32 {
+        let mut client = match lock_client(client) {
+            Ok(client) => client,
+            Err(status) => return status,
+        };
+        return client.fail(
+            MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT,
+            "sdp_mline_index must fit u16",
+        );
+    }
+    let sdp_mline_index = if sdp_mline_index < 0 {
+        None
+    } else {
+        Some(sdp_mline_index as u16)
+    };
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+
+    match client.send_video_ice(&candidate, sdp_mid, sdp_mline_index) {
+        Ok(()) => {
+            client.clear_error();
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        }
+        Err(err) if err.contains("not connected") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+        }
+        Err(err) if err.contains("invalid") => {
+            client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+        }
+        Err(err) if err.contains("rejected") => client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err),
+        Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_video_next_signal_json(client: *mut c_void) -> *mut c_char {
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match client.next_video_signal_json() {
+        Ok(Some(json)) => {
+            client.clear_error();
+            into_c_string_ptr(&json)
+        }
+        Ok(None) => {
+            client.clear_error();
+            ptr::null_mut()
+        }
+        Err(err) => {
+            client.last_error = Some(err);
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Classify an error string from the mode helpers into an FFI status code.
 fn classify_mode_error(client: &mut MotionStageSwiftClientInner, err: String) -> i32 {
-    if err.contains("invalid mode value") || err.contains("invalid data-flow") || err.contains("invalid recording") {
+    if err.contains("invalid mode value")
+        || err.contains("invalid data-flow")
+        || err.contains("invalid recording")
+    {
         client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
     } else if err.contains("not connected") {
         client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
@@ -2405,11 +3205,7 @@ mod tests {
         let attr2 = CString::new("motion.rotation").unwrap();
         let names: &[*const c_char] = &[attr1.as_ptr(), attr2.as_ptr()];
 
-        let client = motionstage_swift_client_new_v2(
-            device_name.as_ptr(),
-            2,
-            names.as_ptr(),
-        );
+        let client = motionstage_swift_client_new_v2(device_name.as_ptr(), 2, names.as_ptr());
         assert!(!client.is_null());
         motionstage_swift_client_free(client);
     }

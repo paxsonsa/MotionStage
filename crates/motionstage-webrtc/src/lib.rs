@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use motionstage_media::{IceCandidate, SdpMessage, SdpType};
+use motionstage_media::{IceCandidate, SdpMessage, SdpType, VideoCodec};
 use thiserror::Error;
 use webrtc::{
     api::{
@@ -15,7 +15,7 @@ use webrtc::{
         configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription, RTCPeerConnection,
     },
-    rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
+    rtp_transceiver::{rtp_codec::RTCRtpCodecCapability, RTCPFeedback},
     track::track_local::track_local_static_sample::TrackLocalStaticSample,
 };
 
@@ -25,6 +25,17 @@ pub struct WebRtcSession {
 }
 
 impl WebRtcSession {
+    fn codec_fmtp_line(codec: VideoCodec) -> &'static str {
+        match codec {
+            // Constrained Baseline Profile, Level 3.1 (42e01f) — matches openh264's default
+            // output. Explicit profile-level-id is required for deterministic codec matching
+            // with the media engine's registered H.264 variants and correct iOS decoder
+            // configuration (CAVLC entropy coding).
+            VideoCodec::H264 => "profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1",
+            _ => "",
+        }
+    }
+
     pub async fn new() -> Result<Self, WebRtcError> {
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -108,30 +119,50 @@ impl WebRtcSession {
             .map_err(|err| WebRtcError::Ice(err.to_string()))
     }
 
-    pub async fn add_h264_track(
+    pub async fn add_video_track(
         &self,
+        codec: VideoCodec,
         stream_id: &str,
         track_id: &str,
     ) -> Result<Arc<TrackLocalStaticSample>, WebRtcError> {
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: "video/H264".into(),
+                mime_type: codec.mime_type().into(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line: "".into(),
-                rtcp_feedback: vec![],
+                sdp_fmtp_line: Self::codec_fmtp_line(codec).into(),
+                // Must match the media engine's registered RTCP feedback so the SDP
+                // negotiation enables PLI/NACK/FIR — without these, the receiver
+                // cannot request keyframes on packet loss.
+                rtcp_feedback: vec![
+                    RTCPFeedback { typ: "goog-remb".to_owned(), parameter: "".to_owned() },
+                    RTCPFeedback { typ: "ccm".to_owned(), parameter: "fir".to_owned() },
+                    RTCPFeedback { typ: "nack".to_owned(), parameter: "".to_owned() },
+                    RTCPFeedback { typ: "nack".to_owned(), parameter: "pli".to_owned() },
+                ],
             },
             track_id.into(),
             stream_id.into(),
         ));
 
         self.peer
-            .add_track(Arc::clone(&track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+            .add_track(
+                Arc::clone(&track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>
+            )
             .await
             .map_err(|err| WebRtcError::Track(err.to_string()))?;
 
         *self.track.lock().await = Some(Arc::clone(&track));
         Ok(track)
+    }
+
+    pub async fn add_h264_track(
+        &self,
+        stream_id: &str,
+        track_id: &str,
+    ) -> Result<Arc<TrackLocalStaticSample>, WebRtcError> {
+        self.add_video_track(VideoCodec::H264, stream_id, track_id)
+            .await
     }
 
     pub async fn write_sample(&self, data: Bytes, duration: Duration) -> Result<(), WebRtcError> {

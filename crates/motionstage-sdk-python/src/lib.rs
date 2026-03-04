@@ -1,4 +1,8 @@
-#![allow(clippy::useless_conversion, clippy::type_complexity, clippy::needless_borrow)]
+#![allow(
+    clippy::useless_conversion,
+    clippy::type_complexity,
+    clippy::needless_borrow
+)]
 
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_protocol::{
@@ -14,27 +18,36 @@ use pyo3::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Set `MOTIONSTAGE_DEBUG_H264=1` to dump H.264 to the default path, or
+/// `MOTIONSTAGE_DEBUG_H264=/path/to/file.h264` for a custom path (supports FIFOs).
+const DEBUG_H264_DEFAULT_PATH: &str = "/tmp/motionstage_debug.h264";
+
 #[pyclass(name = "MotionStageServer")]
 pub struct PyMotionStageServer {
     server: ServerHandle,
     rt: tokio::runtime::Runtime,
     encoder: std::sync::Mutex<Option<motionstage_media::encoder::H264Encoder>>,
     video_fps: std::sync::atomic::AtomicU32,
+    debug_h264_path: Option<String>,
 }
 
 #[pymethods]
 impl PyMotionStageServer {
     #[new]
     #[pyo3(signature = (name=None, discoverable=true, bind_addr=None))]
-    pub fn new(name: Option<String>, discoverable: bool, bind_addr: Option<String>) -> PyResult<Self> {
+    pub fn new(
+        name: Option<String>,
+        discoverable: bool,
+        bind_addr: Option<String>,
+    ) -> PyResult<Self> {
         let mut config = ServerConfig::default();
         if let Some(name) = name {
             config.name = name;
         }
         let addr = bind_addr.as_deref().unwrap_or("0.0.0.0:0");
-        config.quic_bind_addr = addr
-            .parse()
-            .map_err(|err| PyValueError::new_err(format!("invalid bind address `{addr}`: {err}")))?;
+        config.quic_bind_addr = addr.parse().map_err(|err| {
+            PyValueError::new_err(format!("invalid bind address `{addr}`: {err}"))
+        })?;
         config.enable_discovery = discoverable;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -42,11 +55,34 @@ impl PyMotionStageServer {
             .build()
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
+        let debug_h264_path = std::env::var("MOTIONSTAGE_DEBUG_H264").ok().and_then(|v| {
+            if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") {
+                return None;
+            }
+            let path = if v == "1" || v.eq_ignore_ascii_case("true") {
+                DEBUG_H264_DEFAULT_PATH.to_string()
+            } else {
+                v
+            };
+            // Only truncate regular files (not FIFOs/pipes)
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.file_type().is_file() {
+                    let _ = std::fs::write(&path, b"");
+                }
+            } else {
+                // File doesn't exist — create it
+                let _ = std::fs::write(&path, b"");
+            }
+            eprintln!("MOTIONSTAGE_DEBUG_H264: streaming to {path}");
+            Some(path)
+        });
+
         Ok(Self {
             server: ServerHandle::new(config),
             rt,
             encoder: std::sync::Mutex::new(None),
             video_fps: std::sync::atomic::AtomicU32::new(24),
+            debug_h264_path,
         })
     }
 
@@ -499,14 +535,9 @@ impl PyMotionStageServer {
 
     // --- Video ---
 
-    pub fn set_master_video_descriptor(
-        &self,
-        width: u32,
-        height: u32,
-        fps: u32,
-    ) -> PyResult<()> {
+    pub fn set_master_video_descriptor(&self, width: u32, height: u32, fps: u32) -> PyResult<()> {
         use motionstage_media::{
-            ColorPrimaries, DynamicRange, TransferFunction, VideoStreamDescriptor,
+            ColorPrimaries, DynamicRange, TransferFunction, VideoCodec, VideoStreamDescriptor,
         };
 
         let descriptor = VideoStreamDescriptor {
@@ -517,6 +548,7 @@ impl PyMotionStageServer {
             color_primaries: ColorPrimaries::Bt709,
             transfer: TransferFunction::Srgb,
             bit_depth: 8,
+            codec: VideoCodec::H264,
         };
 
         self.rt
@@ -524,11 +556,20 @@ impl PyMotionStageServer {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
         // (Re)create the encoder to match the descriptor
+        // Scale bitrate by pixel-rate to avoid heavy macroblocking at higher resolutions.
+        // ~0.08 bits/pixel at target fps, clamped to a practical realtime range.
+        let target_bitrate_bps = ((width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(fps as u64)
+            .saturating_mul(8)
+            / 100)
+            .clamp(1_500_000, 12_000_000) as u32;
+
         let encoder = motionstage_media::encoder::H264Encoder::new(
             width,
             height,
             fps as f32,
-            2_000_000, // 2 Mbps default — reasonable for 720p real-time preview
+            target_bitrate_bps,
         )
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
@@ -553,10 +594,50 @@ impl PyMotionStageServer {
             let encoder = guard.as_mut().ok_or_else(|| {
                 PyRuntimeError::new_err("call set_master_video_descriptor before pushing frames")
             })?;
+            // Force IDR keyframe when a new peer has connected so it can start decoding.
+            if self.rt.block_on(self.server.take_keyframe_needed()) {
+                encoder.force_keyframe();
+            }
             encoder
                 .encode_rgba(data)
                 .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
         };
+
+        self.maybe_dump_h264(&encoded);
+
+        let fps = self
+            .video_fps
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let _ = timestamp_ns; // reserved for future PTS support
+        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+
+        self.rt
+            .block_on(self.server.push_video_frame(encoded, duration))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Accept raw BGRA bytes from Python, encode to H.264, push to all WebRTC peers.
+    pub fn push_video_frame_bgra(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
+        let encoded = {
+            let mut guard = self
+                .encoder
+                .lock()
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            let encoder = guard.as_mut().ok_or_else(|| {
+                PyRuntimeError::new_err("call set_master_video_descriptor before pushing frames")
+            })?;
+            if self.rt.block_on(self.server.take_keyframe_needed()) {
+                encoder.force_keyframe();
+            }
+            encoder
+                .encode_bgra(data)
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+        };
+
+        self.maybe_dump_h264(&encoded);
 
         let fps = self
             .video_fps
@@ -574,6 +655,20 @@ impl PyMotionStageServer {
 
     pub fn video_peer_count(&self) -> PyResult<u32> {
         Ok(self.rt.block_on(self.server.video_peer_count()))
+    }
+}
+
+impl PyMotionStageServer {
+    /// Append encoded H.264 bytes to the debug dump file/pipe (if enabled).
+    fn maybe_dump_h264(&self, encoded: &[u8]) {
+        let path = match &self.debug_h264_path {
+            Some(p) => p,
+            None => return,
+        };
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = f.write_all(encoded);
+        }
     }
 }
 
@@ -693,7 +788,9 @@ fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
     let raw_objects = spec
         .get_item("objects")
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err("scene spec: missing required list field 'objects'"))?;
+        .ok_or_else(|| {
+            PyValueError::new_err("scene spec: missing required list field 'objects'")
+        })?;
     let objects = raw_objects
         .iter()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -1010,8 +1107,8 @@ mod tests {
 
     #[test]
     fn rust_binding_constructs_server() {
-        let server =
-            PyMotionStageServer::new(Some("py-test".into()), false, None).expect("py server should build");
+        let server = PyMotionStageServer::new(Some("py-test".into()), false, None)
+            .expect("py server should build");
         let _ = server.start().expect("start should succeed");
         server.stop().expect("stop should succeed");
     }

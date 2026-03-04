@@ -115,6 +115,55 @@ public enum ConnectionState: Int32, Sendable {
     case failed        = 3
 }
 
+public enum VideoSdpType: Int32, Sendable {
+    case offer = 0
+    case answer = 1
+
+    fileprivate var ffiRawValue: Int32 {
+        switch self {
+        case .offer: return MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER
+        case .answer: return MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER
+        }
+    }
+
+    fileprivate static func fromFFI(_ value: Int32) -> VideoSdpType? {
+        switch value {
+        case MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER: return .offer
+        case MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER: return .answer
+        default: return nil
+        }
+    }
+}
+
+public struct VideoOffer: Sendable, Equatable {
+    public let type: VideoSdpType
+    public let sdp: String
+}
+
+public enum VideoSignal: Sendable, Equatable {
+    case sdp(fromDevice: String, toDevice: String, type: VideoSdpType, sdp: String)
+    case ice(fromDevice: String, toDevice: String, candidate: String, sdpMid: String?, sdpMLineIndex: UInt16?)
+}
+
+public struct VideoStreamStatus: Sendable, Equatable {
+    public let available: Bool
+    public let descriptorSet: Bool
+    public let peerCount: UInt32
+    public let lastFrameAgeMs: Int64?
+
+    public init(
+        available: Bool,
+        descriptorSet: Bool,
+        peerCount: UInt32,
+        lastFrameAgeMs: Int64?
+    ) {
+        self.available = available
+        self.descriptorSet = descriptorSet
+        self.peerCount = peerCount
+        self.lastFrameAgeMs = lastFrameAgeMs
+    }
+}
+
 // MARK: - Legacy MotionFrame (deprecated — use CameraMotionFrame)
 
 @available(*, deprecated, renamed: "CameraMotionFrame")
@@ -292,15 +341,25 @@ public final class MotionStageClient: @unchecked Sendable {
         fingerprint: String,
         pairingToken: String? = nil,
         apiKey: String? = nil
-    ) throws {
-        try serverAddress.withCString { serverAddrPtr in
-            try fingerprint.withCString { fpPtr in
-                try withOptionalCString(pairingToken) { pairingTokenPtr in
-                    try withOptionalCString(apiKey) { apiKeyPtr in
-                        let status = motionstage_swift_client_connect_pinned(
-                            rawClient, serverAddrPtr, pairingTokenPtr, apiKeyPtr, fpPtr
-                        )
-                        try checkStatus(status)
+    ) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let box = Unmanaged.passRetained(ContinuationBox(cont))
+            let ctx = box.toOpaque()
+
+            serverAddress.withCString { serverAddrPtr in
+                fingerprint.withCString { fpPtr in
+                    withOptionalCString(pairingToken) { pairingTokenPtr in
+                        withOptionalCString(apiKey) { apiKeyPtr in
+                            motionstage_swift_client_connect_async_pinned(
+                                rawClient,
+                                serverAddrPtr,
+                                pairingTokenPtr,
+                                apiKeyPtr,
+                                fpPtr,
+                                connectCallback,
+                                ctx
+                            )
+                        }
                     }
                 }
             }
@@ -515,6 +574,172 @@ public final class MotionStageClient: @unchecked Sendable {
         }.value
     }
 
+    // MARK: - Video signaling
+
+    /// Query server-reported stream availability for UI/UX gating.
+    public func videoStreamStatus() async throws -> VideoStreamStatus {
+        let rawClient = self.rawClient
+        return try await Task.detached(priority: .userInitiated) {
+            var available: Int32 = 0
+            var descriptorSet: Int32 = 0
+            var peerCount: UInt32 = 0
+            var lastFrameAgeMs: Int64 = -1
+            let status = motionstage_swift_client_video_get_status(
+                rawClient,
+                &available,
+                &descriptorSet,
+                &peerCount,
+                &lastFrameAgeMs
+            )
+            if status != MOTIONSTAGE_SWIFT_STATUS_OK {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "video stream status failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+            return VideoStreamStatus(
+                available: available != 0,
+                descriptorSet: descriptorSet != 0,
+                peerCount: peerCount,
+                lastFrameAgeMs: lastFrameAgeMs >= 0 ? lastFrameAgeMs : nil
+            )
+        }.value
+    }
+
+    /// Request a server-generated WebRTC SDP offer for this client.
+    public func createVideoOffer(
+        streamID: String = "motionstage",
+        trackID: String = "video"
+    ) async throws -> VideoOffer {
+        let rawClient = self.rawClient
+        return try await Task.detached(priority: .userInitiated) {
+            var outType: Int32 = MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER
+            var outSdp: UnsafeMutablePointer<CChar>?
+            let status = streamID.withCString { streamPtr in
+                trackID.withCString { trackPtr in
+                    motionstage_swift_client_video_create_offer(
+                        rawClient,
+                        streamPtr,
+                        trackPtr,
+                        &outType,
+                        &outSdp
+                    )
+                }
+            }
+            guard status == MOTIONSTAGE_SWIFT_STATUS_OK else {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "create video offer failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+            guard let outSdp else {
+                throw MotionStageError.internalError("create video offer succeeded without SDP payload")
+            }
+            let sdp = takeRustString(outSdp) ?? ""
+            guard let type = VideoSdpType.fromFFI(outType) else {
+                throw MotionStageError.protocolError("unknown SDP type \(outType)")
+            }
+            return VideoOffer(type: type, sdp: sdp)
+        }.value
+    }
+
+    /// Send SDP to server-side video signaling.
+    public func sendVideoSdp(type: VideoSdpType, sdp: String) async throws {
+        let rawClient = self.rawClient
+        try await Task.detached(priority: .userInitiated) {
+            let status = sdp.withCString { sdpPtr in
+                motionstage_swift_client_video_send_sdp(rawClient, type.ffiRawValue, sdpPtr)
+            }
+            if status != MOTIONSTAGE_SWIFT_STATUS_OK {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "send video SDP failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+        }.value
+    }
+
+    /// Convenience helper for sending a local SDP answer.
+    public func sendVideoAnswer(_ sdp: String) async throws {
+        try await sendVideoSdp(type: .answer, sdp: sdp)
+    }
+
+    /// Send local ICE candidate to server-side video signaling.
+    public func sendVideoIce(
+        candidate: String,
+        sdpMid: String? = nil,
+        sdpMLineIndex: UInt16? = nil
+    ) async throws {
+        let rawClient = self.rawClient
+        try await Task.detached(priority: .userInitiated) {
+            let status = candidate.withCString { candPtr in
+                withOptionalCString(sdpMid) { sdpMidPtr in
+                    motionstage_swift_client_video_send_ice(
+                        rawClient,
+                        candPtr,
+                        sdpMidPtr,
+                        sdpMLineIndex.map(Int32.init) ?? -1
+                    )
+                }
+            }
+            if status != MOTIONSTAGE_SWIFT_STATUS_OK {
+                let msg = takeRustString(motionstage_swift_client_last_error(rawClient))
+                    ?? "send video ICE failed with status \(status)"
+                throw makeError(status: status, message: msg)
+            }
+        }.value
+    }
+
+    /// Poll next pending server signal; returns nil when no signal is queued.
+    public func nextVideoSignal() throws -> VideoSignal? {
+        let pointer = motionstage_swift_client_video_next_signal_json(rawClient)
+        guard let pointer else {
+            if let msg = lastErrorMessage {
+                throw MotionStageError.transportError(msg)
+            }
+            return nil
+        }
+        guard let json = takeRustString(pointer) else { return nil }
+        let data = Data(json.utf8)
+        do {
+            let payload = try JSONDecoder().decode(VideoSignalEnvelope.self, from: data)
+            switch payload.kind {
+            case .sdp:
+                guard let sdp = payload.sdp,
+                      let sdpTypeRaw = payload.sdpType
+                else {
+                    throw MotionStageError.protocolError("invalid SDP signal payload")
+                }
+                let type: VideoSdpType
+                if sdpTypeRaw == "offer" {
+                    type = .offer
+                } else if sdpTypeRaw == "answer" {
+                    type = .answer
+                } else {
+                    throw MotionStageError.protocolError("unknown SDP type \(sdpTypeRaw)")
+                }
+                return .sdp(
+                    fromDevice: payload.fromDevice ?? "",
+                    toDevice: payload.toDevice ?? "",
+                    type: type,
+                    sdp: sdp
+                )
+            case .ice:
+                guard let candidate = payload.candidate else {
+                    throw MotionStageError.protocolError("invalid ICE signal payload")
+                }
+                return .ice(
+                    fromDevice: payload.fromDevice ?? "",
+                    toDevice: payload.toDevice ?? "",
+                    candidate: candidate,
+                    sdpMid: payload.sdpMid,
+                    sdpMLineIndex: payload.sdpMLineIndex
+                )
+            }
+        } catch let err as MotionStageError {
+            throw err
+        } catch {
+            throw MotionStageError.protocolError("failed to decode video signal JSON: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Accessors
 
     public var sessionID: String? {
@@ -628,6 +853,33 @@ private let connectionEventCallback: MotionStageConnectionEventCallback = { even
         return
     }
     box.cont.yield(connectionEvent)
+}
+
+private struct VideoSignalEnvelope: Decodable {
+    enum Kind: String, Decodable {
+        case sdp
+        case ice
+    }
+
+    let kind: Kind
+    let fromDevice: String?
+    let toDevice: String?
+    let sdpType: String?
+    let sdp: String?
+    let candidate: String?
+    let sdpMid: String?
+    let sdpMLineIndex: UInt16?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case fromDevice = "from_device"
+        case toDevice = "to_device"
+        case sdpType = "sdp_type"
+        case sdp
+        case candidate
+        case sdpMid = "sdp_mid"
+        case sdpMLineIndex = "sdp_mline_index"
+    }
 }
 
 // MARK: - Free helpers

@@ -50,6 +50,10 @@ extern "C" {
 #define MOTIONSTAGE_SWIFT_EVENT_RECONNECTING       2
 #define MOTIONSTAGE_SWIFT_EVENT_RECONNECT_FAILED   3
 
+/* Video SDP type constants */
+#define MOTIONSTAGE_SWIFT_SDP_TYPE_OFFER  0
+#define MOTIONSTAGE_SWIFT_SDP_TYPE_ANSWER 1
+
 /* Legacy camera-specific motion frame (deprecated — use send_batch instead). */
 typedef struct {
     float position[3];
@@ -208,6 +212,21 @@ int32_t motionstage_swift_client_connect_pinned(
     const char *fingerprint_hex
 );
 
+/**
+ * Non-blocking connect with certificate pinning (TOFU / 3.1).
+ * fingerprint_hex: 64-char hex SHA-256 of the server's DER certificate.
+ * client must remain valid until callback is called.
+ */
+void motionstage_swift_client_connect_async_pinned(
+    void *client,
+    const char *server_addr,
+    const char *pairing_token,  /* NULL = none */
+    const char *api_key,        /* NULL = none */
+    const char *fingerprint_hex,
+    MotionStageConnectCallback callback,
+    void *context               /* passed through to callback */
+);
+
 int32_t motionstage_swift_client_disconnect(void *client);
 
 /* General batch send (2.1) */
@@ -299,6 +318,68 @@ int32_t motionstage_swift_client_set_mode(
     int32_t requested_mode,
     int32_t *active_mode_out
 );
+
+/* Video signaling */
+
+/**
+ * Query server-reported video stream status.
+ * out_available: 1 when server reports an active stream heartbeat, else 0.
+ * out_descriptor_set: 1 when a master video descriptor is configured, else 0.
+ * out_peer_count: active peer count with attached video tracks.
+ * out_last_frame_age_ms: milliseconds since last pushed frame, or -1 if unknown.
+ */
+int32_t motionstage_swift_client_video_get_status(
+    void *client,
+    int32_t *out_available,
+    int32_t *out_descriptor_set,
+    uint32_t *out_peer_count,
+    int64_t *out_last_frame_age_ms
+);
+
+/**
+ * Request a server video offer for this client session.
+ * out_sdp_type receives MOTIONSTAGE_SWIFT_SDP_TYPE_*.
+ * out_sdp receives an owned C string; free with motionstage_swift_string_free().
+ */
+int32_t motionstage_swift_client_video_create_offer(
+    void *client,
+    const char *stream_id,
+    const char *track_id,
+    int32_t *out_sdp_type,
+    char **out_sdp
+);
+
+/**
+ * Send an SDP message to the server for this client session.
+ * sdp_type must be MOTIONSTAGE_SWIFT_SDP_TYPE_*.
+ */
+int32_t motionstage_swift_client_video_send_sdp(
+    void *client,
+    int32_t sdp_type,
+    const char *sdp
+);
+
+/**
+ * Send an ICE candidate to the server for this client session.
+ * sdp_mid may be NULL.
+ * sdp_mline_index: -1 means "none".
+ */
+int32_t motionstage_swift_client_video_send_ice(
+    void *client,
+    const char *candidate,
+    const char *sdp_mid,
+    int32_t sdp_mline_index
+);
+
+/**
+ * Poll the next pending server video signal as JSON.
+ * Returns NULL when no signal is available.
+ * On success, caller owns the returned string and must free with motionstage_swift_string_free().
+ * JSON shape:
+ *  - {"kind":"sdp","from_device":"...","to_device":"...","sdp_type":"offer|answer","sdp":"..."}
+ *  - {"kind":"ice","from_device":"...","to_device":"...","candidate":"...","sdp_mid":"...|null","sdp_mline_index":0|null}
+ */
+char *motionstage_swift_client_video_next_signal_json(void *client);
 
 /* Reconnection (4.2) */
 

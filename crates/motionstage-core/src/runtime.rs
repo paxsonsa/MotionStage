@@ -306,8 +306,10 @@ impl RuntimeCore {
         mapping.disconnected_at_ns = None;
 
         self.mapping_index.remove(&old_key);
-        self.mapping_index
-            .insert((mapping.source_device, mapping.source_output.clone()), mapping_id);
+        self.mapping_index.insert(
+            (mapping.source_device, mapping.source_output.clone()),
+            mapping_id,
+        );
         Ok(())
     }
 
@@ -332,7 +334,9 @@ impl RuntimeCore {
         now_ns: u64,
     ) -> Result<BTreeMap<String, AttributeValue>, CoreError> {
         self.heartbeat(device_id, now_ns);
-        if self.mode.data_flow == DataFlowState::Idle || self.mode.recording == RecordingState::Playback {
+        if self.mode.data_flow == DataFlowState::Idle
+            || self.mode.recording == RecordingState::Playback
+        {
             return Ok(BTreeMap::new());
         }
 

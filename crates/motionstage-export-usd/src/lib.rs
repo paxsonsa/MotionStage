@@ -64,7 +64,7 @@ pub fn export(recording: &RecordingFile, config: &UsdExportConfig) -> String {
 
     struct PrimInfo {
         prim_name: String,
-        xform_ops: Vec<PrimProperty>,   // translate, orient
+        xform_ops: Vec<PrimProperty>,    // translate, orient
         custom_props: Vec<PrimProperty>, // everything else
     }
 
@@ -251,7 +251,11 @@ fn format_f64(v: f64) -> String {
 fn format_usd_value(value: &AttributeValue) -> String {
     match value {
         AttributeValue::Bool(v) | AttributeValue::Trigger(v) => {
-            if *v { "true".into() } else { "false".into() }
+            if *v {
+                "true".into()
+            } else {
+                "false".into()
+            }
         }
         AttributeValue::Int32(v) => v.to_string(),
         AttributeValue::Float32(v) => format_float(*v),
@@ -323,7 +327,7 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use crate::{export, UsdExportConfig, UpAxis};
+    use crate::{export, UpAxis, UsdExportConfig};
 
     fn make_recording(frames: Vec<RecordedFrame>) -> RecordingFile {
         let started_ns = frames.first().map(|f| f.timestamp_ns).unwrap_or(0);
@@ -342,10 +346,7 @@ mod tests {
         }
     }
 
-    fn frame_at(
-        timestamp_ns: u64,
-        attributes: Vec<RecordedAttribute>,
-    ) -> RecordedFrame {
+    fn frame_at(timestamp_ns: u64, attributes: Vec<RecordedAttribute>) -> RecordedFrame {
         RecordedFrame {
             timestamp_ns,
             mode: Mode::RECORDING,
@@ -366,7 +367,11 @@ mod tests {
         let obj = Uuid::nil();
         let recording = make_recording(vec![frame_at(
             0,
-            vec![attr(obj, "position", AttributeValue::Vec3f([1.0, 2.0, 3.0]))],
+            vec![attr(
+                obj,
+                "position",
+                AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            )],
         )]);
         let config = UsdExportConfig::default();
         let a = export(&recording, &config);
@@ -396,7 +401,11 @@ mod tests {
         let obj = Uuid::nil();
         let recording = make_recording(vec![frame_at(
             0,
-            vec![attr(obj, "position", AttributeValue::Vec3f([1.0, 2.0, 3.0]))],
+            vec![attr(
+                obj,
+                "position",
+                AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            )],
         )]);
         let out = export(&recording, &UsdExportConfig::default());
         assert!(out.contains("float3 xformOp:translate.timeSamples"));
@@ -485,14 +494,37 @@ mod tests {
         let obj = Uuid::nil();
         // 1 second into recording
         let recording = make_recording(vec![
-            frame_at(0, vec![attr(obj, "position", AttributeValue::Vec3f([0.0, 0.0, 0.0]))]),
+            frame_at(
+                0,
+                vec![attr(
+                    obj,
+                    "position",
+                    AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+                )],
+            ),
             frame_at(
                 1_000_000_000,
-                vec![attr(obj, "position", AttributeValue::Vec3f([1.0, 0.0, 0.0]))],
+                vec![attr(
+                    obj,
+                    "position",
+                    AttributeValue::Vec3f([1.0, 0.0, 0.0]),
+                )],
             ),
         ]);
-        let out_24 = export(&recording, &UsdExportConfig { fps: 24.0, up_axis: UpAxis::Y });
-        let out_60 = export(&recording, &UsdExportConfig { fps: 60.0, up_axis: UpAxis::Y });
+        let out_24 = export(
+            &recording,
+            &UsdExportConfig {
+                fps: 24.0,
+                up_axis: UpAxis::Y,
+            },
+        );
+        let out_60 = export(
+            &recording,
+            &UsdExportConfig {
+                fps: 60.0,
+                up_axis: UpAxis::Y,
+            },
+        );
         // At 24fps, 1 second = frame 24
         assert!(out_24.contains("24:"));
         // At 60fps, 1 second = frame 60
@@ -514,7 +546,11 @@ mod tests {
         let obj = Uuid::nil();
         let recording = make_recording(vec![frame_at(
             0,
-            vec![attr(obj, "camera.focal_length", AttributeValue::Float32(35.0))],
+            vec![attr(
+                obj,
+                "camera.focal_length",
+                AttributeValue::Float32(35.0),
+            )],
         )]);
         let out = export(&recording, &UsdExportConfig::default());
         // Must be "35.0" not "35"

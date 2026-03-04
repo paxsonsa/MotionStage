@@ -38,6 +38,7 @@ public struct CameraMotionFrame: Sendable {
             updates.append((Attribute.Motion.position, [position.x, position.y, position.z]))
         }
         if fieldMask.contains(.rotation) {
+            // Protocol canonical quaternion order is [x, y, z, w].
             updates.append((Attribute.Motion.rotation,
                             [rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real]))
         }

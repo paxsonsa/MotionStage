@@ -289,6 +289,14 @@ pub struct SignalMessage {
     pub payload: SignalPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStreamStatus {
+    pub available: bool,
+    pub descriptor_set: bool,
+    pub peer_count: u32,
+    pub last_frame_age_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     ServerHello(ServerHello),
@@ -304,6 +312,8 @@ pub enum ControlMessage {
         track_id: String,
     },
     VideoOffer(SdpMessage),
+    GetVideoStreamStatus,
+    VideoStreamStatus(VideoStreamStatus),
     ListTakes {
         scene_id: Option<Uuid>,
     },

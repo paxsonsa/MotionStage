@@ -31,6 +31,30 @@ pub enum ToneMapMode {
     Hdr10ToSdr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Vp8,
+    Vp9,
+    Av1,
+}
+
+impl VideoCodec {
+    pub fn mime_type(&self) -> &'static str {
+        match self {
+            Self::H264 => "video/H264",
+            Self::Vp8 => "video/VP8",
+            Self::Vp9 => "video/VP9",
+            Self::Av1 => "video/AV1",
+        }
+    }
+
+    pub fn supports_hdr(&self) -> bool {
+        matches!(self, Self::Vp9 | Self::Av1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoStreamDescriptor {
     pub width: u32,
@@ -40,6 +64,8 @@ pub struct VideoStreamDescriptor {
     pub color_primaries: ColorPrimaries,
     pub transfer: TransferFunction,
     pub bit_depth: u8,
+    #[serde(default)]
+    pub codec: VideoCodec,
 }
 
 impl VideoStreamDescriptor {
@@ -66,24 +92,31 @@ impl VideoStreamDescriptor {
                     "HDR10 requires 10-bit pipeline".into(),
                 ));
             }
+            if !self.codec.supports_hdr() {
+                return Err(MediaError::InvalidDescriptor(
+                    "HDR10 requires a codec that supports 10-bit (VP9 or AV1)".into(),
+                ));
+            }
         }
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoClientCapability {
     pub supports_hdr10: bool,
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
+    pub supported_codecs: Vec<VideoCodec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NegotiatedVideoStream {
     pub descriptor: VideoStreamDescriptor,
     pub tone_map: ToneMapMode,
+    pub codec: VideoCodec,
 }
 
 pub fn negotiate_stream(
@@ -101,7 +134,24 @@ pub fn negotiate_stream(
         ));
     }
 
-    if master.dynamic_range == DynamicRange::Hdr10 && !client.supports_hdr10 {
+    // Codec negotiation: empty supported_codecs means accept whatever the master uses.
+    // H264 is the universal fallback — if the client can't handle the master's codec, we
+    // try H264 before giving up. Other codecs are only used if the master explicitly selects them.
+    let codec = if client.supported_codecs.is_empty() {
+        master.codec
+    } else if client.supported_codecs.contains(&master.codec) {
+        master.codec
+    } else if client.supported_codecs.contains(&VideoCodec::H264) {
+        VideoCodec::H264
+    } else {
+        return Err(MediaError::UnsupportedDescriptor(
+            "no codec overlap between master and client".into(),
+        ));
+    };
+
+    if master.dynamic_range == DynamicRange::Hdr10
+        && (!client.supports_hdr10 || !codec.supports_hdr())
+    {
         return Ok(NegotiatedVideoStream {
             descriptor: VideoStreamDescriptor {
                 width: master.width,
@@ -111,14 +161,17 @@ pub fn negotiate_stream(
                 color_primaries: ColorPrimaries::Bt709,
                 transfer: TransferFunction::Srgb,
                 bit_depth: 8,
+                codec,
             },
             tone_map: ToneMapMode::Hdr10ToSdr,
+            codec,
         });
     }
 
     Ok(NegotiatedVideoStream {
         descriptor: master.clone(),
         tone_map: ToneMapMode::None,
+        codec,
     })
 }
 
@@ -272,10 +325,55 @@ mod tests {
             color_primaries: ColorPrimaries::Bt709,
             transfer: TransferFunction::Pq,
             bit_depth: 10,
+            codec: VideoCodec::H264,
         };
 
         let err = descriptor.validate().unwrap_err();
         assert!(format!("{err}").contains("BT.2020"));
+    }
+
+    #[test]
+    fn hdr10_rejects_non_hdr_codec() {
+        let descriptor = VideoStreamDescriptor {
+            width: 1920,
+            height: 1080,
+            fps: 24,
+            dynamic_range: DynamicRange::Hdr10,
+            color_primaries: ColorPrimaries::Bt2020,
+            transfer: TransferFunction::Pq,
+            bit_depth: 10,
+            codec: VideoCodec::H264,
+        };
+
+        let err = descriptor.validate().unwrap_err();
+        assert!(format!("{err}").contains("VP9 or AV1"));
+    }
+
+    #[test]
+    fn hdr10_forced_to_sdr_when_negotiated_codec_does_not_support_hdr() {
+        // Master wants HDR10/VP9; client supports HDR but only via H264 (which can't carry it).
+        let descriptor = VideoStreamDescriptor {
+            width: 1920,
+            height: 1080,
+            fps: 24,
+            dynamic_range: DynamicRange::Hdr10,
+            color_primaries: ColorPrimaries::Bt2020,
+            transfer: TransferFunction::Pq,
+            bit_depth: 10,
+            codec: VideoCodec::Vp9,
+        };
+        let client = VideoClientCapability {
+            supports_hdr10: true,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 24,
+            supported_codecs: vec![VideoCodec::H264],
+        };
+
+        let negotiated = negotiate_stream(&descriptor, client).unwrap();
+        assert_eq!(negotiated.codec, VideoCodec::H264);
+        assert_eq!(negotiated.descriptor.dynamic_range, DynamicRange::Sdr);
+        assert_eq!(negotiated.tone_map, ToneMapMode::Hdr10ToSdr);
     }
 
     #[test]
@@ -288,12 +386,14 @@ mod tests {
             color_primaries: ColorPrimaries::Bt2020,
             transfer: TransferFunction::Pq,
             bit_depth: 10,
+            codec: VideoCodec::Vp9,
         };
         let client = VideoClientCapability {
             supports_hdr10: false,
             max_width: 3840,
             max_height: 2160,
             max_fps: 60,
+            supported_codecs: vec![VideoCodec::H264],
         };
 
         let negotiated = negotiate_stream(&descriptor, client).unwrap();
@@ -313,12 +413,14 @@ mod tests {
             color_primaries: ColorPrimaries::Bt709,
             transfer: TransferFunction::Srgb,
             bit_depth: 8,
+            codec: VideoCodec::H264,
         };
         let client = VideoClientCapability {
             supports_hdr10: true,
             max_width: 1920,
             max_height: 1080,
             max_fps: 60,
+            supported_codecs: vec![VideoCodec::H264],
         };
 
         let err = negotiate_stream(&descriptor, client).unwrap_err();
@@ -380,6 +482,7 @@ mod tests {
             color_primaries: ColorPrimaries::Bt709,
             transfer: TransferFunction::Srgb,
             bit_depth: 8,
+            codec: VideoCodec::H264,
         };
         let sink = Arc::new(TestPushSink::new());
         let endpoint = VideoStreamEndpoint::from_push(
@@ -398,5 +501,53 @@ mod tests {
 
         assert_eq!(sink.states.lock().as_slice(), &[StreamState::Started]);
         assert_eq!(sink.frames.lock().len(), 1);
+    }
+
+    #[test]
+    fn codec_fallback_selects_best_available() {
+        let descriptor = VideoStreamDescriptor {
+            width: 1920,
+            height: 1080,
+            fps: 24,
+            dynamic_range: DynamicRange::Sdr,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            bit_depth: 8,
+            codec: VideoCodec::Vp9,
+        };
+        let client = VideoClientCapability {
+            supports_hdr10: false,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 24,
+            supported_codecs: vec![VideoCodec::H264, VideoCodec::Vp8],
+        };
+
+        let negotiated = negotiate_stream(&descriptor, client).unwrap();
+        assert_eq!(negotiated.codec, VideoCodec::H264);
+    }
+
+    #[test]
+    fn codec_negotiation_rejects_no_overlap() {
+        let descriptor = VideoStreamDescriptor {
+            width: 1920,
+            height: 1080,
+            fps: 24,
+            dynamic_range: DynamicRange::Sdr,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            bit_depth: 8,
+            codec: VideoCodec::Av1,
+        };
+        let client = VideoClientCapability {
+            supports_hdr10: false,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 24,
+            supported_codecs: vec![VideoCodec::Vp8],
+        };
+
+        let err = negotiate_stream(&descriptor, client).unwrap_err();
+        assert!(format!("{err}").contains("no codec overlap"));
     }
 }

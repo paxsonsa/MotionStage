@@ -548,5 +548,4 @@ mod tests {
 
         server_task.await.unwrap();
     }
-
 }
