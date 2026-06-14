@@ -15,6 +15,8 @@ use pyo3::{
     prelude::*,
     types::{PyAny, PyDict},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -26,8 +28,10 @@ const DEBUG_H264_DEFAULT_PATH: &str = "/tmp/motionstage_debug.h264";
 pub struct PyMotionStageServer {
     server: ServerHandle,
     rt: tokio::runtime::Runtime,
-    encoder: std::sync::Mutex<Option<motionstage_media::encoder::H264Encoder>>,
+    encoder: Arc<std::sync::Mutex<Option<motionstage_media::encoder::H264Encoder>>>,
     video_fps: std::sync::atomic::AtomicU32,
+    // Single-flight gate for the off-thread video encode+push pipeline.
+    video_encode_inflight: Arc<AtomicBool>,
     debug_h264_path: Option<String>,
 }
 
@@ -80,8 +84,9 @@ impl PyMotionStageServer {
         Ok(Self {
             server: ServerHandle::new(config),
             rt,
-            encoder: std::sync::Mutex::new(None),
+            encoder: Arc::new(std::sync::Mutex::new(None)),
             video_fps: std::sync::atomic::AtomicU32::new(24),
+            video_encode_inflight: Arc::new(AtomicBool::new(false)),
             debug_h264_path,
         })
     }
@@ -584,73 +589,22 @@ impl PyMotionStageServer {
         Ok(())
     }
 
-    /// Accept raw RGBA bytes from Python, encode to H.264, push to all WebRTC peers.
+    /// Accept raw RGBA bytes from Python and stream them to all WebRTC peers.
+    ///
+    /// Returns immediately. The CPU-bound H.264 encode and the network push run
+    /// on the Tokio runtime, NOT on the calling thread. In Blender this call
+    /// happens on the main draw thread, so doing encode+push inline used to
+    /// freeze the viewport and hold the GIL (starving the SDK event poller).
+    /// Frames that arrive while an encode+push is still in flight are dropped
+    /// (conflation: live feedback wants the freshest frame, never a backlog).
     pub fn push_video_frame(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
-        let encoded = {
-            let mut guard = self
-                .encoder
-                .lock()
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-            let encoder = guard.as_mut().ok_or_else(|| {
-                PyRuntimeError::new_err("call set_master_video_descriptor before pushing frames")
-            })?;
-            // Force IDR keyframe when a new peer has connected so it can start decoding.
-            if self.rt.block_on(self.server.take_keyframe_needed()) {
-                encoder.force_keyframe();
-            }
-            encoder
-                .encode_rgba(data)
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
-        };
-
-        self.maybe_dump_h264(&encoded);
-
-        let fps = self
-            .video_fps
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(1);
-        let _ = timestamp_ns; // reserved for future PTS support
-        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
-
-        self.rt
-            .block_on(self.server.push_video_frame(encoded, duration))
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-
-        Ok(())
+        self.enqueue_video_frame(data, timestamp_ns, false)
     }
 
-    /// Accept raw BGRA bytes from Python, encode to H.264, push to all WebRTC peers.
+    /// Accept raw BGRA bytes from Python and stream them to all WebRTC peers.
+    /// Same off-thread, single-flight behavior as [`Self::push_video_frame`].
     pub fn push_video_frame_bgra(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
-        let encoded = {
-            let mut guard = self
-                .encoder
-                .lock()
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-            let encoder = guard.as_mut().ok_or_else(|| {
-                PyRuntimeError::new_err("call set_master_video_descriptor before pushing frames")
-            })?;
-            if self.rt.block_on(self.server.take_keyframe_needed()) {
-                encoder.force_keyframe();
-            }
-            encoder
-                .encode_bgra(data)
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
-        };
-
-        self.maybe_dump_h264(&encoded);
-
-        let fps = self
-            .video_fps
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(1);
-        let _ = timestamp_ns; // reserved for future PTS support
-        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
-
-        self.rt
-            .block_on(self.server.push_video_frame(encoded, duration))
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-
-        Ok(())
+        self.enqueue_video_frame(data, timestamp_ns, true)
     }
 
     pub fn video_peer_count(&self) -> PyResult<u32> {
@@ -659,16 +613,89 @@ impl PyMotionStageServer {
 }
 
 impl PyMotionStageServer {
-    /// Append encoded H.264 bytes to the debug dump file/pipe (if enabled).
-    fn maybe_dump_h264(&self, encoded: &[u8]) {
-        let path = match &self.debug_h264_path {
-            Some(p) => p,
-            None => return,
-        };
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-            let _ = f.write_all(encoded);
+    /// Hand a captured frame to the Tokio runtime for encode + WebRTC push,
+    /// returning immediately so the caller's thread (Blender's main draw thread)
+    /// is never blocked on encoding or network I/O.
+    fn enqueue_video_frame(&self, data: &[u8], _timestamp_ns: u64, bgra: bool) -> PyResult<()> {
+        // Single-flight gate: if an encode+push is still running, drop this
+        // frame rather than queueing. Live feedback wants the newest frame, and
+        // an unbounded queue would grow memory and add latency under backpressure.
+        if self
+            .video_encode_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
         }
+
+        // Copy the borrowed pixel buffer so the spawned task can own it.
+        let frame = data.to_vec();
+        let fps = self.video_fps.load(Ordering::Relaxed).max(1);
+        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+
+        let server = self.server.clone();
+        let encoder = Arc::clone(&self.encoder);
+        let inflight = Arc::clone(&self.video_encode_inflight);
+        let debug_path = self.debug_h264_path.clone();
+
+        self.rt.spawn(async move {
+            // Release the single-flight gate however this task exits.
+            struct InflightGuard(Arc<AtomicBool>);
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _gate = InflightGuard(inflight);
+
+            // Force an IDR for any newly-joined peer so it can start decoding.
+            let needs_keyframe = server.take_keyframe_needed().await;
+
+            let encoded = {
+                let mut guard = match encoder.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let encoder = match guard.as_mut() {
+                    Some(encoder) => encoder,
+                    None => return, // set_master_video_descriptor not called yet
+                };
+                if needs_keyframe {
+                    encoder.force_keyframe();
+                }
+                let result = if bgra {
+                    encoder.encode_bgra(&frame)
+                } else {
+                    encoder.encode_rgba(&frame)
+                };
+                match result {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        eprintln!("motionstage: video encode failed: {err}");
+                        return;
+                    }
+                }
+                // encoder lock released here, before the network push
+            };
+
+            if let Some(path) = debug_path.as_deref() {
+                dump_h264_to(path, &encoded);
+            }
+
+            if let Err(err) = server.push_video_frame(encoded, duration).await {
+                eprintln!("motionstage: video push failed: {err}");
+            }
+        });
+
+        Ok(())
+    }
+}
+
+/// Append encoded H.264 bytes to the debug dump file/pipe (if enabled).
+fn dump_h264_to(path: &str, encoded: &[u8]) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = f.write_all(encoded);
     }
 }
 
