@@ -41,6 +41,9 @@ use uuid::Uuid;
 mod take_catalog;
 use take_catalog::TakeCatalog;
 
+#[cfg(feature = "companion-ui")]
+pub mod companion_ui;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityMode {
     TrustedLan,
