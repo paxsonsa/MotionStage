@@ -33,6 +33,8 @@ pub struct PyMotionStageServer {
     // Single-flight gate for the off-thread video encode+push pipeline.
     video_encode_inflight: Arc<AtomicBool>,
     debug_h264_path: Option<String>,
+    // Companion UI listener, lazily started on first request and held alive here.
+    companion_ui: std::sync::Mutex<Option<motionstage_server::companion_ui::CompanionUiHandle>>,
 }
 
 #[pymethods]
@@ -88,6 +90,7 @@ impl PyMotionStageServer {
             video_fps: std::sync::atomic::AtomicU32::new(24),
             video_encode_inflight: Arc::new(AtomicBool::new(false)),
             debug_h264_path,
+            companion_ui: std::sync::Mutex::new(None),
         })
     }
 
@@ -103,6 +106,59 @@ impl PyMotionStageServer {
         self.rt
             .block_on(self.server.stop())
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    /// Start the companion-UI listener (idempotent) and return its bound port.
+    ///
+    /// Lazily spawns one axum HTTP+WebSocket listener on this server's Tokio
+    /// runtime, holding a clone of the `ServerHandle`. Repeated calls return the
+    /// already-bound port without binding twice.
+    pub fn start_companion_ui(&self) -> PyResult<u16> {
+        let mut slot = self
+            .companion_ui
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        if let Some(handle) = slot.as_ref() {
+            return Ok(handle.port());
+        }
+        let token = Some(Uuid::new_v4().to_string());
+        let handle = self
+            .rt
+            .block_on(motionstage_server::companion_ui::serve_companion_ui(
+                self.server.clone(),
+                token,
+            ))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let port = handle.port();
+        *slot = Some(handle);
+        Ok(port)
+    }
+
+    /// The auth token required on the companion-UI `/ws` upgrade (carried in the
+    /// launch URL). Returns `None` if the UI has not been started.
+    pub fn companion_ui_token(&self) -> PyResult<Option<String>> {
+        let slot = self
+            .companion_ui
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(slot.as_ref().and_then(|h| h.auth_token.clone()))
+    }
+
+    /// Gracefully stop the companion-UI listener if running.
+    pub fn stop_companion_ui(&self) -> PyResult<()> {
+        let handle = {
+            let mut slot = self
+                .companion_ui
+                .lock()
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            slot.take()
+        };
+        if let Some(handle) = handle {
+            self.rt
+                .block_on(handle.shutdown())
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn upsert_scene(&self, spec: &Bound<'_, PyDict>) -> PyResult<String> {

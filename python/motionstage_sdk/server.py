@@ -429,6 +429,28 @@ class MotionStageServer:
     def video_peer_count(self) -> int:
         return self._native.video_peer_count()
 
+    # --- Companion UI ---
+
+    def start_companion_ui(self) -> int:
+        """Start the embedded companion-UI listener (idempotent); return its port."""
+        return int(self._native.start_companion_ui())
+
+    def companion_ui_token(self) -> str | None:
+        """Auth token carried in the companion-UI URL, or None if not started."""
+        token = self._native.companion_ui_token()
+        return str(token) if token is not None else None
+
+    def companion_ui_url(self) -> str:
+        """Token-bearing localhost URL for opening the companion UI in a browser."""
+        port = self.start_companion_ui()
+        token = self.companion_ui_token()
+        base = f"http://127.0.0.1:{port}/"
+        return f"{base}?token={token}" if token else base
+
+    def stop_companion_ui(self) -> None:
+        """Gracefully stop the companion-UI listener if running."""
+        self._native.stop_companion_ui()
+
     # --- Events ---
 
     def emit_scene_snapshot(self, snapshot: dict[str, Any]) -> None:
