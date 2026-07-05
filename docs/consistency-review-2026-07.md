@@ -355,60 +355,86 @@ server in-process via `motionstage_sdk` → native `motionstage_sdk_rust`
 
 ---
 
-## 5. iOS app (`cinemotion-ios`)
+## 5. iOS app (`motionstage-ios`)
 
-Candidly: CineMotion is a UI/architecture scaffold, not yet a MotionStage
-client. Zero references to MotionStage, QUIC, discovery, or CoreMotion; the
-only dependency is `stasel/WebRTC`.
+> Note: this section originally reviewed `cinemotion-ios`, which is now
+> **obsolete** — it was a UI scaffold with a faked connect flow (hardcoded 3 s
+> sleep), an empty `Networking` actor, no SDK/QUIC/CoreMotion usage, and
+> crash-on-error WebRTC experiments. Its successor, `motionstage-ios`, was
+> audited in its place; the old repo should be archived.
 
-- **Connection is faked.** `Connect` sets `.connecting`, the real call is
-  commented out, then a hardcoded 3 s sleep dispatches `Connected`
-  (`Commands/Connect.swift:22-40`). The status light and mode-picker gating
-  run off that timer.
-- **Mode changes never reach a server.** `UpdateMode` mutates local state and
-  returns `.none` (`Commands/UpdateMode.swift:19-23`); it also duplicates the
-  server's mode enum as a String enum with no wire mapping
-  (`State/Mode.swift:11-17`).
-- `Services/Networking.swift` is `actor Networking {}` — empty.
-- The WebRTC path is a manual base64 SDP copy/paste experiment whose data
-  channel echoes bytes back (`Services/WebRTC.swift:49-67,128-132`), with
-  `fatalError` on most failure paths; `SignalingDemo.swift` posts
-  `{"hello":"world"}` to a hardcoded localhost HTTP endpoint that no server
-  implements. Neither matches the server's video model (server-owned WebRTC
-  peers, SDP/ICE over QUIC control messages).
-- Tests: the one substantive unit test (`EngineTests.swift`) doesn't compile
-  against current APIs; the rest are Xcode templates.
+The rewrite is a genuinely substantial, well-structured SwiftUI app (38 Swift
+files; Observation-framework services, viewport with Metal grid + video
+renderer + HUD, Live/Record/Reset/Zero/lens-ring controls, connection sheet,
+settings). It fixes essentially everything wrong with the old app:
 
-What's worth keeping: the unidirectional `Engine`/`Command`/`ViewModel` core
-(`Core/Engine.swift:11-59`, `Core/ViewModel.swift:15-68`) is a solid little
-TCA-style foundation, well suited to folding a server event stream into app
-state.
+- **Real connection**: `MotionStageService.connect` calls the SDK over the
+  Rust QUIC FFI, sets `.error` on failure — no fake path remains
+  (`Services/MotionStageService.swift:50-76`).
+- **Real discovery**: `NWBrowser` Bonjour browse of `_motionstage._udp`, TXT
+  parsing (`port`, `cert_fp`), IPv4/IPv6 socket-address formatting for Rust
+  (`Services/DiscoveryService.swift:28-251`).
+- **Real motion**: ARKit 6DOF at ~60 Hz with Y-up→Z-up conversion and
+  quaternion continuity, decoupled from a `CADisplayLink` send loop
+  (30-120 Hz, last-value-wins), idle-gated
+  (`Services/MotionTrackingService.swift:110-179`,
+  `Services/MotionPipeline.swift:64-111`).
+- **Mode confirmed by server**: optimistic flip, then reconcile/revert from
+  the server response (`MotionStageService.swift:144-162`).
+- Clean error hygiene: no `fatalError`/`try!`/`as!`/TODOs in app code; video
+  errors surface to UI state.
 
-### Path to a real client
+### Critical finding: the app builds against a phantom SDK
 
-1. Depend on `swift/MotionStageClient` (the wrapper over the Rust QUIC FFI) —
-   delete the SDP-paste WebRTC path, `SignalingDemo`, and the local `Mode`
-   enum in favor of the SDK's `RuntimeMode`.
-2. Implement `Networking` as an actor wrapping `MotionStageClient`:
-   `connect(serverAddress:pairingToken:apiKey:)` behind the existing
-   `Connect` command; `Connected` fires only on `RegisterAccepted`.
-3. Make `UpdateMode` call `setMode` and fold the *returned authoritative
-   mode* into state (optimistic UI optional, but confirm against the server).
-4. Add CoreMotion → `sendPosition` streaming (the whole point of a phone
-   client), with a UI toggle and rate control.
-5. Add Bonjour discovery of `_motionstage._udp.local` for a server picker.
-6. Then grow toward the cooperative features as §1/§3 land server-side: scene
-   tree view, mapping list ("this phone drives camera.position"), recording
-   control, session roster.
+The Xcode project references a **local** package at
+`../cinemotion/swift/MotionStageClient` (`project.pbxproj:208, 630-632`) —
+i.e. a sibling checkout of the server repo on the developer's machine. The
+API surface the app consumes does not exist in the pushed MotionStage repo:
 
-Note the SDK itself will constrain step 6: the Swift FFI currently exposes only
-`connect/send_vec3f/set_mode` and hardcodes roles `[MotionSource, Operator]`
-and features `[Motion, Mapping, Recording]` (no `Video`)
-(`crates/motionstage-sdk-swift/src/lib.rs:122-124`). Widening the wire
-protocol (§1.5) must be followed by widening this FFI, and the client still
-uses `new_insecure_for_local_dev` TLS — fine for LAN dev, flagged already in
-`docs/ios-integrators.md:57`, but needs a real verification path before any
-public build.
+| App expects | Pushed SDK/FFI has |
+|---|---|
+| `init(deviceName:outputAttributes:[AttributeKey])` (typed, plural) | single `outputAttribute: String` |
+| `connect(...fingerprint:)` (cert pinning) | no fingerprint param |
+| `setDataFlow(_:)` + `setRecording(_:)` mode split | flat `setMode(RuntimeMode)` |
+| `sendMotionFrame` (`CameraMotionFrame`), `sendFloat(attribute:value:)` | `sendPosition(x:y:z:)` only |
+| `resetScene()` | — |
+| `client.events` async stream (connected/reconnecting/…) | — |
+| Video signaling (`createVideoOffer`, `sendVideoAnswer`, `sendVideoIce`, `nextVideoSignal`, `videoStreamStatus`) | — |
+
+The FFI header (`crates/motionstage-sdk-swift/include/motionstage_swift.h:23-56`)
+confirms only `new/connect/disconnect/send_vec3f/set_mode/session_id/device_id/
+last_error`. **No remote branch of MotionStage contains the richer SDK either**
+(`swiftbridge-prototype`, `reengine`, `clienttui` are older divergent trees).
+So the SDK — and presumably matching server-side protocol work
+(`setDataFlow`/`setRecording` split, `resetScene` over the wire, connection
+events, client-side video signaling) — exists only in an unpushed local
+working copy. Until that lands, the app cannot be built from the pushed
+repos, and this review's protocol audit (§1) understates the in-flight
+protocol. **Pushing that SDK/server work is the highest-priority iOS action.**
+
+### Remaining gaps in the app itself
+
+- **Connection events dropped on the floor.** The app consumes `client.events`
+  but only logs them (`MotionStageService.swift:219-238`); a transport drop
+  leaves the UI showing connected until a 30-consecutive-send-failure circuit
+  breaker trips (`:19-20, 180-185`). Reconnect state should feed
+  `connectionState` and the HUD.
+- **MappingView is a static mock** — hardcoded attribute list, `"--"` targets
+  (`Views/Mapping/MappingView.swift:26-33`, `AttributeRow.swift:22`). No
+  mapping RPCs exist for it to call (§1.2) — this is the concrete iOS
+  casualty of the missing wire mapping surface.
+- **Two divergent "zero" semantics**: HUD "Zero Origin" calls server
+  `resetScene()` (`ViewportView.swift:53-55`) while the sidebar ZERO button
+  resets only the local ARKit origin (`SetOriginButton.swift:7-8`). Likely a
+  bug; at minimum confusing.
+- **Manual connect can't cert-pin** — discovered-server connect passes the
+  TXT `cert_fp`, manual entry omits fingerprint (`ConnectionSheet.swift:221-236`).
+- No UI for: baseline commit (only reset), take management/export, session
+  roster, mapping management — mostly blocked on §1/§3 server work.
+- **Tests are empty stubs** (one assertion-free `@Test`, template UI tests) —
+  though coordinate conversion, socket-address formatting, TXT parsing, and
+  mode reconciliation are all pure and easily testable. A good DEBUG preview
+  harness exists (`PreviewHarness`/`PreviewData`) but nothing automated.
 
 ---
 
@@ -442,7 +468,7 @@ public build.
 | 1 | Event plane (§3): event bus + wire events + real `SceneSynced` snapshot + Python delegate fed by events | Root cause of the reported symptom; unblocks everything below |
 | 2 | Blender addon stabilization (§4.1–4.2): single update path, lock, enum-item caching, mapping persistence/rehydration | Converts the addon from two racing pollers to one event consumer; fixes the jank users feel |
 | 3 | Wire surface completion (§1.5): mapping CRUD/list + scene read over QUIC; expose `update_mapping`/`set_mapping_lock`/descriptor or delete them | Makes devices first-class citizens; prerequisite for a useful iOS app |
-| 4 | iOS: adopt `MotionStageClient`, real connect/mode/motion (§5 steps 1–5) | The app is greenfield past its state engine; build on the fixed protocol, not the current one |
+| 4 | iOS: **push the local SDK/server work** the `motionstage-ios` app builds against (phantom `../cinemotion` package, §5), then reconcile it with the event plane; wire reconnect events into UI; real MappingView | The app is already substantial but unbuildable from the pushed repos; landing the in-flight SDK changes the protocol picture in §1 |
 | 5 | Protocol hygiene: version negotiation fix, handshake error replies, naming normalization (§1.3–1.4) | Cheap, but touches wire compat — bundle with the event-plane minor bump |
 | 6 | Video: expose descriptor management, wire the frame pipeline into `WebRtcSession`, or explicitly descope video from v1 | Currently half-built and unreachable; decide rather than drift |
 
