@@ -133,29 +133,51 @@ Consequences:
 
 > **Design decisions confirmed (July 2026, owner):** (a) the DCC hosting the
 > server in-process is the intended topology — devices are the only wire
-> clients; (b) cooperation scope is one DCC + devices, not multi-DCC;
-> (c) the `setDataFlow`/`setRecording` split from the in-flight iOS SDK is
-> the new canonical mode model, replacing the `Idle/Live/Recording` tristate;
-> (d) DCC-viewport→device video is a core feature. The recommendations below
-> reflect those decisions.
+> clients; (b) devices are **concurrent operators**, not passive sources: the
+> target workflow is a single artist running an almost-complete mocap session
+> from their phone/iPad — browsing the scene, binding their device, driving
+> takes — while the DCC+server remains the authority and the place scenes are
+> authored. No multi-DCC support needed; (c) the `setDataFlow`/`setRecording`
+> split from the in-flight iOS SDK is the new canonical mode model, replacing
+> the `Idle/Live/Recording` tristate; (d) DCC-viewport→device video is a core
+> feature. The recommendations below reflect those decisions.
 
-**Formalize the wire as the device plane** (per decision a/b) — the in-process
-`ServerHandle`/Python API stays the control plane where scenes and mappings
-are authored. Document that explicitly, then close the gaps the device plane
-actually has:
+**Guiding model (owner's framing): a multiplayer game server.** The runtime
+is the authoritative simulation; devices *and the DCC* are all "players" —
+the DCC is simply a very special player (it authors the scene and hosts the
+server in-process, like a listen server in games). This framing resolves the
+two-disjoint-surfaces problem of §1.1 at the conceptual level: there are not
+two planes, there is **one session/protocol model with two transports**
+(in-process for the host player, QUIC for remote players). The DCC's
+privileges should be expressed as *roles/capabilities* (e.g. a `SceneAuthor`
+role only the host holds) rather than as a separate API with different
+semantics. Concretely: the in-process bridge may remain a transport shortcut,
+but it should register a real session, hold roles, and consume the same event
+stream as everyone else — no state or notification should exist that only
+one transport can see.
 
-- **Read + subscribe:** devices need the scene/mapping/mode state relevant to
-  them — a real `SceneSynced` snapshot plus the event stream (§3). A device
-  should be able to render "I am mapped to camera.position" without the DCC
-  side-channeling it.
-- **Recording + mode-split control:** the iOS record button implies
-  `SetRecording`/`SetDataFlow` as wire operations (Operator-gated). Recording
-  start/stop is currently host-only; under decision (c) it becomes a
-  first-class wire message pair.
-- **Mapping CRUD stays host-side** (the DCC owns authoring), but add a
-  device-scoped `ListMappings`/mapping events so clients can display their own
-  bindings. Full wire mapping CRUD is explicitly out of scope for this
-  topology.
+**Formalize the wire as the operator plane** (per decisions a/b) — scene
+*authoring* stays a host-player capability, but everything a session
+operator does must work over the wire so a device can run a session
+end-to-end:
+
+- **Read + subscribe:** a real `SceneSynced` snapshot (scene graph with
+  objects/attributes so the device can present target pickers), the mapping
+  list, mode/recording state, and the event stream (§3). A device must render
+  "I am mapped to camera.position" — and everything else about session state
+  — without the DCC side-channeling it.
+- **Mapping management over the wire:** create/remove/list as wire messages.
+  Default scope: a device manages mappings whose *source* is itself
+  ("bind me to that object"); the `Operator` role may manage any mapping. The
+  existing exclusive-owner-per-target-attribute lease model is already the
+  conflict-resolution mechanism between concurrent devices — reuse it
+  unchanged. Scene/object/attribute *authoring* stays host-side.
+- **Recording + mode-split control:** `SetRecording`/`SetDataFlow` as
+  Operator-gated wire operations, including take start/stop with a
+  server-assigned take identity (the phone's record button drives real
+  `.cmtrk` capture, not just a mode flip). Concurrent operator writes to
+  mode/recording are last-write-wins, made safe by the event stream: every
+  client immediately sees the change and its originator.
 - **Mode-split migration (decision c):** replace the core `Mode` tristate
   with two axes (`data_flow: on/off`, `recording: on/off`) through Rust core,
   wire, Python, and Blender. One semantic must be nailed down before
@@ -268,11 +290,14 @@ Add a server→client event stream, and make **both** SDK surfaces consume it:
    never-fired callbacks and delete the 3-cadence poller.
 5. **Cooperative niceties this unlocks cheaply:** session list with
    roles/device names in every client and "mapping owned by <device>" labels.
-   (Scope note: cooperation target is confirmed as one DCC + devices — no
-   multi-DCC attribution or conflict semantics needed. Keep `seq` and
-   originating `session_id` in the event envelope anyway: `seq` is required
-   for reconnect correctness regardless, and the originator field costs
-   nothing now but avoids a breaking change if multi-user ever arrives.)
+   (Scope note: cooperation target is one DCC + devices, but devices are
+   **concurrent operators** — several phones/iPads may flip mode, start
+   takes, and rebind mappings at once. Originator `session_id` in every event
+   is therefore required, not optional: it's how a device UI explains "iPad-A
+   started recording" and how clients suppress echoes of their own actions.
+   `seq` is likewise required for reconnect correctness. Mapping conflicts
+   are already arbitrated by the exclusive-owner lease model; mode/recording
+   writes are last-write-wins with immediate event fan-out.)
 
 This is the single highest-leverage change in the system; almost every other
 complaint (Blender jank, iOS emptiness, doc divergence) gets simpler once
@@ -492,8 +517,8 @@ protocol. **Pushing that SDK/server work is the highest-priority iOS action.**
 |---|---|---|
 | 1 | Event plane (§3): event bus + wire events + real `SceneSynced` snapshot + Python delegate fed by events | Root cause of the reported symptom; unblocks everything below |
 | 2 | Blender addon stabilization (§4.1–4.2): single update path, lock, enum-item caching, mapping persistence/rehydration | Converts the addon from two racing pollers to one event consumer; fixes the jank users feel |
-| 3 | Device-plane completion (§1.5): scene/mapping read + events over QUIC, `SetDataFlow`/`SetRecording` wire ops, mode-split migration through core/Python/Blender | Devices become first-class per the confirmed embedded topology; single protocol bump together with #1 and #5 |
-| 4 | iOS: **push the local SDK/server work** the `motionstage-ios` app builds against (phantom `../cinemotion` package, §5), then reconcile it with the event plane; wire reconnect events into UI; real mapping display via device-scoped `ListMappings` | The app is already substantial but unbuildable from the pushed repos; landing the in-flight SDK changes the protocol picture in §1 |
+| 3 | Operator-plane completion (§1.5): scene read + events over QUIC, wire mapping create/remove/list (device-scoped, lease-arbitrated), `SetDataFlow`/`SetRecording` + take control, mode-split migration through core/Python/Blender | Devices become full session operators per the confirmed workflow (run a mocap session from the phone); single protocol bump together with #1 and #5 |
+| 4 | iOS: **push the local SDK/server work** the `motionstage-ios` app builds against (phantom `../cinemotion` package, §5), then reconcile it with the event plane; wire reconnect events into UI; replace the mock MappingView with real wire mapping management (browse scene targets, bind self, see ownership) | The app is already substantial but unbuildable from the pushed repos; landing the in-flight SDK changes the protocol picture in §1 |
 | 5 | Protocol hygiene: version negotiation fix, handshake error replies, naming normalization (§1.3–1.4) | Cheap, but touches wire compat — bundle with the event-plane minor bump |
 | 6 | Video (confirmed core feature): expose descriptor management to the host/Python API, wire the frame pipeline into `WebRtcSession`, fix the Blender capture hot path (§ addendum), land the iOS receive path | Both client ends already invested; the server middle is the missing third of the pipeline |
 
