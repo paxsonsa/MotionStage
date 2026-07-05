@@ -6,7 +6,49 @@
 - Deterministic mapping and export behavior
 - Separation of control plane, data plane, and DCC outputs
 - Transport/version gates at decode boundaries
-- Integrator-friendly surfaces for Rust and Python
+- Integrator-friendly surfaces for Rust, Python, and Swift
+- One session/protocol model for every participant, regardless of transport
+
+## Topology and Scope
+
+The mental model is a **multiplayer game server**.
+
+- The runtime is the authoritative simulation. All state lives in it; all
+  changes flow through it; it replicates state changes out to everyone.
+- Devices (phones, tablets, trackers) and the DCC are all **players**.
+- The DCC is **the host**: a special player that authors the scene
+  (object/attribute definitions), renders outputs, and runs the server
+  in-process — a listen server. Host privileges are expressed as
+  roles/capabilities (e.g. `SceneAuthor`), not as a separate API with
+  different semantics.
+- There is **one session model with two transports**: in-process for the
+  host, QUIC for remote players. No state or notification may exist that
+  only one transport can observe. The host's bridge registers a real
+  session, holds roles, and consumes the same event stream as every other
+  player.
+- Joining follows the game pattern: connect → handshake → **initial world
+  snapshot** (scene graph, mappings, mode, current sequence number) → ordered
+  **delta replication** (state events). Reconnect is a rejoin: present the
+  last seen sequence number, receive replay or a fresh snapshot.
+
+Scope decisions:
+
+- **Single stage, single host.** One DCC per session; multi-DCC is out of
+  scope.
+- **Devices are concurrent operators.** A single artist with a phone/iPad can
+  run an almost-complete mocap session from the device: browse the scene,
+  bind their device to targets, control data flow and recording, manage
+  takes. Scene authoring remains a host capability.
+- **Conflict handling stays lightweight.** Mapping contention is arbitrated
+  by the exclusive-owner-per-target-attribute lease model. Mode/recording
+  writes are last-write-wins, made safe by immediate event fan-out carrying
+  the originating session.
+- **Mode model is two axes**, `data_flow: on|off` and `recording: on|off`,
+  replacing the earlier `Idle/Live/Recording` tristate. `recording=on`
+  requires `data_flow=on`; mapping mutations are blocked while recording is
+  active. (Sections below that reference the tristate describe the current
+  implementation and migrate under this model.)
+- **DCC-viewport→device video is a core feature**, not an experiment.
 
 ## System Topology
 

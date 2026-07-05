@@ -513,6 +513,11 @@ protocol. **Pushing that SDK/server work is the highest-priority iOS action.**
 
 ## 7. Suggested sequencing
 
+> Superseded in detail by `roadmap-v2.md` (phased plan with exit criteria,
+> incorporating the confirmed design decisions) and `design-scene-management.md`
+> (takes/tracks/replay + USD). The table below is the original review-time
+> ordering, kept for context.
+
 | Order | Work | Why first |
 |---|---|---|
 | 1 | Event plane (§3): event bus + wire events + real `SceneSynced` snapshot + Python delegate fed by events | Root cause of the reported symptom; unblocks everything below |

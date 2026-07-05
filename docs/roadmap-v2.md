@@ -1,0 +1,33 @@
+# Roadmap: v2 Architecture
+
+Target: the model described in `design-architecture.md` → "Topology and
+Scope" — one authoritative simulation, all participants (host DCC + device
+operators) as sessions on a single protocol model, snapshot + delta
+replication, operator plane over the wire, video as a core feature.
+Findings and evidence behind each item: `consistency-review-2026-07.md`.
+
+Phases are ordered by dependency. P1+P2+P3 together are one protocol
+version bump — the wire should break once, not three times.
+
+| Phase | Body of Work | Key Steps | Exit Criteria |
+|---|---|---|---|
+| P0 | **Land in-flight work** | Push the local `cinemotion` SDK/server changes that `motionstage-ios` builds against (mode split, connection events, video signaling, typed attributes, fingerprint connect). Reconcile with this roadmap before building further on it. | `motionstage-ios` compiles from pushed repos; the richer Swift SDK surface exists in `MotionStage` main history. |
+| P1 | **Event plane + unified session model** | `StateEvent` enum in `motionstage-protocol` (mode, scene load/activate, scene delta, mapping created/updated/removed/locked/released, baseline applied, session joined/left, recording started/stopped) with monotonic `seq` + originating `session_id`. Per-session outbound event delivery on the QUIC side; event bus inside `ServerHandle` so every mutation emits exactly once. `SceneSynced` sends a real snapshot (scene graph + mappings + mode + seq). Reconnect = snapshot-or-replay from last seen seq. Host bridge (pyo3) becomes a real session: registers, holds roles, consumes the same events; the Python delegate's `on_scene_snapshot` / `on_mapping_event` / `on_recording_event` fire from events; the 3-cadence polling pump is deleted. | A mutation from any session is observed by every other session (both transports) without polling; Python delegate tests assert all six callbacks fire; no reader of `last_published_snapshot` remains (field deleted or repurposed as the event-plane snapshot source). |
+| P2 | **Mode-split migration** | Replace `Mode` tristate with `data_flow: on/off` + `recording: on/off` through core, wire, Python, Blender. Enforce: `recording=on` ⇒ `data_flow=on` (reject or auto-enable — pick one and document); mapping mutations blocked while `recording=on`. Map legacy vocabulary (`idle`=flow off, `live`=flow on, `recording`=both) at SDK boundaries for one deprecation cycle. | Core state machine tests cover all four axis combinations; recording-dead-air is unrepresentable; Blender UI and Python SDK expose the two axes. |
+| P3 | **Operator plane + protocol hygiene** | Wire messages: scene read (host-authored graph, for device target pickers), mapping create/remove/list (device manages own-source mappings; `Operator` manages any; lease model arbitrates), `SetDataFlow`/`SetRecording`, take start/stop with server-assigned take identity. Widen the Swift FFI accordingly. Hygiene in the same bump: store + stamp the negotiated protocol minor; typed `Error`/`RegisterRejected` before every handshake drop; naming normalization (`target_object_id` everywhere, one casing per serialization boundary, retire the `stopped` alias); expose or delete `update_mapping`/`set_mapping_lock`/allowlist. | A device with no DCC-side help can: join, browse the scene, create a mapping to a target, go live, record a take, stop, and see the take identity — exercised by an integration test using the simulator client. Older-minor client interop test passes. |
+| P4 | **Client adoption** | Blender: consume events instead of polling (single main-thread update path stays), enum-items caching keyed by catalog revision, mapping persistence-as-intent + rehydration via `load_post`, CI passes `--python-sdk-dir`, `bl_info`/manifest aligned, calibration math tests + position re-anchor, JSON dump out of `draw`. iOS: reconnect events feed `connectionState`/HUD, MappingView backed by wire mapping ops, manual connect accepts fingerprint, unit tests for the pure functions (coordinate conversion, address formatting, TXT parsing, mode reconciliation). | Blender UI reflects a remote client's change within one timer tick with zero polls of `sessions()`; mappings survive `.blend` reload; released bundle contains `motionstage_sdk`; iOS shows reconnecting state and real mappings. |
+| P5 | **Video pipeline (core feature)** | Expose master-descriptor management to the host API (Python); wire the frame pipeline (`VideoStreamEndpoint`/`FramePushSink`) into `WebRtcSession` so `add_h264_track` is actually fed; Blender capture hot-path fixes (preallocated buffer, flip in consumer, debug paths out of production); land the iOS receive path against the pushed SDK. | Blender viewport visible on an iOS device end-to-end from pushed repos; frame-rate/latency measured and recorded in `hardening.md`. |
+| P6 | **Scene management: takes, tracks, replay, USD** | Per `design-scene-management.md`: server-owned take library (identity, slate/numbering, per-attribute tracks, markers), replay as a virtual player through the same apply path, transport controls, and USD adoption Level A (real UsdGeom export) then Level B (takes as USD layers). | A take recorded from a phone can be listed, replayed onto the scene, and opened in Blender/usdview as proper time-sampled USD. |
+
+## Sequencing notes
+
+- P0 is strictly first: it changes the protocol picture P1-P3 build on.
+- P1 is the root fix for "clients act, DCCs don't hear about it" — every
+  later phase assumes replication exists.
+- P4 client work can start against P1 as soon as events exist; it does not
+  need P3's operator plane.
+- P5 depends only on P0 (signaling exists today); listed after P4 because
+  state sync fixes the reported pain, but video can proceed in parallel if
+  staffed separately.
+- P6 is design-complete-first: agree on `design-scene-management.md`, then
+  implement — its wire ops ride the P3 message surface.
