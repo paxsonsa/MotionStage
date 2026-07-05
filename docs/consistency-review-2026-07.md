@@ -445,3 +445,82 @@ public build.
 | 4 | iOS: adopt `MotionStageClient`, real connect/mode/motion (§5 steps 1–5) | The app is greenfield past its state engine; build on the fixed protocol, not the current one |
 | 5 | Protocol hygiene: version negotiation fix, handshake error replies, naming normalization (§1.3–1.4) | Cheap, but touches wire compat — bundle with the event-plane minor bump |
 | 6 | Video: expose descriptor management, wire the frame pipeline into `WebRtcSession`, or explicitly descope video from v1 | Currently half-built and unreachable; decide rather than drift |
+
+---
+
+## Addendum: re-audit of `motionstage/stability-and-state-simplification` (blender addon)
+
+The branch (+2,260 lines over `main`) was re-audited against the ten defects in
+§4. It makes real progress on the threading story and adds significant new
+surface (GPU offscreen video capture, quaternion calibration, camera-relative
+routing, one-click default mappings, companion UI).
+
+### Scorecard vs the original findings
+
+| # | Finding (§4) | Verdict |
+|---|---|---|
+| 1 | EnumProperty items string-lifetime bug | **Not fixed** — callbacks (`addon.py:120-186`) still return fresh lists; exposure reduced only because the mapping sub-panels were unregistered (`_CLASSES`, 2807-2815), but the properties/callbacks are still live |
+| 2 | Cross-thread dict races | **Fixed** for mode + client/source catalog — Phase 2 makes the SDK pump log-only (`service.py:568-596`); main-thread `refresh_*` is the single writer, locked in by a test. Residual: `capture_attribute_batch` still appends `samples` from the bg thread (598-635) — benign under the GIL, a lock would make it airtight |
+| 3 | Silent redraw skips on exception | **Partially fixed** — timer body and all draws now log/render errors; change-detection gating retained by design |
+| 4 | Two redundant pollers | **Fixed** — single writer on the main-thread timer; pump only feeds the sample queue |
+| 5 | Mapping persistence / rehydration / undo | **Not fixed** — still no `load_post`/undo handlers; `SERVICE.mappings` is still a module singleton wiped on reload while the `.blend` mirror is one-way. New partial runtime self-heal: `_clear_disconnected_mapping_sources` (`service.py:1178-1206`) |
+| 6 | `rotation_mode` mutation on resync/commit | **Not fixed** (unchanged; live-apply path does it per sample too) |
+| 7 | Selection clobbers mapping target + UIList hiding | **Mostly moot by removal** — the mapping panel/UIList are unregistered (moved to companion UI), but the per-tick overwrite of `mapping_target_object` still runs (`addon.py:1342-1346`) |
+| 8 | JSON logging in `draw` | **Not fixed** — `_draw_main_header` still builds the full state payload + `json.dumps` per redraw (`addon.py:2389`, `625-632`) |
+| 9 | Connection-health surfacing | **Not fixed** — `is_connected` is still `server is not None` (`service.py:1003`); errors now logged; new health is video-only |
+| 10 | Packaging | **Partially fixed** — `build_bundle.py --python-sdk-dir` can now vendor the pure-Python SDK (101-119), **but CI never passes the flag** (build-bundle.yml:95, release.yml:76), so released bundles still risk missing `motionstage_sdk`. cp311 pin, `bl_info` 4.0 vs manifest 4.2 mismatch, and fake-wheel bundle test all unchanged |
+
+### New issues introduced on the branch
+
+- **Capture hot path cost** (`capture.py:46-128`): per frame — full offscreen
+  draw, `read_color` readback, `bytes()` copy, then a pure-Python per-row flip
+  (two full-frame copies, ~3-4 MB each) synchronously inside a `POST_PIXEL`
+  draw handler at up to 30 fps. Fine at 720p, will hurt at 1080p+. Preallocate
+  and flip in the consumer (or negotiate stride/orientation) instead.
+- **Debug cruft in production path**: `MOTIONSTAGE_TEST_PATTERN` renders the
+  scene then discards it for a Python-loop gradient (72-88); `_save_debug_png`
+  writes hardcoded `/tmp/motionstage_debug.png` from inside the draw callback
+  (196-228).
+- **No-viewport blind spot**: streaming "on" with no visible VIEW_3D means the
+  draw handler never fires — status shows configured forever with no frames
+  and no user-visible warning.
+- **Camera-relative position math** (`_apply_live_position_camera_relative`,
+  `addon.py:257-302`): anchors orientation from `matrix_world` but writes
+  `obj.location` (local) — inconsistent frame for parented objects; unlike the
+  rotation path there is **no re-anchor threshold**, so a device re-zero
+  mid-stream jumps the object. The Rx(−90) `(x, z, -y)` re-express has zero
+  tests. (The quaternion rotation path itself — shortest-path sign fix,
+  normalization, jump re-anchor — is sound.)
+- **`start_companion_ui` mutates `os.environ`** based on a hardcoded
+  sibling-repo dev path (`service.py:227-231`) — silent env pollution;
+  harmless when the path is absent but shouldn't ship.
+- **RGBA/BGRA is env-var-selected** (`MOTIONSTAGE_VIDEO_PIXEL_FORMAT`,
+  `service.py:895-896`) — silent red/blue swap if encoder expectations differ.
+- **Throttling latency**: idle tick is 66 ms and external mode changes poll at
+  250 ms, so motion onset can lag ~0.25-0.3 s before the timer ramps to
+  120 Hz, and companion-UI actions wait up to a tick to be drained. Samples
+  aren't lost (deque), but first frames of a take apply late.
+- **Draw-handler lifecycle is solid** (guarded add, safe remove order,
+  deferred teardown after repeated failures, unregister cleanup) — credit
+  where due.
+
+### State-model verdict
+
+The **concurrency** model is genuinely simpler (single writer for mode +
+catalog; server clearly authoritative for those). The **state topology** is
+not: state now lives in five places (Rust runtime, `SERVICE` singleton, the
+persisted PropertyGroup mirror, module-global calibration/timer/video dicts,
+and the companion UI), and the mapping double-truth (§4.2) is untouched. Tests
+improved meaningfully at the service layer, but `addon.py` and `capture.py` —
+including all the new math — remain entirely untested.
+
+### Priority residuals on this branch
+
+1. Enum-items string retention (one small cache keyed by catalog revision).
+2. Mapping persistence/rehydration + `load_post`/undo handlers — the remaining
+   data-loss path.
+3. CI: pass `--python-sdk-dir` in both workflows; fix `bl_info` vs manifest;
+   test against a real wheel.
+4. Position-path re-anchor + frame consistency, with tests for both
+   calibration functions (pure-math, easily testable without `bpy`).
+5. Drop the JSON state dump from `draw`.
