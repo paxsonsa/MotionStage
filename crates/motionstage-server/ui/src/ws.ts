@@ -68,6 +68,12 @@ function reduce(state: State, action: Action): State {
       return state.data ? { ...state, data: { ...state.data, video: msg.video } } : state;
     case "metrics":
       return state.data ? { ...state, data: { ...state.data, metrics: msg.metrics } } : state;
+    case "takes_changed":
+      return state.data
+        ? { ...state, data: { ...state.data, takes: msg.takes, playback: msg.playback } }
+        : state;
+    case "selection_changed":
+      return state.data ? { ...state, data: { ...state.data, selected: msg.selected } } : state;
     case "command_error":
       return { ...state, lastError: msg.message };
     default:

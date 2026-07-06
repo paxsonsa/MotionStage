@@ -3,6 +3,7 @@ dist/*.xcframework
 swift/MotionStageClient/Artifacts/*.xcframework
 swift/**/.build/
 swift/**/.swiftpm/
+dist/
 
 .vscode/
 .DS_Store

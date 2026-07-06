@@ -451,6 +451,16 @@ class MotionStageServer:
         """Gracefully stop the companion-UI listener if running."""
         self._native.stop_companion_ui()
 
+    def drain_host_requests(self) -> list[dict[str, Any]]:
+        """DCC-side actions the companion UI requested, for the host to execute on
+        its main thread. Each dict has a ``kind`` discriminator (resync_scene,
+        start_video, stop_video, bake_take)."""
+        return list(self._native.drain_host_requests())
+
+    def set_host_selection(self, names: list[str]) -> None:
+        """Report objects selected in the host DCC (by name) for UI highlight."""
+        self._native.set_host_selection([str(n) for n in names])
+
     # --- Events ---
 
     def emit_scene_snapshot(self, snapshot: dict[str, Any]) -> None:

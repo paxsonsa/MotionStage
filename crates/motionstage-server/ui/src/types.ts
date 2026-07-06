@@ -57,7 +57,7 @@ export interface UiSession {
   session_id: string | null;
   roles: string[];
   features: string[];
-  advertised_attributes: { name: string; value_type: string }[];
+  advertised_attributes: { path: string; value_type: string }[];
   state: string;
 }
 
@@ -78,12 +78,32 @@ export interface VideoStatus {
   last_frame_age_ms: number | null;
 }
 
+export interface UiTake {
+  take_id: string;
+  scene_id: string;
+  name: string;
+  frame_count: number;
+  created_ns: number;
+  selected: boolean;
+}
+
+export interface UiPlayback {
+  take_id: string;
+  state: "stopped" | "playing" | "paused";
+  position_ns: number;
+  duration_ns: number;
+  looping: boolean;
+}
+
 export interface AppData {
   scene: UiSceneState;
   mode: UiMode;
   sessions: UiSession[];
   metrics: UiMetrics;
   video: VideoStatus;
+  takes: UiTake[];
+  playback: UiPlayback | null;
+  selected?: string[]; // object names selected in the host DCC (Blender), for highlight
 }
 
 export type ServerToUi =
@@ -95,6 +115,8 @@ export type ServerToUi =
   | { type: "session_removed"; device_id: string }
   | { type: "video_status_changed"; video: VideoStatus }
   | { type: "metrics"; metrics: UiMetrics }
+  | { type: "takes_changed"; takes: UiTake[]; playback: UiPlayback | null }
+  | { type: "selection_changed"; selected: string[] }
   | { type: "command_error"; message: string };
 
 export interface UiAttributeValue {

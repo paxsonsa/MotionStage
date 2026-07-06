@@ -35,7 +35,7 @@ async fn serves_index_over_bound_port() {
         response.lines().next().unwrap_or_default()
     );
     assert!(
-        response.contains("MotionStage Companion"),
+        response.contains("MotionStage"),
         "index should contain the app title"
     );
 
@@ -110,6 +110,55 @@ where
             return serde_json::from_str(&text).expect("valid json frame");
         }
     }
+}
+
+#[tokio::test]
+async fn ws_snapshot_carries_takes_and_bridges_host_requests() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let server = ServerHandle::new(ServerConfig::default());
+    // Keep a clone to drain the host-request queue the WS handler fills.
+    let ui = serve_companion_ui(server.clone(), None).await.expect("bind");
+    let url = format!("ws://127.0.0.1:{}/ws", ui.port());
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+    // Snapshot now carries a takes array + playback field.
+    let snap = next_json(&mut ws).await;
+    assert_eq!(snap["type"], "snapshot");
+    assert!(snap["takes"].is_array(), "snapshot must include takes");
+    assert!(snap.get("playback").is_some(), "snapshot must include playback");
+
+    // DCC-side commands route to the host-request queue, not ServerHandle.
+    ws.send(Message::Text(r#"{"cmd":"resync_scene"}"#.into())).await.unwrap();
+    ws.send(Message::Text(
+        r#"{"cmd":"start_video","width":1280,"height":720,"fps":24}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Drain (poll briefly — command handling is async on the server task).
+    let mut drained = Vec::new();
+    for _ in 0..40 {
+        drained.extend(server.drain_host_requests().await);
+        if drained.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        drained.iter().any(|r| matches!(r, motionstage_server::HostRequest::ResyncScene)),
+        "resync_scene should reach the host queue, got {drained:?}"
+    );
+    assert!(
+        drained.iter().any(|r| matches!(
+            r,
+            motionstage_server::HostRequest::StartVideo { width: 1280, fps: 24, .. }
+        )),
+        "start_video should reach the host queue, got {drained:?}"
+    );
+
+    ui.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

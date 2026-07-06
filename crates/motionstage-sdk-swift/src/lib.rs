@@ -1030,7 +1030,13 @@ fn make_client_inner(
     // Ensure the global runtime is initialized.
     let _ = get_runtime();
 
-    let device_id = Uuid::now_v7();
+    // A stable identity across reconnects/launches: the host app persists a UUID and
+    // sets MOTIONSTAGE_DEVICE_ID so a returning device resumes its session instead of
+    // appearing as a brand-new client. Falls back to a fresh id when unset.
+    let device_id = std::env::var("MOTIONSTAGE_DEVICE_ID")
+        .ok()
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .unwrap_or_else(Uuid::now_v7);
     let qualified_outputs: Vec<AttributeDescriptor> = source_outputs
         .iter()
         .map(|desc| AttributeDescriptor {

@@ -161,6 +161,55 @@ impl PyMotionStageServer {
         Ok(())
     }
 
+    /// Drain DCC-side actions the companion UI requested, for the plugin to execute
+    /// on its main thread. Returns a list of dicts, each with a `kind` discriminator.
+    pub fn drain_host_requests<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        use motionstage_server::HostRequest;
+        let requests = self.rt.block_on(self.server.drain_host_requests());
+        let mut out = Vec::with_capacity(requests.len());
+        for req in requests {
+            let d = PyDict::new_bound(py);
+            match req {
+                HostRequest::ResyncScene => {
+                    d.set_item("kind", "resync_scene")?;
+                }
+                HostRequest::StartVideo {
+                    width,
+                    height,
+                    fps,
+                    source,
+                } => {
+                    d.set_item("kind", "start_video")?;
+                    d.set_item("width", width)?;
+                    d.set_item("height", height)?;
+                    d.set_item("fps", fps)?;
+                    d.set_item("source", source)?;
+                }
+                HostRequest::StopVideo => {
+                    d.set_item("kind", "stop_video")?;
+                }
+                HostRequest::BakeTake {
+                    take_id,
+                    fps,
+                    start_frame,
+                } => {
+                    d.set_item("kind", "bake_take")?;
+                    d.set_item("take_id", take_id.to_string())?;
+                    d.set_item("fps", fps)?;
+                    d.set_item("start_frame", start_frame)?;
+                }
+            }
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Report the object names selected in the host DCC, for companion-UI highlight.
+    pub fn set_host_selection(&self, names: Vec<String>) -> PyResult<()> {
+        self.rt.block_on(self.server.set_host_selection(names));
+        Ok(())
+    }
+
     pub fn upsert_scene(&self, spec: &Bound<'_, PyDict>) -> PyResult<String> {
         let scene = parse_scene_spec(spec)?;
         let scene_id = self.rt.block_on(self.server.load_scene(scene));

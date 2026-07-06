@@ -9,6 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.1.1",
+    "@fontsource/saira-condensed": "^5.1.1",
+    "@fontsource/saira-semi-condensed": "^5.1.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

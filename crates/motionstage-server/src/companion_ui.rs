@@ -48,13 +48,13 @@ use motionstage_core::{
 };
 use motionstage_protocol::{
     AttributeDescriptor, ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction,
-    RecordingState, SessionState, VideoStreamStatus,
+    PlaybackRuntimeState, RecordingState, SessionState, TakeInfo, VideoStreamStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
-use crate::{now_ns, ServerHandle, SessionInfo};
+use crate::{now_ns, HostRequest, PlaybackStatus, ServerHandle, SessionInfo};
 
 /// How often the connection polls non-event state (snapshot/sessions/metrics/video)
 /// and emits deltas. The runtime publishes at <= 60 Hz, so 30 Hz is comfortably under
@@ -167,14 +167,42 @@ async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
+    // Dev override: serve from a filesystem dir so UI changes show on a browser
+    // refresh without rebuilding/re-embedding the wheel. Set MOTIONSTAGE_UI_DIR to
+    // the built `ui/dist` path. Falls through to embedded assets if absent/missing.
+    if let Ok(dir) = std::env::var("MOTIONSTAGE_UI_DIR") {
+        if let Some(resp) = serve_from_dir(&dir, path) {
+            return resp;
+        }
+    }
+
     if let Some(content) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         return serve_bytes(mime.as_ref(), content.data);
     }
     match Assets::get("index.html") {
         Some(content) => serve_bytes("text/html", content.data),
-        None => (StatusCode::NOT_FOUND, "companion UI assets not built").into_response(),
+        None => (StatusCode::NOT_FOUND, "UI assets not built").into_response(),
     }
+}
+
+/// Read an asset from a filesystem dir (dev override). Path traversal is blocked
+/// by rejecting any `..` segment. SPA fallback to index.html.
+fn serve_from_dir(dir: &str, path: &str) -> Option<Response> {
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    let base = std::path::Path::new(dir);
+    let candidate = base.join(path);
+    let bytes = std::fs::read(&candidate)
+        .ok()
+        .or_else(|| std::fs::read(base.join("index.html")).ok())?;
+    let mime = if std::fs::metadata(&candidate).is_ok() {
+        mime_guess::from_path(path).first_or_octet_stream().to_string()
+    } else {
+        "text/html".to_string()
+    };
+    Some(serve_bytes(&mime, std::borrow::Cow::Owned(bytes)))
 }
 
 fn serve_bytes(content_type: &str, data: std::borrow::Cow<'static, [u8]>) -> Response {
@@ -217,6 +245,13 @@ enum ServerToUi {
     SessionRemoved { device_id: Uuid },
     VideoStatusChanged { video: VideoStreamStatus },
     Metrics { metrics: UiMetrics },
+    /// Recorded takes and/or playback transport changed.
+    TakesChanged {
+        takes: Vec<UiTake>,
+        playback: Option<UiPlayback>,
+    },
+    /// Host-DCC object selection changed (object names), for UI highlight.
+    SelectionChanged { selected: Vec<String> },
     /// A rejected/failed command, echoed back for UI feedback.
     CommandError { message: String },
 }
@@ -228,6 +263,40 @@ struct UiSnapshot {
     sessions: Vec<UiSession>,
     metrics: UiMetrics,
     video: VideoStreamStatus,
+    takes: Vec<UiTake>,
+    playback: Option<UiPlayback>,
+    selected: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct UiTake {
+    take_id: Uuid,
+    scene_id: Uuid,
+    name: String,
+    frame_count: u64,
+    created_ns: u64,
+    selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+struct UiPlayback {
+    take_id: Uuid,
+    #[serde(serialize_with = "ser_playback_state")]
+    state: PlaybackRuntimeState,
+    position_ns: u64,
+    duration_ns: u64,
+    looping: bool,
+}
+
+fn ser_playback_state<S: serde::Serializer>(
+    s: &PlaybackRuntimeState,
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(match s {
+        PlaybackRuntimeState::Stopped => "stopped",
+        PlaybackRuntimeState::Playing => "playing",
+        PlaybackRuntimeState::Paused => "paused",
+    })
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -361,6 +430,44 @@ impl From<&SessionInfo> for UiSession {
     }
 }
 
+impl From<&TakeInfo> for UiTake {
+    fn from(t: &TakeInfo) -> Self {
+        UiTake {
+            take_id: t.take_id,
+            scene_id: t.scene_id,
+            name: t.name.clone(),
+            frame_count: t.frame_count,
+            created_ns: t.created_ns,
+            selected: t.selected,
+        }
+    }
+}
+
+impl From<PlaybackStatus> for UiPlayback {
+    fn from(p: PlaybackStatus) -> Self {
+        UiPlayback {
+            take_id: p.take_id,
+            state: p.state,
+            position_ns: p.position_ns,
+            duration_ns: p.duration_ns,
+            looping: p.looping,
+        }
+    }
+}
+
+/// Takes for the active scene + current playback transport.
+async fn build_takes(server: &ServerHandle, active_scene: Option<SceneId>) -> (Vec<UiTake>, Option<UiPlayback>) {
+    let takes = server
+        .list_takes(active_scene)
+        .await
+        .iter()
+        .filter(|t| !t.deleted)
+        .map(UiTake::from)
+        .collect();
+    let playback = server.playback_status().await.map(UiPlayback::from);
+    (takes, playback)
+}
+
 /// Reshape a [`RuntimeSnapshot`]'s id-keyed maps into UI-stable arrays.
 fn build_scene_state(snapshot: &RuntimeSnapshot) -> UiSceneState {
     let scenes = snapshot
@@ -478,9 +585,11 @@ async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch:
     let mut last_scene = build_scene_state(&server.runtime_snapshot().await);
     let mut last_mode: UiMode = server.mode().await.into();
     let mut last_sessions: Vec<UiSession> =
-        server.sessions().await.iter().map(UiSession::from).collect();
+        server.sessions().await.iter().filter(|s| s.state != SessionState::Closed).map(UiSession::from).collect();
     let mut last_metrics: UiMetrics = (&server.metrics().await).into();
     let mut last_video = server.video_stream_status().await;
+    let (mut last_takes, mut last_playback) = build_takes(&server, last_scene.active_scene).await;
+    let mut last_selection = server.host_selection().await;
 
     let initial = ServerToUi::Snapshot(UiSnapshot {
         scene: last_scene.clone(),
@@ -488,6 +597,9 @@ async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch:
         sessions: last_sessions.clone(),
         metrics: last_metrics,
         video: last_video,
+        takes: last_takes.clone(),
+        playback: last_playback,
+        selected: last_selection.clone(),
     });
     if send_json(&mut sender, &initial).await.is_err() {
         return;
@@ -530,6 +642,9 @@ async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch:
                     &mut last_sessions,
                     &mut last_metrics,
                     &mut last_video,
+                    &mut last_takes,
+                    &mut last_playback,
+                    &mut last_selection,
                 )
                 .await
                 .is_err()
@@ -565,6 +680,9 @@ async fn push_deltas(
     last_sessions: &mut Vec<UiSession>,
     last_metrics: &mut UiMetrics,
     last_video: &mut VideoStreamStatus,
+    last_takes: &mut Vec<UiTake>,
+    last_playback: &mut Option<UiPlayback>,
+    last_selection: &mut Vec<String>,
 ) -> Result<(), axum::Error> {
     // Scene: poll the *published* snapshot (cheap, already computed), not a fresh one.
     if let Some(snapshot) = server.last_published_snapshot().await {
@@ -584,7 +702,7 @@ async fn push_deltas(
 
     // Sessions: upsert changed/new, remove gone.
     let cur_sessions: Vec<UiSession> =
-        server.sessions().await.iter().map(UiSession::from).collect();
+        server.sessions().await.iter().filter(|s| s.state != SessionState::Closed).map(UiSession::from).collect();
     if &cur_sessions != last_sessions {
         for s in &cur_sessions {
             if !last_sessions.iter().any(|p| p == s) {
@@ -618,6 +736,29 @@ async fn push_deltas(
         send_json(sender, &ServerToUi::VideoStatusChanged { video: cur_video }).await?;
     }
 
+    // Takes + playback: emit on change (playback advances while playing, so this is
+    // also what drives the seek bar).
+    let (cur_takes, cur_playback) = build_takes(server, last_scene.active_scene).await;
+    if &cur_takes != last_takes || &cur_playback != last_playback {
+        *last_takes = cur_takes.clone();
+        *last_playback = cur_playback;
+        send_json(
+            sender,
+            &ServerToUi::TakesChanged {
+                takes: cur_takes,
+                playback: cur_playback,
+            },
+        )
+        .await?;
+    }
+
+    // Host-DCC selection: emit on change.
+    let cur_selection = server.host_selection().await;
+    if &cur_selection != last_selection {
+        *last_selection = cur_selection.clone();
+        send_json(sender, &ServerToUi::SelectionChanged { selected: cur_selection }).await?;
+    }
+
     Ok(())
 }
 
@@ -633,7 +774,9 @@ async fn send_json(
 // Upstream command path (UI -> server)
 // ---------------------------------------------------------------------------
 
-/// Group B: UI-only commands that have no [`ControlMessage`] variant.
+/// Group B: UI-only commands that have no [`ControlMessage`] variant. The first
+/// group dispatch to `ServerHandle` directly; the `host_*` group enqueue a
+/// [`HostRequest`] for the DCC plugin to execute on its main thread.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum UiCommand {
@@ -641,6 +784,23 @@ enum UiCommand {
     CreateMapping { req: MappingRequest },
     UpdateMapping { mapping_id: MappingId, req: MappingRequest },
     RemoveMapping { mapping_id: MappingId },
+    DisconnectClient { device_id: Uuid },
+    // DCC-side actions, bridged to the plugin via the host-request queue.
+    ResyncScene,
+    StartVideo {
+        width: u32,
+        height: u32,
+        fps: u32,
+        #[serde(default)]
+        source: Option<String>,
+    },
+    StopVideo,
+    BakeTake {
+        take_id: Uuid,
+        fps: u32,
+        #[serde(default)]
+        start_frame: i32,
+    },
 }
 
 /// Parse an inbound text frame and dispatch it to `ServerHandle` methods. Tries the
@@ -723,6 +883,48 @@ async fn dispatch_ui_command(server: &ServerHandle, cmd: UiCommand) -> Result<()
             .map_err(stringify),
         UiCommand::RemoveMapping { mapping_id } => {
             server.remove_mapping(mapping_id).await.map_err(stringify)
+        }
+        UiCommand::DisconnectClient { device_id } => {
+            server.close_session(device_id, now_ns()).await.map_err(stringify)
+        }
+        // DCC-side actions: park on the host-request queue; the plugin executes them.
+        UiCommand::ResyncScene => {
+            server.enqueue_host_request(HostRequest::ResyncScene).await;
+            Ok(())
+        }
+        UiCommand::StartVideo {
+            width,
+            height,
+            fps,
+            source,
+        } => {
+            server
+                .enqueue_host_request(HostRequest::StartVideo {
+                    width,
+                    height,
+                    fps,
+                    source,
+                })
+                .await;
+            Ok(())
+        }
+        UiCommand::StopVideo => {
+            server.enqueue_host_request(HostRequest::StopVideo).await;
+            Ok(())
+        }
+        UiCommand::BakeTake {
+            take_id,
+            fps,
+            start_frame,
+        } => {
+            server
+                .enqueue_host_request(HostRequest::BakeTake {
+                    take_id,
+                    fps,
+                    start_frame,
+                })
+                .await;
+            Ok(())
         }
     }
 }

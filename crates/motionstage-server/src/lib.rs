@@ -174,6 +174,11 @@ struct ServerState {
     runtime_resources: Option<RuntimeResources>,
     active_advertisement: Option<DiscoveryAdvertisement>,
     last_published_snapshot: Option<RuntimeSnapshot>,
+    /// DCC-side actions requested by the companion UI, drained by the plugin on its
+    /// main-thread tick. The runtime never executes these itself.
+    host_requests: Vec<HostRequest>,
+    /// Object names selected in the host DCC, pushed by the plugin for UI highlight.
+    host_selection: Vec<String>,
 }
 
 const VIDEO_STREAM_ACTIVITY_WINDOW_NS: u64 = 2_000_000_000;
@@ -350,6 +355,41 @@ impl ServerState {
     }
 }
 
+/// A DCC-side action the companion UI asked for that the runtime cannot perform
+/// itself (it must run on the host's main thread: reading/writing the DCC scene,
+/// GPU capture, baking onto the host timeline). The plugin drains these from its
+/// main-thread tick via [`ServerHandle::drain_host_requests`] and executes them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostRequest {
+    /// Re-enumerate the DCC scene into the runtime (objects + attributes).
+    ResyncScene,
+    /// Begin viewport video capture + streaming.
+    StartVideo {
+        width: u32,
+        height: u32,
+        fps: u32,
+        source: Option<String>,
+    },
+    /// Stop viewport video capture.
+    StopVideo,
+    /// Bake a recorded take onto the host timeline as keyframes.
+    BakeTake {
+        take_id: Uuid,
+        fps: u32,
+        start_frame: i32,
+    },
+}
+
+/// Snapshot of playback transport state for the companion UI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackStatus {
+    pub take_id: Uuid,
+    pub state: PlaybackRuntimeState,
+    pub position_ns: u64,
+    pub duration_ns: u64,
+    pub looping: bool,
+}
+
 #[derive(Clone)]
 pub struct ServerHandle {
     state: Arc<RwLock<ServerState>>,
@@ -415,6 +455,8 @@ impl ServerHandle {
             runtime_resources: None,
             active_advertisement: None,
             last_published_snapshot: None,
+            host_requests: Vec::new(),
+            host_selection: Vec::new(),
             config,
         };
 
@@ -942,6 +984,44 @@ impl ServerHandle {
 
     pub fn subscribe_mode_updates(&self) -> broadcast::Receiver<Mode> {
         self.mode_updates.subscribe()
+    }
+
+    /// Queue a DCC-side action requested by the companion UI. The plugin drains and
+    /// executes it on its main thread (the runtime never touches the DCC directly).
+    pub async fn enqueue_host_request(&self, request: HostRequest) {
+        let mut state = self.state.write().await;
+        state.host_requests.push(request);
+    }
+
+    /// Drain pending host requests for the plugin to execute on its main thread.
+    pub async fn drain_host_requests(&self) -> Vec<HostRequest> {
+        let mut state = self.state.write().await;
+        std::mem::take(&mut state.host_requests)
+    }
+
+    /// Record the objects selected in the host DCC (by name), for UI highlight.
+    pub async fn set_host_selection(&self, names: Vec<String>) {
+        let mut state = self.state.write().await;
+        state.host_selection = names;
+    }
+
+    /// Objects currently selected in the host DCC (by name).
+    pub async fn host_selection(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state.host_selection.clone()
+    }
+
+    /// Current playback transport status, if a take is loaded.
+    pub async fn playback_status(&self) -> Option<PlaybackStatus> {
+        let state = self.state.read().await;
+        let playback = state.active_playback.as_ref()?;
+        Some(PlaybackStatus {
+            take_id: playback.take_id,
+            state: playback.state,
+            position_ns: playback.playhead_ns,
+            duration_ns: ServerState::playback_duration_ns(&playback.recording),
+            looping: playback.looping,
+        })
     }
 
     /// Convenience: set both axes of the composite mode in one call.

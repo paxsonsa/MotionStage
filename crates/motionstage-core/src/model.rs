@@ -170,7 +170,10 @@ impl Default for LeaseConfig {
             heartbeat_interval_ns: 500_000_000,
             timeout_ns: 2_000_000_000,
             reclaim_grace_ns: 5_000_000_000,
-            session_idle_timeout_ns: 30_000_000_000, // 30s
+            // A live client touches activity constantly (datagrams + 0.5s heartbeats),
+            // so 8s of silence means it's genuinely gone. Kept short so a crashed
+            // client clears from the operator UI quickly.
+            session_idle_timeout_ns: 8_000_000_000, // 8s
         }
     }
 }
