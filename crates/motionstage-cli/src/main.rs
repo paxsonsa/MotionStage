@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use motionstage_server::{ServerConfig, ServerHandle};
+mod export;
 mod simulate;
+use export::ExportArgs;
 use simulate::SimulateArgs;
 
 #[derive(Parser)]
@@ -15,6 +17,7 @@ struct Cli {
 enum Command {
     Serve,
     Simulate(SimulateArgs),
+    Export(ExportArgs),
     Version,
 }
 
@@ -39,6 +42,9 @@ async fn main() -> Result<()> {
         }
         Command::Simulate(args) => {
             simulate::run(args).await?;
+        }
+        Command::Export(args) => {
+            export::run(&args)?;
         }
         Command::Version => {
             println!("motionstage-cli {}", env!("CARGO_PKG_VERSION"));

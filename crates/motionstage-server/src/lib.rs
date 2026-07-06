@@ -143,7 +143,7 @@ impl ServerState {
         let session = self
             .sessions
             .get_mut(&device_id)
-            .ok_or_else(|| ServerError::SessionNotFound(device_id))?;
+            .ok_or(ServerError::SessionNotFound(device_id))?;
 
         if !session.state.can_transition_to(next) {
             return Err(ServerError::Protocol(ProtocolError::InvalidTransition {

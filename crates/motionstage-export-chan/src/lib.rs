@@ -61,14 +61,12 @@ fn encode_value(value: &AttributeValue) -> String {
         AttributeValue::Vec3f(v) => format!("{} {} {}", v[0], v[1], v[2]),
         AttributeValue::Vec4f(v) => format!("{} {} {} {}", v[0], v[1], v[2], v[3]),
         AttributeValue::Quatf(v) => format!("{} {} {} {}", v[0], v[1], v[2], v[3]),
-        AttributeValue::Mat4f(v) => format!(
-            "{}",
-            v.iter()
-                .flat_map(|row| row.iter())
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        AttributeValue::Mat4f(v) => v
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         AttributeValue::Trigger(v) => v.to_string(),
     }
 }
@@ -107,6 +105,40 @@ mod tests {
             version: RecordingFormatVersion::V2,
         };
         assert_eq!(export(&recording), export(&recording));
+    }
+
+    #[test]
+    fn mat4_is_emitted_as_space_separated_row_major_values() {
+        let recording = RecordingFile {
+            manifest: RecordingManifest {
+                recording_id: Uuid::nil(),
+                scene_id: Uuid::nil(),
+                started_ns: 0,
+                stopped_ns: 1,
+                frame_count: 1,
+            },
+            markers: Vec::new(),
+            frames: vec![RecordedFrame {
+                timestamp_ns: 0,
+                mode: Mode::Recording,
+                attributes: vec![RecordedAttribute {
+                    object_id: Uuid::nil(),
+                    attribute: "xform".into(),
+                    value: AttributeValue::Mat4f([
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [4.5, 5.0, 6.25, 1.0],
+                    ]),
+                }],
+            }],
+            version: RecordingFormatVersion::V2,
+        };
+        assert_eq!(
+            export(&recording),
+            "0 00000000-0000-0000-0000-000000000000 xform \
+             1 0 0 0 0 1 0 0 0 0 1 0 4.5 5 6.25 1"
+        );
     }
 
     #[test]
