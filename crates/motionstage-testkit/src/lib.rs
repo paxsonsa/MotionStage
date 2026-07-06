@@ -1,3 +1,5 @@
+pub mod wire;
+
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, ClientHello, ClientRole, Feature, RegisterRequest,
 };
@@ -267,9 +269,11 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_counters_progress_at_runtime_start() {
-        let mut config = motionstage_server::ServerConfig::default();
-        config.enable_discovery = false;
-        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        let config = motionstage_server::ServerConfig {
+            enable_discovery: false,
+            quic_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
         let server = motionstage_server::ServerHandle::new(config);
 
         server.start().await.unwrap();

@@ -11,11 +11,16 @@
 //! ## Wire protocol
 //!
 //! * **Downstream (server -> UI):** a UI-shaped [`ServerToUi`] enum (serde-tagged on
-//!   `type`). One full [`UiSnapshot`] on connect, then emit-on-change deltas driven by
-//!   the mode broadcast (event) plus a ~30 Hz poll/diff of the published snapshot,
-//!   sessions, metrics, and video status. The runtime's own structs are reshaped into
-//!   UI-stable types so the device wire format and the UI wire format evolve
-//!   independently.
+//!   `type`). One full [`UiSnapshot`] on connect, then deltas. Structural state
+//!   (scene graph, mappings, mode, sessions, takes, playback transport) is driven by
+//!   the server's ordered [`StateEvent`] stream — each event is translated into the
+//!   existing UI message vocabulary, gated on the snapshot's event seq so the
+//!   browser never sees a change twice. Only the data plane stays on a ~30 Hz poll:
+//!   attribute *values* (from the published snapshot), the playback playhead, and
+//!   state that has no events yet (metrics, video status, host selection). If the
+//!   event subscription lags, the connection resynchronizes with a fresh full
+//!   snapshot. The runtime's own structs are reshaped into UI-stable types so the
+//!   device wire format and the UI wire format evolve independently.
 //! * **Upstream (UI -> server):** two shapes, both dispatched to `ServerHandle`
 //!   methods. **Group A** reuses existing [`ControlMessage`] operator verbs as JSON
 //!   (`{"SetDataFlow":"Live"}`). **Group B** is a small UI-only envelope for actions
@@ -26,6 +31,7 @@
 //! and it is strictly additive: a panic in a UI connection is caught at the task
 //! boundary and never unwinds into the host (Blender/Unreal/...).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
@@ -48,7 +54,7 @@ use motionstage_core::{
 };
 use motionstage_protocol::{
     AttributeDescriptor, ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction,
-    PlaybackRuntimeState, RecordingState, SessionState, TakeInfo, VideoStreamStatus,
+    PlaybackRuntimeState, RecordingState, SessionState, StateEvent, TakeInfo, VideoStreamStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
@@ -56,9 +62,10 @@ use uuid::Uuid;
 
 use crate::{now_ns, HostRequest, PlaybackStatus, ServerHandle, SessionInfo};
 
-/// How often the connection polls non-event state (snapshot/sessions/metrics/video)
-/// and emits deltas. The runtime publishes at <= 60 Hz, so 30 Hz is comfortably under
-/// while staying responsive. Mode is event-driven (broadcast) and not throttled.
+/// How often the connection polls the data plane (attribute values, playback
+/// playhead) and event-less state (metrics/video/selection) and emits deltas. The
+/// runtime publishes at <= 60 Hz, so 30 Hz is comfortably under while staying
+/// responsive. Structural state is event-driven (broadcast) and not throttled.
 const PUSH_INTERVAL: Duration = Duration::from_millis(33);
 
 // ---------------------------------------------------------------------------
@@ -577,31 +584,95 @@ fn value_diffs(prev: &UiSceneState, cur: &UiSceneState) -> Vec<UiAttributeValue>
 // Connection handler
 // ---------------------------------------------------------------------------
 
+type WsSink = futures::stream::SplitSink<WebSocket, Message>;
+
+/// Connection-local replica of what the browser has been told. Structural state
+/// advances via [`StateEvent`]s; only attribute values, the playback playhead,
+/// and event-less state (metrics/video/selection) advance from the poll ticker.
+struct ConnState {
+    /// Event seq the browser state is consistent with. Events at or below this
+    /// were already folded into the last full snapshot we sent and are dropped.
+    seq: u64,
+    scene: UiSceneState,
+    mode: UiMode,
+    sessions: Vec<UiSession>,
+    /// session_id -> device_id, to translate [`StateEvent::SessionLeft`] (which
+    /// carries only the session id) into the UI's device-keyed removal message.
+    session_devices: HashMap<Uuid, Uuid>,
+    metrics: UiMetrics,
+    video: VideoStreamStatus,
+    takes: Vec<UiTake>,
+    playback: Option<UiPlayback>,
+    selection: Vec<String>,
+}
+
+impl ConnState {
+    /// Gather a full world snapshot. The seq is captured *before* reading any
+    /// state, so a mutation racing the reads is re-delivered as an event rather
+    /// than dropped; event handling re-reads authoritative state, so a
+    /// re-delivery converges instead of double-applying.
+    async fn gather(server: &ServerHandle) -> Self {
+        let seq = server.current_event_seq().await;
+        let scene = build_scene_state(&server.runtime_snapshot().await);
+        let mode: UiMode = server.mode().await.into();
+        let all_sessions = server.sessions().await;
+        // The in-process host session is a real session on the event plane, but
+        // the UI's "Clients" panel lists device operators only. Sessions that
+        // never registered (no session_id) never emit SessionJoined/SessionLeft,
+        // so listing them here would leave the UI with entries no event can
+        // ever remove — keep the snapshot domain aligned with the event domain.
+        let sessions: Vec<UiSession> = all_sessions
+            .iter()
+            .filter(|s| !s.is_host && s.session_id.is_some() && s.state != SessionState::Closed)
+            .map(UiSession::from)
+            .collect();
+        let session_devices = all_sessions
+            .iter()
+            .filter_map(|s| s.session_id.map(|session_id| (session_id, s.device_id)))
+            .collect();
+        let metrics: UiMetrics = (&server.metrics().await).into();
+        let video = server.video_stream_status().await;
+        let (takes, playback) = build_takes(server, scene.active_scene).await;
+        let selection = server.host_selection().await;
+
+        ConnState {
+            seq,
+            scene,
+            mode,
+            sessions,
+            session_devices,
+            metrics,
+            video,
+            takes,
+            playback,
+            selection,
+        }
+    }
+
+    fn snapshot_message(&self) -> ServerToUi {
+        ServerToUi::Snapshot(UiSnapshot {
+            scene: self.scene.clone(),
+            mode: self.mode,
+            sessions: self.sessions.clone(),
+            metrics: self.metrics,
+            video: self.video,
+            takes: self.takes.clone(),
+            playback: self.playback,
+            selected: self.selection.clone(),
+        })
+    }
+}
+
 async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch::Receiver<bool>) {
     let (mut sender, mut receiver) = socket.split();
-    let mut mode_rx = server.subscribe_mode_updates();
+
+    // Subscribe before gathering the snapshot so no event can fall between the
+    // two; events already folded into the snapshot are gated out by its seq.
+    let mut events_rx = server.subscribe_state_events();
 
     // --- snapshot on connect ---
-    let mut last_scene = build_scene_state(&server.runtime_snapshot().await);
-    let mut last_mode: UiMode = server.mode().await.into();
-    let mut last_sessions: Vec<UiSession> =
-        server.sessions().await.iter().filter(|s| s.state != SessionState::Closed).map(UiSession::from).collect();
-    let mut last_metrics: UiMetrics = (&server.metrics().await).into();
-    let mut last_video = server.video_stream_status().await;
-    let (mut last_takes, mut last_playback) = build_takes(&server, last_scene.active_scene).await;
-    let mut last_selection = server.host_selection().await;
-
-    let initial = ServerToUi::Snapshot(UiSnapshot {
-        scene: last_scene.clone(),
-        mode: last_mode,
-        sessions: last_sessions.clone(),
-        metrics: last_metrics,
-        video: last_video,
-        takes: last_takes.clone(),
-        playback: last_playback,
-        selected: last_selection.clone(),
-    });
-    if send_json(&mut sender, &initial).await.is_err() {
+    let mut st = ConnState::gather(&server).await;
+    if send_json(&mut sender, &st.snapshot_message()).await.is_err() {
         return;
     }
 
@@ -614,41 +685,32 @@ async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch:
             // (otherwise an open browser tab would block shutdown()/the FFI block_on).
             _ = shutdown.changed() => break,
 
-            // Mode is event-driven; dedup redundant broadcasts (set_mode re-emits).
-            changed = mode_rx.recv() => {
-                let mode = match changed {
-                    Ok(mode) => mode,
-                    Err(broadcast::error::RecvError::Lagged(_)) => server.mode().await,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-                let ui_mode: UiMode = mode.into();
-                if ui_mode != last_mode {
-                    last_mode = ui_mode;
-                    if send_json(&mut sender, &ServerToUi::ModeChanged { mode: ui_mode })
-                        .await
-                        .is_err()
-                    {
+            // Control plane: every structural mutation arrives here, in order.
+            received = events_rx.recv() => match received {
+                Ok(envelope) => {
+                    if envelope.seq <= st.seq {
+                        // Already folded into the last full snapshot we sent.
+                        continue;
+                    }
+                    st.seq = envelope.seq;
+                    if apply_event(&server, &mut sender, &mut st, &envelope.event).await.is_err() {
                         break;
                     }
                 }
-            }
+                // Events were dropped; resynchronize with a fresh full snapshot
+                // (the browser replaces its whole state on `snapshot`).
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    st = ConnState::gather(&server).await;
+                    if send_json(&mut sender, &st.snapshot_message()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
 
-            // Poll/diff everything else at ~30 Hz, emit-on-change.
+            // Data plane + event-less state at ~30 Hz, emit-on-change.
             _ = ticker.tick() => {
-                if push_deltas(
-                    &server,
-                    &mut sender,
-                    &mut last_scene,
-                    &mut last_sessions,
-                    &mut last_metrics,
-                    &mut last_video,
-                    &mut last_takes,
-                    &mut last_playback,
-                    &mut last_selection,
-                )
-                .await
-                .is_err()
-                {
+                if poll_data_plane(&server, &mut sender, &mut st).await.is_err() {
                     break;
                 }
             }
@@ -672,100 +734,158 @@ async fn handle_ws(socket: WebSocket, server: ServerHandle, mut shutdown: watch:
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn push_deltas(
+/// Translate one [`StateEvent`] into the UI message vocabulary and send it.
+///
+/// The UI wire format replicates whole slices of state (`snapshot_changed`,
+/// `takes_changed`) rather than per-entity patches, so handlers re-read the
+/// authoritative server state and emit-on-change instead of applying the event
+/// payload incrementally. That also makes re-delivery (snapshot/event overlap
+/// races) converge: a redundant event finds nothing changed and sends nothing.
+async fn apply_event(
     server: &ServerHandle,
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    last_scene: &mut UiSceneState,
-    last_sessions: &mut Vec<UiSession>,
-    last_metrics: &mut UiMetrics,
-    last_video: &mut VideoStreamStatus,
-    last_takes: &mut Vec<UiTake>,
-    last_playback: &mut Option<UiPlayback>,
-    last_selection: &mut Vec<String>,
+    sender: &mut WsSink,
+    st: &mut ConnState,
+    event: &StateEvent,
 ) -> Result<(), axum::Error> {
-    // Scene: poll the *published* snapshot (cheap, already computed), not a fresh one.
+    match event {
+        // Dedup redundant re-assertions (set_mode re-emits the same mode).
+        StateEvent::ModeChanged { mode } => {
+            let ui_mode: UiMode = (*mode).into();
+            if ui_mode != st.mode {
+                st.mode = ui_mode;
+                send_json(sender, &ServerToUi::ModeChanged { mode: ui_mode }).await?;
+            }
+        }
+
+        // Scene-structural events: rebuild the UI scene state from the runtime.
+        StateEvent::SceneLoaded { .. }
+        | StateEvent::SceneActivated { .. }
+        | StateEvent::MappingCreated { .. }
+        | StateEvent::MappingUpdated { .. }
+        | StateEvent::MappingRemoved { .. }
+        | StateEvent::MappingLockChanged { .. }
+        | StateEvent::MappingReleased { .. }
+        | StateEvent::BaselineApplied { .. } => {
+            let cur = build_scene_state(&server.runtime_snapshot().await);
+            if cur != st.scene {
+                let active_scene_changed = cur.active_scene != st.scene.active_scene;
+                send_json(sender, &ServerToUi::SnapshotChanged(cur.clone())).await?;
+                st.scene = cur;
+                // The takes panel is filtered by active scene.
+                if active_scene_changed {
+                    refresh_takes(server, sender, st).await?;
+                }
+            }
+        }
+
+        StateEvent::SessionJoined {
+            session_id,
+            device_id,
+            ..
+        } => {
+            st.session_devices.insert(*session_id, *device_id);
+            // The event carries identity only; the UI session shape (features,
+            // advertised outputs, state) comes from the session table.
+            if let Some(info) = server.session_info(*device_id).await {
+                if !info.is_host && info.state != SessionState::Closed {
+                    let session = UiSession::from(&info);
+                    st.sessions.retain(|s| s.device_id != *device_id);
+                    st.sessions.push(session.clone());
+                    send_json(sender, &ServerToUi::SessionUpserted { session }).await?;
+                }
+            }
+        }
+
+        StateEvent::SessionLeft { session_id, .. } => {
+            if let Some(device_id) = st.session_devices.remove(session_id) {
+                let was_listed = st.sessions.iter().any(|s| s.device_id == device_id);
+                st.sessions.retain(|s| s.device_id != device_id);
+                if was_listed {
+                    send_json(sender, &ServerToUi::SessionRemoved { device_id }).await?;
+                }
+            }
+        }
+
+        // Take library / playback transport events all refresh the takes panel.
+        StateEvent::RecordingStarted { .. }
+        | StateEvent::RecordingStopped { .. }
+        | StateEvent::TakeRegistered { .. }
+        | StateEvent::TakeSelected { .. }
+        | StateEvent::TakeDeleted { .. }
+        | StateEvent::PlaybackChanged { .. } => {
+            refresh_takes(server, sender, st).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-read takes + playback transport and emit `takes_changed` if either moved.
+async fn refresh_takes(
+    server: &ServerHandle,
+    sender: &mut WsSink,
+    st: &mut ConnState,
+) -> Result<(), axum::Error> {
+    let (takes, playback) = build_takes(server, st.scene.active_scene).await;
+    if takes != st.takes || playback != st.playback {
+        st.takes = takes.clone();
+        st.playback = playback;
+        send_json(sender, &ServerToUi::TakesChanged { takes, playback }).await?;
+    }
+    Ok(())
+}
+
+/// The ~30 Hz tick: attribute values, playback playhead, and event-less state.
+/// Structural changes never originate here — the event plane owns them.
+async fn poll_data_plane(
+    server: &ServerHandle,
+    sender: &mut WsSink,
+    st: &mut ConnState,
+) -> Result<(), axum::Error> {
+    // Attribute values: poll the *published* snapshot (cheap, already computed).
+    // A structurally different published snapshot means a scene event is in
+    // flight (or the publish loop hasn't caught up with one we already applied);
+    // the event handler owns that transition, so skip it here.
     if let Some(snapshot) = server.last_published_snapshot().await {
         let cur = build_scene_state(&snapshot);
-        if &cur != last_scene {
-            if same_structure(last_scene, &cur) {
-                let changes = value_diffs(last_scene, &cur);
-                if !changes.is_empty() {
-                    send_json(sender, &ServerToUi::AttributeValues { changes }).await?;
-                }
-            } else {
-                send_json(sender, &ServerToUi::SnapshotChanged(cur.clone())).await?;
+        if cur != st.scene && same_structure(&st.scene, &cur) {
+            let changes = value_diffs(&st.scene, &cur);
+            if !changes.is_empty() {
+                send_json(sender, &ServerToUi::AttributeValues { changes }).await?;
             }
-            *last_scene = cur;
+            st.scene = cur;
         }
     }
 
-    // Sessions: upsert changed/new, remove gone.
-    let cur_sessions: Vec<UiSession> =
-        server.sessions().await.iter().filter(|s| s.state != SessionState::Closed).map(UiSession::from).collect();
-    if &cur_sessions != last_sessions {
-        for s in &cur_sessions {
-            if !last_sessions.iter().any(|p| p == s) {
-                send_json(sender, &ServerToUi::SessionUpserted { session: s.clone() }).await?;
-            }
-        }
-        for p in last_sessions.iter() {
-            if !cur_sessions.iter().any(|s| s.device_id == p.device_id) {
-                send_json(
-                    sender,
-                    &ServerToUi::SessionRemoved {
-                        device_id: p.device_id,
-                    },
-                )
-                .await?;
-            }
-        }
-        *last_sessions = cur_sessions;
-    }
-
-    // Metrics + video status: emit on change.
+    // Metrics + video status + host selection have no state events (yet): poll.
     let cur_metrics: UiMetrics = (&server.metrics().await).into();
-    if cur_metrics != *last_metrics {
-        *last_metrics = cur_metrics;
+    if cur_metrics != st.metrics {
+        st.metrics = cur_metrics;
         send_json(sender, &ServerToUi::Metrics { metrics: cur_metrics }).await?;
     }
 
     let cur_video = server.video_stream_status().await;
-    if cur_video != *last_video {
-        *last_video = cur_video;
+    if cur_video != st.video {
+        st.video = cur_video;
         send_json(sender, &ServerToUi::VideoStatusChanged { video: cur_video }).await?;
     }
 
-    // Takes + playback: emit on change (playback advances while playing, so this is
-    // also what drives the seek bar).
-    let (cur_takes, cur_playback) = build_takes(server, last_scene.active_scene).await;
-    if &cur_takes != last_takes || &cur_playback != last_playback {
-        *last_takes = cur_takes.clone();
-        *last_playback = cur_playback;
-        send_json(
-            sender,
-            &ServerToUi::TakesChanged {
-                takes: cur_takes,
-                playback: cur_playback,
-            },
-        )
-        .await?;
+    let cur_selection = server.host_selection().await;
+    if cur_selection != st.selection {
+        st.selection = cur_selection.clone();
+        send_json(sender, &ServerToUi::SelectionChanged { selected: cur_selection }).await?;
     }
 
-    // Host-DCC selection: emit on change.
-    let cur_selection = server.host_selection().await;
-    if &cur_selection != last_selection {
-        *last_selection = cur_selection.clone();
-        send_json(sender, &ServerToUi::SelectionChanged { selected: cur_selection }).await?;
+    // The playback playhead advances without events while playing; it drives the
+    // seek bar. Take-list changes themselves arrive via events.
+    let cur_playback = server.playback_status().await.map(UiPlayback::from);
+    if cur_playback != st.playback {
+        refresh_takes(server, sender, st).await?;
     }
 
     Ok(())
 }
 
-async fn send_json(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    msg: &ServerToUi,
-) -> Result<(), axum::Error> {
+async fn send_json(sender: &mut WsSink, msg: &ServerToUi) -> Result<(), axum::Error> {
     let text = serde_json::to_string(msg).map_err(axum::Error::new)?;
     sender.send(Message::Text(Utf8Bytes::from(text))).await
 }

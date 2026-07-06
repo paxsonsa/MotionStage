@@ -1640,9 +1640,11 @@ dependencies = [
 name = "motionstage-testkit"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "motionstage-core",
  "motionstage-protocol",
  "motionstage-server",
+ "motionstage-transport-quic",
  "tokio",
  "uuid",
 ]

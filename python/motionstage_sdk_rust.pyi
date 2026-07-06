@@ -19,6 +19,44 @@ class MotionStageServer:
     def start(self) -> str: ...
     def stop(self) -> None: ...
 
+    def host_session_id(self) -> str:
+        """Session id of the in-process host session this bridge acts as.
+        Host-API mutations carry this id as their event origin_session."""
+        ...
+
+    def host_device_id(self) -> str: ...
+
+    def current_event_seq(self) -> int:
+        """Sequence number of the most recently emitted state event."""
+        ...
+
+    def initial_scene_snapshot(self) -> dict[str, Any]:
+        """Full world snapshot: {seq, mode, data_flow, recording, active_scene,
+        scenes: [{scene_id, name, objects: [{object_id, name, attributes:
+        [{name, default_value, current_value, live_enabled, record_enabled}]}]}],
+        mappings: [{mapping_id, source_device, source_output, target_scene,
+        target_object, target_attribute, component_mask, lock}],
+        sessions: [{session_id, device_id, device_name, roles, is_host}]
+        (registered sessions only, the in-process host included),
+        takes: [{take_id, scene_id, name, path, created_ns, frame_count,
+        selected, deleted}],
+        playback: {state, take_id, playhead_ns, looping} | None}.
+        Events with seq <= the snapshot's seq are already folded in."""
+        ...
+
+    def drain_state_events(self, timeout_ms: int = 0) -> list[dict[str, Any]]:
+        """Block up to timeout_ms for the next state event, then batch everything
+        currently queued (timeout_ms == 0 is a non-blocking drain). Each dict has
+        seq, origin_session (str | None), timestamp_ns, a snake_case "type"
+        discriminator (mode_changed, scene_loaded, scene_activated,
+        mapping_created/updated/removed/lock_changed/released, baseline_applied,
+        session_joined, session_left, recording_started/stopped, take_registered,
+        take_selected, take_deleted, playback_changed), and the event payload
+        flattened alongside. A lagged receiver yields
+        {"type": "event_stream_lagged", "skipped": n}; refetch
+        initial_scene_snapshot when one appears."""
+        ...
+
     def upsert_scene(self, spec: dict[str, Any]) -> str: ...
     def set_active_scene(self, scene_id: str) -> None: ...
 
@@ -89,9 +127,11 @@ class MotionStageServer:
 
     def sessions(
         self,
-    ) -> list[tuple[str, str, str | None, list[str], list[str], list[str], str]]:
-        """Returns list of (device_id, device_name, session_id, roles, features,
-        advertised_attributes, state)."""
+    ) -> list[tuple[str, str, str | None, list[str], list[str], list[str], str, bool]]:
+        """Raw diagnostics listing of every session record (all lifecycle
+        states, the in-process host session included). Returns list of
+        (device_id, device_name, session_id, roles, features,
+        advertised_attributes, state, is_host)."""
         ...
 
     def create_mapping(self, request: dict[str, Any]) -> str: ...

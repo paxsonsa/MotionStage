@@ -35,6 +35,7 @@ class MotionStageSession:
     features: tuple[str, ...]
     advertised_attributes: tuple[str, ...]
     state: str
+    is_host: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,24 +170,45 @@ class MotionStageServer:
         self._delegate: Optional[SceneUpdateDelegate] = None
         self._native = _NativeMotionStageServer(name=name)
         self._running = False
-        # Fixed high-performance defaults; avoid runtime tuning knobs.
-        self._session_poll_interval_s = 1.0
-        self._mode_poll_interval_s = 0.05
+        # Attribute values are the data plane: the core emits no per-value
+        # events, so the pump samples them at a fixed high-performance cadence
+        # (fast while data flows, slow while idle). Everything else is
+        # event-driven via drain_state_events.
         self._attribute_poll_interval_live_s = 1.0 / 120.0
         self._attribute_poll_interval_idle_s = 0.25
-        self._event_loop_tick_s = 0.005
-        # Back-compat alias; kept for external diagnostics expecting this field.
-        self._event_poll_interval_s = self._session_poll_interval_s
         self._event_thread: Optional[threading.Thread] = None
         self._event_stop = threading.Event()
-        self._known_clients: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], str]] = {}
-        self._known_mode: Optional[str] = None
+        # Diff cache for the attribute-value poll (data plane only).
         self._known_attribute_values: dict[tuple[str, str], str] = {}
+        # Mode as last reported by the event stream / snapshot; drives the
+        # attribute poll cadence.
+        self._current_mode: Optional[str] = None
+        # session_id -> (device_id, device_name), learned from session_joined
+        # events so session_left can carry the device identity too.
+        self._session_devices: dict[str, tuple[str, str]] = {}
+        # The in-process host session (the DCC itself). It rides the event
+        # plane like any session but is not a motion client: it is excluded
+        # from the client catalog and from on_client_event deltas.
+        try:
+            self._host_session_id: str = str(self._native.host_session_id())
+        except Exception:  # pragma: no cover - bridge predates host sessions
+            self._host_session_id = ""
+        # Monotonic deadline of the next attribute-value poll; event dispatch
+        # pulls it forward when server state invalidates cached values.
+        self._next_attributes_at = 0.0
 
     def bind_delegate(self, delegate: SceneUpdateDelegate) -> None:
+        pump_was_running = self._event_thread is not None and self._event_thread.is_alive()
         self._delegate = delegate
         if self._running:
             self._start_event_pump()
+            if pump_was_running:
+                # The pump only emits the snapshot once at startup; a delegate
+                # bound later still needs the current world state.
+                try:
+                    self._emit_scene_snapshot_from_native()
+                except Exception:
+                    LOGGER.exception("scene snapshot emit on delegate bind failed")
 
     def start(self) -> str:
         self._running = True
@@ -343,6 +365,17 @@ class MotionStageServer:
         self._native.close_take_bake_cursor(str(cursor_id))
 
     def sessions(self) -> list[dict[str, Any]]:
+        """The client catalog: registered motion clients only.
+
+        The native bridge reports every session record (all lifecycle states,
+        the in-process host session included). Consumers of this method build
+        their client/source catalogs from it, so it drops:
+
+        * the host session (``is_host`` — the DCC itself is not a client), and
+        * pre-registration sessions (no ``session_id`` yet) — they never emit
+          ``session_joined``/``session_left``, so listing them would create
+          entries no event could ever remove.
+        """
         rows = self._native.sessions()
         sessions: list[dict[str, Any]] = []
         for row in rows:
@@ -354,16 +387,22 @@ class MotionStageServer:
                 features,
                 advertised_attributes,
                 state,
+                is_host,
             ) = row
+            if bool(is_host) or not session_id:
+                continue
+            if str(state).strip().lower() == "closed":
+                continue
             sessions.append(
                 {
                     "device_id": str(device_id),
                     "device_name": str(device_name),
-                    "session_id": str(session_id) if session_id else None,
+                    "session_id": str(session_id),
                     "roles": [str(value) for value in roles],
                     "features": [str(value) for value in features],
                     "advertised_attributes": [str(value) for value in advertised_attributes],
                     "state": str(state),
+                    "is_host": False,
                 }
             )
         return sessions
@@ -492,8 +531,8 @@ class MotionStageServer:
             return
         self._event_stop.clear()
         self._event_thread = threading.Thread(
-            target=self._poll_client_events,
-            name="motionstage-client-events",
+            target=self._event_pump,
+            name="motionstage-state-events",
             daemon=True,
         )
         self._event_thread.start()
@@ -503,101 +542,170 @@ class MotionStageServer:
         if self._event_thread is not None:
             self._event_thread.join(timeout=1.0)
         self._event_thread = None
-        self._known_clients.clear()
-        self._known_mode = None
         self._known_attribute_values.clear()
+        self._session_devices.clear()
+        self._current_mode = None
 
-    def _poll_client_events(self) -> None:
-        next_sessions_at = time.monotonic()
-        next_mode_at = next_sessions_at
-        next_attributes_at = next_sessions_at
+    def _event_pump(self) -> None:
+        """Single background loop: replicated state events drive the control
+        plane callbacks; attribute values (the data plane, which has no core
+        event) are sampled inside the same loop at a mode-dependent cadence."""
+        drain = getattr(self._native, "drain_state_events", None)
+        try:
+            self._emit_scene_snapshot_from_native()
+            if self._current_mode:
+                self.emit_mode_event(
+                    {"type": "mode_changed", "mode": self._current_mode, "initial": True}
+                )
+        except Exception:
+            LOGGER.exception("initial scene snapshot failed")
+        if drain is None:
+            LOGGER.error(
+                "native bridge lacks drain_state_events(); state events disabled, "
+                "attribute polling only (rebuild the motionstage_sdk_rust extension)"
+            )
+
+        self._next_attributes_at = time.monotonic()
         while not self._event_stop.is_set():
+            budget_s = max(0.0, self._next_attributes_at - time.monotonic())
+            # Never block past the next attribute-poll deadline, and cap the
+            # wait so stop() stays responsive.
+            wait_s = min(budget_s, self._attribute_poll_interval_idle_s)
+            if drain is not None:
+                timeout_ms = int(wait_s * 1000.0)
+                if timeout_ms == 0 and budget_s > 0.0:
+                    timeout_ms = 1
+                try:
+                    events = drain(timeout_ms)
+                except Exception:
+                    LOGGER.exception("state event drain failed")
+                    events = []
+                    self._event_stop.wait(0.1)
+                for event in events:
+                    if self._event_stop.is_set():
+                        break
+                    try:
+                        self._dispatch_state_event(event)
+                    except Exception:
+                        LOGGER.exception("state event dispatch failed")
+            elif wait_s > 0.0:
+                self._event_stop.wait(wait_s)
+
+            if self._event_stop.is_set():
+                break
             now = time.monotonic()
-            if now >= next_sessions_at:
-                try:
-                    self._emit_client_deltas(self.sessions())
-                except Exception:
-                    LOGGER.exception("session catalog poll failed")
-                next_sessions_at = now + self._session_poll_interval_s
-
-            if now >= next_mode_at:
-                try:
-                    mode_changed = self._emit_mode_delta(self.mode())
-                except Exception:
-                    LOGGER.exception("mode poll failed")
-                    mode_changed = False
-                next_mode_at = now + self._mode_poll_interval_s
-                if mode_changed:
-                    next_attributes_at = now
-
-            if now >= next_attributes_at:
+            if now >= self._next_attributes_at:
                 try:
                     self._emit_runtime_attribute_batch(self.runtime_attribute_values())
                 except Exception:
                     LOGGER.exception("runtime attribute poll failed")
-                next_attributes_at = now + self._current_attribute_poll_interval_s()
-
-            next_due = min(next_sessions_at, next_mode_at, next_attributes_at)
-            wait_for = max(0.0, next_due - time.monotonic())
-            wait_for = min(wait_for, self._event_loop_tick_s)
-            self._event_stop.wait(wait_for)
-
-    def _emit_client_deltas(self, sessions: list[dict[str, Any]]) -> None:
-        current: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], str]] = {}
-        for session in sessions:
-            device_id = str(session.get("device_id") or "").strip()
-            if not device_id:
-                continue
-
-            state = str(session.get("state") or "").strip()
-            if state.lower() == "closed":
-                continue
-
-            device_name = str(session.get("device_name") or device_id).strip() or device_id
-            roles = tuple(
-                sorted(str(value).strip() for value in (session.get("roles") or []) if str(value).strip())
-            )
-            features = tuple(
-                sorted(str(value).strip() for value in (session.get("features") or []) if str(value).strip())
-            )
-            attributes = tuple(
-                sorted(
-                    str(value).strip()
-                    for value in (session.get("advertised_attributes") or [])
-                    if str(value).strip()
-                )
-            )
-            current[device_id] = (device_name, roles, features, attributes, state)
-
-            if self._known_clients.get(device_id) != current[device_id]:
-                self.emit_client_event(
-                    {
-                        "kind": "upsert",
-                        "device_id": device_id,
-                        "device_name": device_name,
-                        "roles": list(roles),
-                        "features": list(features),
-                        "advertised_attributes": list(attributes),
-                        "state": state,
-                        "session_id": session.get("session_id"),
-                    }
+                self._next_attributes_at = (
+                    time.monotonic() + self._current_attribute_poll_interval_s()
                 )
 
-        for device_id in set(self._known_clients.keys()) - set(current.keys()):
-            self.emit_client_event({"kind": "removed", "device_id": device_id})
+    # State-event -> delegate-callback routing tables. Values are the short
+    # `kind` discriminator carried alongside the raw event payload.
+    _MAPPING_EVENT_KINDS = {
+        "mapping_created": "created",
+        "mapping_updated": "updated",
+        "mapping_removed": "removed",
+        "mapping_lock_changed": "lock_changed",
+        "mapping_released": "released",
+    }
+    _RECORDING_EVENT_TYPES = frozenset(
+        {
+            "recording_started",
+            "recording_stopped",
+            "take_registered",
+            "take_selected",
+            "take_deleted",
+            "playback_changed",
+        }
+    )
 
-        self._known_clients = current
+    def _dispatch_state_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "").strip()
 
-    def _emit_mode_delta(self, mode: str) -> bool:
-        normalized = str(mode).strip().lower()
-        if not normalized or normalized == self._known_mode:
-            return False
-        self._known_mode = normalized
-        self.emit_mode_event({"mode": normalized})
-        return True
+        if event_type == "mode_changed":
+            mode = str(event.get("mode") or "").strip().lower()
+            if mode:
+                self._current_mode = mode
+                # Mode transitions change what flows; refresh values promptly.
+                self._next_attributes_at = 0.0
+            self.emit_mode_event(dict(event))
+            return
+
+        if event_type in self._MAPPING_EVENT_KINDS:
+            enriched = dict(event)
+            enriched["kind"] = self._MAPPING_EVENT_KINDS[event_type]
+            self.emit_mapping_event(enriched)
+            return
+
+        if event_type == "session_joined":
+            session_id = str(event.get("session_id") or "").strip()
+            # The in-process host session is not a motion client; its
+            # join/leave never reaches on_client_event.
+            if session_id and session_id == self._host_session_id:
+                return
+            device_id = str(event.get("device_id") or "").strip()
+            device_name = str(event.get("device_name") or "").strip() or device_id
+            if session_id:
+                self._session_devices[session_id] = (device_id, device_name)
+            enriched = dict(event)
+            enriched["kind"] = "upsert"
+            enriched.setdefault("state", "Active")
+            self.emit_client_event(enriched)
+            return
+
+        if event_type == "session_left":
+            session_id = str(event.get("session_id") or "").strip()
+            if session_id and session_id == self._host_session_id:
+                return
+            device_id, device_name = self._session_devices.pop(session_id, ("", ""))
+            enriched = dict(event)
+            enriched["kind"] = "removed"
+            if device_id:
+                enriched.setdefault("device_id", device_id)
+                enriched.setdefault("device_name", device_name)
+            self.emit_client_event(enriched)
+            return
+
+        if event_type in self._RECORDING_EVENT_TYPES:
+            enriched = dict(event)
+            enriched["kind"] = event_type
+            self.emit_recording_event(enriched)
+            return
+
+        if event_type in {"scene_loaded", "scene_activated", "event_stream_lagged"}:
+            # Scene graph changed (or we fell behind the stream): re-baseline
+            # from a fresh snapshot and invalidate the attribute diff cache.
+            self._known_attribute_values.clear()
+            self._next_attributes_at = 0.0
+            try:
+                self._emit_scene_snapshot_from_native()
+            except Exception:
+                LOGGER.exception("scene snapshot refresh failed")
+            return
+
+        if event_type == "baseline_applied":
+            # Attribute values were rewritten wholesale; poll immediately.
+            self._next_attributes_at = 0.0
+            return
+
+        LOGGER.debug("ignoring unhandled state event type: %s", event_type)
+
+    def _emit_scene_snapshot_from_native(self) -> None:
+        fetch = getattr(self._native, "initial_scene_snapshot", None)
+        if fetch is None:
+            return
+        snapshot = fetch()
+        mode = str(snapshot.get("mode") or "").strip().lower()
+        if mode:
+            self._current_mode = mode
+        self.emit_scene_snapshot(dict(snapshot))
 
     def _current_attribute_poll_interval_s(self) -> float:
-        if self._known_mode in {"live", "recording", "record", "playback", "play"}:
+        if self._current_mode in {"live", "recording", "playback"}:
             return self._attribute_poll_interval_live_s
         return self._attribute_poll_interval_idle_s
 

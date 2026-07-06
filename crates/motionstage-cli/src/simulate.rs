@@ -16,7 +16,8 @@ use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, Sc
 use motionstage_discovery::{DiscoveredService, DiscoveryBrowser};
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, ClientHello, ClientRole, ControlMessage, Feature, Mode,
-    RecordingState, RegisterRequest, SamplingMode, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    RecordingState, RegisterRequest, SamplingMode, SceneSnapshotPayload, StateEvent,
+    StateEventEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use motionstage_transport_quic::{
@@ -1344,26 +1345,133 @@ async fn request_remote_mode(
             sim_logln!("debug: sending {msg:?}");
         }
         client.control.send(&msg).await?;
-        match client.control.recv().await? {
-            ControlMessage::ModeState(active_mode) => {
-                if verbose {
-                    sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
+        // Replicated state events (including our own echo) interleave with
+        // the direct ModeState reply on the control stream; log and skip
+        // them while waiting for the reply.
+        loop {
+            match client.control.recv().await? {
+                ControlMessage::ModeState(active_mode) => {
+                    if verbose {
+                        sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
+                    }
+                    last_mode = active_mode;
+                    break;
                 }
-                last_mode = active_mode;
-            }
-            ControlMessage::Error { code, reason } => {
-                return Err(anyhow!(
-                    "remote mode request rejected: code={code:?} reason={reason}"
-                ));
-            }
-            other => {
-                return Err(anyhow!(
-                    "unexpected control reply to mode request: {other:?}"
-                ));
+                ControlMessage::StateEventMsg(envelope) => log_state_event(&envelope),
+                ControlMessage::SceneSnapshot(snapshot) => log_scene_snapshot(&snapshot),
+                ControlMessage::Error { code, reason } => {
+                    return Err(anyhow!(
+                        "remote mode request rejected: code={code:?} reason={reason}"
+                    ));
+                }
+                other => {
+                    return Err(anyhow!(
+                        "unexpected control reply to mode request: {other:?}"
+                    ));
+                }
             }
         }
     }
     Ok(last_mode)
+}
+
+/// Render a replicated state event as a one-line interactive log entry.
+fn describe_state_event(event: &StateEvent) -> String {
+    match event {
+        StateEvent::ModeChanged { mode } => format!("mode changed to {mode:?}"),
+        StateEvent::SceneLoaded { scene_id, name } => {
+            format!("scene loaded \"{name}\" ({scene_id})")
+        }
+        StateEvent::SceneActivated { scene_id } => format!("scene activated {scene_id}"),
+        StateEvent::MappingCreated { mapping } => format!(
+            "mapping created {} ({} -> {}.{})",
+            mapping.mapping_id,
+            mapping.source_output,
+            mapping.target_object,
+            mapping.target_attribute
+        ),
+        StateEvent::MappingUpdated { mapping } => format!(
+            "mapping updated {} ({} -> {}.{})",
+            mapping.mapping_id,
+            mapping.source_output,
+            mapping.target_object,
+            mapping.target_attribute
+        ),
+        StateEvent::MappingRemoved { mapping_id } => format!("mapping removed {mapping_id}"),
+        StateEvent::MappingLockChanged { mapping_id, lock } => {
+            format!("mapping {mapping_id} lock={lock}")
+        }
+        StateEvent::MappingReleased { mapping_id, reason } => {
+            format!("mapping released {mapping_id} ({reason})")
+        }
+        StateEvent::BaselineApplied {
+            action,
+            changed_attributes,
+        } => format!("baseline {action:?} applied (changed_attributes={changed_attributes})"),
+        StateEvent::SessionJoined {
+            session_id,
+            device_name,
+            roles,
+            ..
+        } => format!("session joined \"{device_name}\" ({session_id}, roles={roles:?})"),
+        StateEvent::SessionLeft { session_id, reason } => format!(
+            "session left {session_id} (reason={})",
+            reason.as_deref().unwrap_or("none")
+        ),
+        StateEvent::RecordingStarted { take_id, scene_id } => {
+            format!("recording started take={take_id} scene={scene_id}")
+        }
+        StateEvent::RecordingStopped {
+            take_id,
+            frame_count,
+        } => format!("recording stopped take={take_id} frames={frame_count}"),
+        StateEvent::TakeRegistered { take } => {
+            format!("take registered {} \"{}\"", take.take_id, take.name)
+        }
+        StateEvent::TakeSelected { take_id, .. } => format!("take selected {take_id}"),
+        StateEvent::TakeDeleted { take_id } => format!("take deleted {take_id}"),
+        StateEvent::PlaybackChanged {
+            state,
+            take_id,
+            playhead_ns,
+            looping,
+        } => format!(
+            "playback {state:?} take={take_id} playhead_ns={playhead_ns} looping={looping}"
+        ),
+    }
+}
+
+fn log_state_event(envelope: &StateEventEnvelope) {
+    let origin = envelope
+        .origin_session
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "server".into());
+    sim_logln!(
+        "state event #{} [origin {}] {}",
+        envelope.seq,
+        origin,
+        describe_state_event(&envelope.event)
+    );
+}
+
+fn log_scene_snapshot(snapshot: &SceneSnapshotPayload) {
+    sim_logln!(
+        "scene snapshot seq={} scenes={} mappings={} sessions={} takes={} playback={} mode={:?} active_scene={}",
+        snapshot.seq,
+        snapshot.scenes.len(),
+        snapshot.mappings.len(),
+        snapshot.sessions.len(),
+        snapshot.takes.len(),
+        snapshot
+            .playback
+            .map(|playback| format!("{:?}", playback.state))
+            .unwrap_or_else(|| "<none>".into()),
+        snapshot.mode,
+        snapshot
+            .active_scene
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
 }
 
 fn sine_vec3(amplitude: f32, frequency_hz: f32, seconds: f32) -> [f32; 3] {
@@ -1475,6 +1583,19 @@ async fn connect_simulated_client(
         }
     };
 
+    // The server sends the initial world snapshot directly after
+    // registration, before activating the session.
+    match control.recv().await? {
+        ControlMessage::SceneSnapshot(snapshot) => {
+            log_scene_snapshot(&snapshot);
+        }
+        other => {
+            return Err(anyhow!(
+                "expected initial SceneSnapshot after registration, got {other:?}"
+            ));
+        }
+    }
+
     Ok(SimulatedClient {
         _endpoint: client,
         peer,
@@ -1497,6 +1618,12 @@ async fn drain_control_messages(
         };
 
         match message {
+            ControlMessage::StateEventMsg(envelope) => {
+                log_state_event(&envelope);
+            }
+            ControlMessage::SceneSnapshot(snapshot) => {
+                log_scene_snapshot(&snapshot);
+            }
             ControlMessage::ModeState(active_mode) => {
                 if verbose {
                     sim_logln!("debug: async control message ModeState({active_mode:?})");
@@ -1669,9 +1796,11 @@ mod tests {
 
     #[tokio::test]
     async fn simulated_client_connects_via_quic_handshake() {
-        let mut config = ServerConfig::default();
-        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.enable_discovery = false;
+        let config = ServerConfig {
+            quic_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_discovery: false,
+            ..Default::default()
+        };
         let server = ServerHandle::new(config);
         let _adv = server.start().await.unwrap();
         let server_addr = server.quic_bind_addr().await;

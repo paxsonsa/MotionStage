@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 motionstage-server.workspace = true
 motionstage-protocol.workspace = true
 motionstage-core.workspace = true
+motionstage-transport-quic = { workspace = true, features = ["insecure"] }
 uuid.workspace = true
 tokio.workspace = true

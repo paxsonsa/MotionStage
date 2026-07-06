@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     net::SocketAddr,
     ops::ControlFlow,
@@ -21,10 +21,12 @@ use motionstage_media::{
 };
 use motionstage_protocol::{
     negotiate_version, AttributeDescriptor, BakeAttributeValue, BaselineAction, ClientHello,
-    ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction, PlaybackRuntimeState,
-    ProtocolError, ProtocolVersion, RecordingState, RegisterAccepted, RegisterRejected,
-    RegisterRequest, RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello, SessionState,
-    SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo, VideoStreamStatus, PROTOCOL_MAJOR,
+    ClientRole, ControlMessage, DataFlowState, Feature, MappingSummary, Mode, PlaybackAction,
+    PlaybackRuntimeState, PlaybackSummary, ProtocolError, ProtocolVersion, RecordingState,
+    RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SamplingMode,
+    SceneSnapshotPayload, SdpMessage, SdpType, ServerHello, SessionState, SessionSummary,
+    SignalMessage, SignalPayload, SnapshotAttribute, SnapshotObject, SnapshotScene, StateEvent,
+    StateEventEnvelope, TakeBakeAttribute, TakeInfo, VideoStreamStatus, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
 use motionstage_recording::{
@@ -116,6 +118,11 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// Nanosecond timestamp of last activity (control message or motion datagram).
     pub last_activity_ns: u64,
+    /// True for the in-process host session (registered at server construction).
+    /// The host is a real session — it appears in [`ServerHandle::sessions`],
+    /// fires `SessionJoined`, and consumes the same event stream — but it is
+    /// exempt from capacity checks and idle eviction.
+    pub is_host: bool,
 }
 
 struct ActiveRecording {
@@ -174,6 +181,11 @@ struct ServerState {
     runtime_resources: Option<RuntimeResources>,
     active_advertisement: Option<DiscoveryAdvertisement>,
     last_published_snapshot: Option<RuntimeSnapshot>,
+    /// Monotonic sequence for [`StateEventEnvelope`]s. Incremented while the
+    /// state write lock is held so seq order always matches mutation order.
+    event_seq: u64,
+    /// Ring buffer of recent envelopes for resync replay.
+    event_log: VecDeque<StateEventEnvelope>,
     /// DCC-side actions requested by the companion UI, drained by the plugin on its
     /// main-thread tick. The runtime never executes these itself.
     host_requests: Vec<HostRequest>,
@@ -245,7 +257,7 @@ impl ServerState {
         let active_or_pending = self
             .sessions
             .values()
-            .filter(|session| session.state != SessionState::Closed)
+            .filter(|session| !session.is_host && session.state != SessionState::Closed)
             .count();
         if active_or_pending >= self.config.max_sessions {
             return Err(ServerError::RegisterRejected(RegisterRejected {
@@ -318,19 +330,21 @@ impl ServerState {
         Some(chosen)
     }
 
-    fn tick_playback(&mut self, now_ns: u64) {
-        let Some(playback) = self.active_playback.as_mut() else {
-            return;
-        };
+    /// Advance active playback. Returns a [`StateEvent::PlaybackChanged`] when
+    /// playback transitions on its own (e.g. a non-looping take reaches the
+    /// end and stops), so the caller can replicate it.
+    fn tick_playback(&mut self, now_ns: u64) -> Option<StateEvent> {
+        let playback = self.active_playback.as_mut()?;
         if playback.state != PlaybackRuntimeState::Playing {
-            return;
+            return None;
         }
 
         let Some(started_wall_ns) = playback.started_wall_ns else {
             playback.started_wall_ns = Some(now_ns);
-            return;
+            return None;
         };
 
+        let mut transition = None;
         let elapsed = now_ns.saturating_sub(started_wall_ns);
         let mut playhead = playback.started_playhead_ns.saturating_add(elapsed);
         let duration = Self::playback_duration_ns(&playback.recording);
@@ -344,6 +358,12 @@ impl ServerState {
                 playback.state = PlaybackRuntimeState::Stopped;
                 playback.started_wall_ns = None;
                 playback.started_playhead_ns = playhead;
+                transition = Some(StateEvent::PlaybackChanged {
+                    state: PlaybackRuntimeState::Stopped,
+                    take_id: playback.take_id,
+                    playhead_ns: playhead,
+                    looping: playback.looping,
+                });
             }
         }
 
@@ -352,6 +372,7 @@ impl ServerState {
         if let Some(frame) = Self::frame_for_playhead(&playback.recording, playback.playhead_ns) {
             self.apply_playback_frame(&frame, scene_id);
         }
+        transition
     }
 }
 
@@ -390,10 +411,29 @@ pub struct PlaybackStatus {
     pub looping: bool,
 }
 
+/// Capacity of the state-event broadcast channel; a receiver that falls more
+/// than this many events behind observes `Lagged` and is resynced with a
+/// fresh [`SceneSnapshotPayload`].
+const EVENT_BROADCAST_CAPACITY: usize = 256;
+/// Number of recent [`StateEventEnvelope`]s retained for resync replay.
+const EVENT_LOG_CAPACITY: usize = 1024;
+
+/// Server response to a [`ControlMessage::ResyncRequest`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResyncResponse {
+    /// The gap was still buffered: the exact missing envelopes, in seq order.
+    Replay(Vec<StateEventEnvelope>),
+    /// The gap fell out of the ring buffer (or the seq was from another
+    /// epoch): a fresh full snapshot.
+    Snapshot(SceneSnapshotPayload),
+}
+
 #[derive(Clone)]
 pub struct ServerHandle {
     state: Arc<RwLock<ServerState>>,
-    mode_updates: broadcast::Sender<Mode>,
+    state_events: broadcast::Sender<StateEventEnvelope>,
+    host_session_id: Uuid,
+    host_device_id: Uuid,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -427,10 +467,31 @@ impl QuicRuntime {
 
 impl ServerHandle {
     pub fn new(config: ServerConfig) -> Self {
-        let (mode_updates, _mode_updates_rx) = broadcast::channel(64);
+        let (state_events, _state_events_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        // The host DCC is a real session from the start: it holds roles, shows
+        // up in the session table, and fires SessionJoined like any player.
+        let host_device_id = Uuid::new_v4();
+        let host_session_id = Uuid::new_v4();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            host_device_id,
+            SessionInfo {
+                device_id: host_device_id,
+                device_name: "host".into(),
+                session_id: Some(host_session_id),
+                roles: vec![ClientRole::SceneAuthor, ClientRole::Operator],
+                features: config.supported_features.clone(),
+                advertised_attributes: Vec::new(),
+                state: SessionState::Active,
+                last_activity_ns: now_ns(),
+                is_host: true,
+            },
+        );
+
         let state = ServerState {
             runtime: RuntimeCore::new(config.lease),
-            sessions: BTreeMap::new(),
+            sessions,
             metrics: ServerMetrics::default(),
             running: false,
             active_recording: None,
@@ -455,14 +516,162 @@ impl ServerHandle {
             runtime_resources: None,
             active_advertisement: None,
             last_published_snapshot: None,
+            event_seq: 0,
+            event_log: VecDeque::new(),
             host_requests: Vec::new(),
             host_selection: Vec::new(),
             config,
         };
 
-        Self {
+        let handle = Self {
             state: Arc::new(RwLock::new(state)),
-            mode_updates,
+            state_events,
+            host_session_id,
+            host_device_id,
+        };
+
+        // Emit the host's SessionJoined like any other session join. No other
+        // handle exists yet, so try_write cannot fail.
+        {
+            let mut state = handle
+                .state
+                .try_write()
+                .expect("state lock is uncontended during construction");
+            let (device_name, roles) = state
+                .sessions
+                .get(&host_device_id)
+                .map(|s| (s.device_name.clone(), s.roles.clone()))
+                .expect("host session was just inserted");
+            handle.emit_event(
+                &mut state,
+                Some(host_session_id),
+                StateEvent::SessionJoined {
+                    session_id: host_session_id,
+                    device_id: host_device_id,
+                    device_name,
+                    roles,
+                },
+            );
+        }
+
+        handle
+    }
+
+    /// Session id of the in-process host session. Host-API mutations stamp
+    /// this as their `origin_session`.
+    pub fn host_session_id(&self) -> Uuid {
+        self.host_session_id
+    }
+
+    /// Device id of the in-process host session.
+    pub fn host_device_id(&self) -> Uuid {
+        self.host_device_id
+    }
+
+    /// Assign the next seq, record the envelope in the replay ring buffer, and
+    /// fan it out. Must be called while `state`'s write lock is held so seq
+    /// order matches mutation order.
+    fn emit_event(
+        &self,
+        state: &mut ServerState,
+        origin_session: Option<Uuid>,
+        event: StateEvent,
+    ) -> u64 {
+        state.event_seq += 1;
+        let envelope = StateEventEnvelope {
+            seq: state.event_seq,
+            origin_session,
+            timestamp_ns: now_ns(),
+            event,
+        };
+        if state.event_log.len() == EVENT_LOG_CAPACITY {
+            state.event_log.pop_front();
+        }
+        state.event_log.push_back(envelope.clone());
+        let _ = self.state_events.send(envelope);
+        state.event_seq
+    }
+
+    /// Subscribe to the ordered state-event stream. Every mutation of server
+    /// state is observable here on every transport; see [`StateEvent`].
+    pub fn subscribe_state_events(&self) -> broadcast::Receiver<StateEventEnvelope> {
+        self.state_events.subscribe()
+    }
+
+    /// Sequence number of the most recently emitted state event.
+    pub async fn current_event_seq(&self) -> u64 {
+        let state = self.state.read().await;
+        state.event_seq
+    }
+
+    fn build_scene_snapshot(state: &ServerState) -> SceneSnapshotPayload {
+        let snapshot = state.runtime.snapshot();
+        // Only registered sessions: exactly the set replicated by
+        // SessionJoined/SessionLeft. Sessions closed/evicted before a
+        // session_id was assigned never emit events, so a snapshot must not
+        // show them either.
+        let sessions = state
+            .sessions
+            .values()
+            .filter(|session| session.state != SessionState::Closed)
+            .filter_map(|session| {
+                session.session_id.map(|session_id| SessionSummary {
+                    session_id,
+                    device_id: session.device_id,
+                    device_name: session.device_name.clone(),
+                    roles: session.roles.clone(),
+                    is_host: session.is_host,
+                })
+            })
+            .collect();
+        let playback = state.active_playback.as_ref().map(|playback| PlaybackSummary {
+            state: playback.state,
+            take_id: playback.take_id,
+            playhead_ns: playback.playhead_ns,
+            looping: playback.looping,
+        });
+        SceneSnapshotPayload {
+            scenes: snapshot.scenes.values().map(scene_to_snapshot).collect(),
+            mappings: snapshot.mappings.values().map(mapping_to_summary).collect(),
+            mode: state.runtime.mode(),
+            active_scene: snapshot.active_scene,
+            sessions,
+            takes: state.take_catalog.list(None),
+            playback,
+            seq: state.event_seq,
+        }
+    }
+
+    /// Full world snapshot (scene graphs, mappings, mode, active scene,
+    /// registered sessions, take catalog, playback transport) stamped with
+    /// the current event seq.
+    pub async fn scene_snapshot_payload(&self) -> SceneSnapshotPayload {
+        let state = self.state.read().await;
+        Self::build_scene_snapshot(&state)
+    }
+
+    /// Reconnect support: given the last seq a client observed, either replay
+    /// the exact missing envelopes (still buffered) or hand back a fresh
+    /// snapshot.
+    pub async fn resync_from(&self, last_seq: u64) -> ResyncResponse {
+        let state = self.state.read().await;
+        if last_seq > state.event_seq {
+            // Seq from a previous server epoch: only a snapshot is safe.
+            return ResyncResponse::Snapshot(Self::build_scene_snapshot(&state));
+        }
+        if last_seq == state.event_seq {
+            return ResyncResponse::Replay(Vec::new());
+        }
+        match state.event_log.front() {
+            Some(oldest) if oldest.seq <= last_seq + 1 => ResyncResponse::Replay(
+                state
+                    .event_log
+                    .iter()
+                    .filter(|envelope| envelope.seq > last_seq)
+                    .cloned()
+                    .collect(),
+            ),
+            _ => ResyncResponse::Snapshot(Self::build_scene_snapshot(&state)),
         }
     }
 
@@ -611,24 +820,49 @@ impl ServerHandle {
                             continue;
                         }
                         let now = now_ns();
-                        state.runtime.scheduler_tick(now);
-                        state.tick_playback(now);
+                        let released = state.runtime.scheduler_tick(now);
+                        for mapping_id in released {
+                            tick_server.emit_event(
+                                &mut state,
+                                None,
+                                StateEvent::MappingReleased {
+                                    mapping_id,
+                                    reason: "mapping lease expired".into(),
+                                },
+                            );
+                        }
+                        if let Some(event) = state.tick_playback(now) {
+                            tick_server.emit_event(&mut state, None, event);
+                        }
 
                         // Evict sessions that have been idle beyond the configured timeout (4.4).
+                        // The in-process host session is never evicted.
                         let idle_timeout = state.config.lease.session_idle_timeout_ns;
                         if idle_timeout > 0 {
-                            let expired: Vec<Uuid> = state.sessions.values()
+                            let expired: Vec<(Uuid, Option<Uuid>)> = state.sessions.values()
                                 .filter(|s| {
-                                    s.state != SessionState::Closed
+                                    !s.is_host
+                                        && s.state != SessionState::Closed
                                         && s.state != SessionState::Discovered
                                         && now.saturating_sub(s.last_activity_ns) >= idle_timeout
                                 })
-                                .map(|s| s.device_id)
+                                .map(|s| (s.device_id, s.session_id))
                                 .collect();
-                            for device_id in expired {
+                            for (device_id, session_id) in expired {
                                 warn!(%device_id, "session idle timeout; closing");
                                 state.runtime.register_device_disconnected(device_id, now);
-                                let _ = state.change_session_state(device_id, SessionState::Closed);
+                                if state.change_session_state(device_id, SessionState::Closed).is_ok() {
+                                    if let Some(session_id) = session_id {
+                                        tick_server.emit_event(
+                                            &mut state,
+                                            Some(session_id),
+                                            StateEvent::SessionLeft {
+                                                session_id,
+                                                reason: Some("idle timeout".into()),
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -726,6 +960,23 @@ impl ServerHandle {
         if !state.sessions.contains_key(&device_id) {
             state.enforce_capacity()?;
         }
+        // Reconnect racing a half-open previous connection: replacing a
+        // still-registered record must emit its terminal SessionLeft first,
+        // or event-stream consumers keep a session that no longer exists.
+        if let Some(old) = state.sessions.get(&device_id) {
+            if old.state != SessionState::Closed {
+                if let Some(old_session_id) = old.session_id {
+                    self.emit_event(
+                        &mut state,
+                        Some(old_session_id),
+                        StateEvent::SessionLeft {
+                            session_id: old_session_id,
+                            reason: Some("superseded by reconnect".into()),
+                        },
+                    );
+                }
+            }
+        }
         state.sessions.insert(
             device_id,
             SessionInfo {
@@ -737,18 +988,21 @@ impl ServerHandle {
                 advertised_attributes: Vec::new(),
                 state: SessionState::Discovered,
                 last_activity_ns: now_ns(),
+                is_host: false,
             },
         );
         debug!(%device_id, device_name = %device_name, "session discovered");
         Ok(())
     }
 
+    /// Number of non-closed client sessions. The in-process host session is
+    /// excluded (it always exists); use [`ServerHandle::sessions`] to see it.
     pub async fn session_count(&self) -> usize {
         let state = self.state.read().await;
         state
             .sessions
             .values()
-            .filter(|session| session.state != SessionState::Closed)
+            .filter(|session| !session.is_host && session.state != SessionState::Closed)
             .count()
     }
 
@@ -875,17 +1129,29 @@ impl ServerHandle {
         let mut state = self.state.write().await;
         state.runtime.register_device_connected(device_id);
         state.change_session_state(device_id, SessionState::Active)?;
-        let device_name = state
+        let (device_name, session_id, roles) = state
             .sessions
             .get(&device_id)
-            .map(|s| s.device_name.clone())
+            .map(|s| (s.device_name.clone(), s.session_id, s.roles.clone()))
             .unwrap_or_default();
         if let Some(recording) = state.active_recording.as_mut() {
             recording.writer.push_marker(RecordingMarker::ClientJoined {
                 timestamp_ns: now_ns(),
                 device_id,
-                device_name,
+                device_name: device_name.clone(),
             });
+        }
+        if let Some(session_id) = session_id {
+            self.emit_event(
+                &mut state,
+                Some(session_id),
+                StateEvent::SessionJoined {
+                    session_id,
+                    device_id,
+                    device_name,
+                    roles,
+                },
+            );
         }
         Ok(())
     }
@@ -913,30 +1179,69 @@ impl ServerHandle {
             recording.writer.push_marker(RecordingMarker::ClientLeft {
                 timestamp_ns: now_ns,
                 device_id,
-                reason,
+                reason: reason.clone(),
             });
         }
         state
             .runtime
             .register_device_disconnected(device_id, now_ns);
         state.video_peers.remove(&device_id);
-        state.change_session_state(device_id, SessionState::Closed)
+        state.change_session_state(device_id, SessionState::Closed)?;
+        if let Some(session_id) = state.sessions.get(&device_id).and_then(|s| s.session_id) {
+            self.emit_event(
+                &mut state,
+                Some(session_id),
+                StateEvent::SessionLeft { session_id, reason },
+            );
+        }
+        Ok(())
     }
 
+    /// Load a scene, stamping the in-process host session as event origin.
     pub async fn load_scene(&self, scene: Scene) -> SceneId {
-        let mut state = self.state.write().await;
-        state.runtime.load_scene(scene)
+        self.load_scene_from(scene, Some(self.host_session_id))
+            .await
     }
 
+    pub async fn load_scene_from(&self, scene: Scene, origin: Option<Uuid>) -> SceneId {
+        let mut state = self.state.write().await;
+        let name = scene.name.clone();
+        let scene_id = state.runtime.load_scene(scene);
+        self.emit_event(&mut state, origin, StateEvent::SceneLoaded { scene_id, name });
+        scene_id
+    }
+
+    /// Activate a scene, stamping the host session as event origin.
     pub async fn set_active_scene(&self, scene_id: SceneId) -> Result<(), ServerError> {
+        self.set_active_scene_from(scene_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn set_active_scene_from(
+        &self,
+        scene_id: SceneId,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state
             .runtime
             .set_active_scene(scene_id)
-            .map_err(ServerError::Core)
+            .map_err(ServerError::Core)?;
+        self.emit_event(&mut state, origin, StateEvent::SceneActivated { scene_id });
+        Ok(())
     }
 
+    /// Set the data-flow axis, stamping the host session as event origin.
     pub async fn set_data_flow(&self, data_flow: DataFlowState) -> Result<(), ServerError> {
+        self.set_data_flow_from(data_flow, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn set_data_flow_from(
+        &self,
+        data_flow: DataFlowState,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let from = state.runtime.mode();
         state
@@ -956,11 +1261,21 @@ impl ServerHandle {
                     to,
                 });
         }
-        let _ = self.mode_updates.send(to);
+        self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode: to });
         Ok(())
     }
 
+    /// Set the recording axis, stamping the host session as event origin.
     pub async fn set_recording(&self, recording: RecordingState) -> Result<(), ServerError> {
+        self.set_recording_from(recording, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn set_recording_from(
+        &self,
+        recording: RecordingState,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let from = state.runtime.mode();
         state
@@ -978,12 +1293,8 @@ impl ServerHandle {
                 to,
             });
         }
-        let _ = self.mode_updates.send(to);
+        self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode: to });
         Ok(())
-    }
-
-    pub fn subscribe_mode_updates(&self) -> broadcast::Receiver<Mode> {
-        self.mode_updates.subscribe()
     }
 
     /// Queue a DCC-side action requested by the companion UI. The plugin drains and
@@ -1056,24 +1367,60 @@ impl ServerHandle {
         &self,
         scene_id: Option<SceneId>,
     ) -> Result<u32, ServerError> {
+        self.reset_scene_to_baseline_from(scene_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn reset_scene_to_baseline_from(
+        &self,
+        scene_id: Option<SceneId>,
+        origin: Option<Uuid>,
+    ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
         let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
-        state
+        let changed = state
             .runtime
             .reset_scene_to_baseline(resolved)
-            .map_err(ServerError::Core)
+            .map_err(ServerError::Core)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::BaselineApplied {
+                action: BaselineAction::ResetScene,
+                changed_attributes: changed,
+            },
+        );
+        Ok(changed)
     }
 
     pub async fn commit_scene_baseline(
         &self,
         scene_id: Option<SceneId>,
     ) -> Result<u32, ServerError> {
+        self.commit_scene_baseline_from(scene_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn commit_scene_baseline_from(
+        &self,
+        scene_id: Option<SceneId>,
+        origin: Option<Uuid>,
+    ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
         let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
-        state
+        let changed = state
             .runtime
             .commit_scene_baseline(resolved)
-            .map_err(ServerError::Core)
+            .map_err(ServerError::Core)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::BaselineApplied {
+                action: BaselineAction::CommitScene,
+                changed_attributes: changed,
+            },
+        );
+        Ok(changed)
     }
 
     pub async fn commit_object_baseline(
@@ -1081,12 +1428,31 @@ impl ServerHandle {
         scene_id: Option<SceneId>,
         object_id: ObjectId,
     ) -> Result<u32, ServerError> {
+        self.commit_object_baseline_from(scene_id, object_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn commit_object_baseline_from(
+        &self,
+        scene_id: Option<SceneId>,
+        object_id: ObjectId,
+        origin: Option<Uuid>,
+    ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
         let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
-        state
+        let changed = state
             .runtime
             .commit_object_baseline(resolved, object_id)
-            .map_err(ServerError::Core)
+            .map_err(ServerError::Core)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::BaselineApplied {
+                action: BaselineAction::CommitObject,
+                changed_attributes: changed,
+            },
+        );
+        Ok(changed)
     }
 
     pub async fn set_mode_control_allowlist(&self, _device_ids: Vec<Uuid>) {
@@ -1116,14 +1482,24 @@ impl ServerHandle {
         req: MappingRequest,
         now_ns: u64,
     ) -> Result<MappingId, ServerError> {
+        self.create_mapping_from(req, now_ns, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn create_mapping_from(
+        &self,
+        req: MappingRequest,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<MappingId, ServerError> {
         let mut state = self.state.write().await;
         let mapping_id = state
             .runtime
             .create_mapping(req, now_ns)
             .map_err(ServerError::Core)?;
-        let mapping_for_marker = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
-        if let Some(recording) = state.active_recording.as_mut() {
-            if let Some(mapping) = mapping_for_marker {
+        let mapping = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
+        if let Some(mapping) = mapping {
+            if let Some(recording) = state.active_recording.as_mut() {
                 recording
                     .writer
                     .push_marker(RecordingMarker::MappingCreated {
@@ -1137,6 +1513,13 @@ impl ServerHandle {
                         component_mask: mapping.component_mask.clone(),
                     });
             }
+            self.emit_event(
+                &mut state,
+                origin,
+                StateEvent::MappingCreated {
+                    mapping: mapping_to_summary(&mapping),
+                },
+            );
         }
         Ok(mapping_id)
     }
@@ -1147,14 +1530,25 @@ impl ServerHandle {
         req: MappingRequest,
         now_ns: u64,
     ) -> Result<(), ServerError> {
+        self.update_mapping_from(mapping_id, req, now_ns, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn update_mapping_from(
+        &self,
+        mapping_id: MappingId,
+        req: MappingRequest,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state
             .runtime
             .update_mapping(mapping_id, req, now_ns)
             .map_err(ServerError::Core)?;
-        let mapping_for_marker = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
-        if let Some(recording) = state.active_recording.as_mut() {
-            if let Some(mapping) = mapping_for_marker {
+        let mapping = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
+        if let Some(mapping) = mapping {
+            if let Some(recording) = state.active_recording.as_mut() {
                 recording
                     .writer
                     .push_marker(RecordingMarker::MappingUpdated {
@@ -1168,11 +1562,27 @@ impl ServerHandle {
                         component_mask: mapping.component_mask.clone(),
                     });
             }
+            self.emit_event(
+                &mut state,
+                origin,
+                StateEvent::MappingUpdated {
+                    mapping: mapping_to_summary(&mapping),
+                },
+            );
         }
         Ok(())
     }
 
     pub async fn remove_mapping(&self, mapping_id: MappingId) -> Result<(), ServerError> {
+        self.remove_mapping_from(mapping_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn remove_mapping_from(
+        &self,
+        mapping_id: MappingId,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state
             .runtime
@@ -1186,6 +1596,7 @@ impl ServerHandle {
                     mapping_id,
                 });
         }
+        self.emit_event(&mut state, origin, StateEvent::MappingRemoved { mapping_id });
         Ok(())
     }
 
@@ -1193,6 +1604,16 @@ impl ServerHandle {
         &self,
         mapping_id: MappingId,
         lock: bool,
+    ) -> Result<(), ServerError> {
+        self.set_mapping_lock_from(mapping_id, lock, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn set_mapping_lock_from(
+        &self,
+        mapping_id: MappingId,
+        lock: bool,
+        origin: Option<Uuid>,
     ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state
@@ -1208,6 +1629,11 @@ impl ServerHandle {
                     lock,
                 });
         }
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::MappingLockChanged { mapping_id, lock },
+        );
         Ok(())
     }
 
@@ -1316,8 +1742,40 @@ impl ServerHandle {
         path: impl AsRef<Path>,
         now_ns: u64,
     ) -> Result<Uuid, ServerError> {
+        self.start_recording_from(path, now_ns, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn start_recording_from(
+        &self,
+        path: impl AsRef<Path>,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<Uuid, ServerError> {
         let mut state = self.state.write().await;
-        state.active_playback = None;
+        // Validate every precondition before mutating anything: an error
+        // return must leave runtime state untouched and emit no events.
+        let active_scene = state
+            .runtime
+            .snapshot()
+            .active_scene
+            .ok_or_else(|| ServerError::Recording("no active scene".into()))?;
+
+        let initial_mode = state.runtime.mode();
+        // Recording replaces any loaded playback; that discard is a
+        // replicated mutation like every other playback-terminating path.
+        if let Some(playback) = state.active_playback.take() {
+            self.emit_event(
+                &mut state,
+                origin,
+                StateEvent::PlaybackChanged {
+                    state: PlaybackRuntimeState::Stopped,
+                    take_id: playback.take_id,
+                    playhead_ns: playback.playhead_ns,
+                    looping: playback.looping,
+                },
+            );
+        }
         let mut from_mode = state.runtime.mode();
         if from_mode.data_flow == DataFlowState::Idle {
             state
@@ -1330,12 +1788,6 @@ impl ServerHandle {
             .runtime
             .set_recording(RecordingState::Recording)
             .map_err(ServerError::Core)?;
-
-        let active_scene = state
-            .runtime
-            .snapshot()
-            .active_scene
-            .ok_or_else(|| ServerError::Recording("no active scene".into()))?;
 
         let writer = RecordingWriter::start(active_scene, now_ns);
         let recording_id = writer.recording_id();
@@ -1372,10 +1824,35 @@ impl ServerHandle {
             }
         }
 
+        if initial_mode != Mode::RECORDING {
+            self.emit_event(
+                &mut state,
+                origin,
+                StateEvent::ModeChanged {
+                    mode: Mode::RECORDING,
+                },
+            );
+        }
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::RecordingStarted {
+                take_id: recording_id,
+                scene_id: active_scene,
+            },
+        );
+
         Ok(recording_id)
     }
 
     pub async fn stop_recording(&self) -> Result<RecordingManifest, ServerError> {
+        self.stop_recording_from(Some(self.host_session_id)).await
+    }
+
+    pub async fn stop_recording_from(
+        &self,
+        origin: Option<Uuid>,
+    ) -> Result<RecordingManifest, ServerError> {
         let mut state = self.state.write().await;
         let Some(mut recording) = state.active_recording.take() else {
             return Err(ServerError::Recording("no active recording".into()));
@@ -1395,7 +1872,7 @@ impl ServerHandle {
             .finish(&recording_path)
             .map_err(|err| ServerError::Recording(err.to_string()))?;
 
-        state
+        let entry = state
             .take_catalog
             .register_take(
                 manifest.recording_id,
@@ -1406,10 +1883,28 @@ impl ServerHandle {
             )
             .map_err(ServerError::Take)?;
 
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::RecordingStopped {
+                take_id: manifest.recording_id,
+                frame_count: manifest.frame_count,
+            },
+        );
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::TakeRegistered {
+                take: entry.to_take_info(),
+            },
+        );
+
         state
             .runtime
             .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
+        let mode = state.runtime.mode();
+        self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
 
         Ok(manifest)
     }
@@ -1420,17 +1915,45 @@ impl ServerHandle {
     }
 
     pub async fn select_take(&self, take_id: Uuid) -> Result<TakeInfo, ServerError> {
+        self.select_take_from(take_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn select_take_from(
+        &self,
+        take_id: Uuid,
+        origin: Option<Uuid>,
+    ) -> Result<TakeInfo, ServerError> {
         let mut state = self.state.write().await;
-        state
+        let info = state
             .take_catalog
             .select_take(take_id)
-            .map_err(ServerError::Take)
+            .map_err(ServerError::Take)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::TakeSelected {
+                take_id: info.take_id,
+                scene_id: info.scene_id,
+            },
+        );
+        Ok(info)
     }
 
     pub async fn playback_play(
         &self,
         take_id: Uuid,
         looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        self.playback_play_from(take_id, looping, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn playback_play_from(
+        &self,
+        take_id: Uuid,
+        looping: bool,
+        origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
         let take = state
@@ -1440,6 +1963,8 @@ impl ServerHandle {
             .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
         let recording =
             read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        let previous_scene = state.runtime.active_scene();
+        let previous_mode = state.runtime.mode();
         state
             .runtime
             .set_active_scene(recording.manifest.scene_id)
@@ -1464,15 +1989,43 @@ impl ServerHandle {
         if let Some(frame) = ServerState::frame_for_playhead(&playback.recording, 0) {
             state.apply_playback_frame(&frame, playback.recording.manifest.scene_id);
         }
+        let scene_id = playback.recording.manifest.scene_id;
         let playhead_ns = playback.playhead_ns;
         let looping = playback.looping;
         state.active_playback = Some(playback);
+
+        if previous_scene != Some(scene_id) {
+            self.emit_event(&mut state, origin, StateEvent::SceneActivated { scene_id });
+        }
+        let mode = state.runtime.mode();
+        if previous_mode != mode {
+            self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
+        }
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Playing,
+                take_id,
+                playhead_ns,
+                looping,
+            },
+        );
         Ok((PlaybackRuntimeState::Playing, playhead_ns, looping))
     }
 
     pub async fn playback_pause(
         &self,
         take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        self.playback_pause_from(take_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn playback_pause_from(
+        &self,
+        take_id: Uuid,
+        origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
         let Some(playback) = state.active_playback.as_mut() else {
@@ -1491,7 +2044,19 @@ impl ServerHandle {
         playback.state = PlaybackRuntimeState::Paused;
         playback.started_wall_ns = None;
         playback.started_playhead_ns = playback.playhead_ns;
-        Ok((playback.state, playback.playhead_ns, playback.looping))
+        let (playback_state, playhead_ns, looping) =
+            (playback.state, playback.playhead_ns, playback.looping);
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::PlaybackChanged {
+                state: playback_state,
+                take_id,
+                playhead_ns,
+                looping,
+            },
+        );
+        Ok((playback_state, playhead_ns, looping))
     }
 
     pub async fn playback_seek(
@@ -1499,6 +2064,17 @@ impl ServerHandle {
         take_id: Uuid,
         seek_ns: u64,
         looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        self.playback_seek_from(take_id, seek_ns, looping, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn playback_seek_from(
+        &self,
+        take_id: Uuid,
+        seek_ns: u64,
+        looping: bool,
+        origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
         let (status, playhead, loop_state, scene_id, frame) = {
@@ -1535,12 +2111,31 @@ impl ServerHandle {
         if let Some(frame) = frame {
             state.apply_playback_frame(&frame, scene_id);
         }
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::PlaybackChanged {
+                state: status,
+                take_id,
+                playhead_ns: playhead,
+                looping: loop_state,
+            },
+        );
         Ok((status, playhead, loop_state))
     }
 
     pub async fn playback_stop(
         &self,
         take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        self.playback_stop_from(take_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn playback_stop_from(
+        &self,
+        take_id: Uuid,
+        origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
         let Some(playback) = state.active_playback.take() else {
@@ -1556,6 +2151,18 @@ impl ServerHandle {
             .runtime
             .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
+        let mode = state.runtime.mode();
+        self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Stopped,
+                take_id,
+                playhead_ns: playback.playhead_ns,
+                looping: playback.looping,
+            },
+        );
         Ok((
             PlaybackRuntimeState::Stopped,
             playback.playhead_ns,
@@ -1633,15 +2240,58 @@ impl ServerHandle {
     }
 
     pub async fn delete_take(&self, take_id: Uuid) -> Result<(), ServerError> {
+        self.delete_take_from(take_id, Some(self.host_session_id))
+            .await
+    }
+
+    pub async fn delete_take_from(
+        &self,
+        take_id: Uuid,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let path = state
             .take_catalog
             .mark_deleted(take_id)
             .map_err(ServerError::Take)?;
 
+        // The catalog mutation is persisted (deleted=true) at this point:
+        // replicate it before any fallible filesystem work so the event
+        // stream can never miss the catalog change.
+        self.emit_event(&mut state, origin, StateEvent::TakeDeleted { take_id });
+
+        if let Some(active) =
+            state.active_playback.take_if(|active| active.take_id == take_id)
+        {
+            state
+                .runtime
+                .set_recording(RecordingState::Inactive)
+                .map_err(ServerError::Core)?;
+            let mode = state.runtime.mode();
+            self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
+            self.emit_event(
+                &mut state,
+                origin,
+                StateEvent::PlaybackChanged {
+                    state: PlaybackRuntimeState::Stopped,
+                    take_id,
+                    playhead_ns: active.playhead_ns,
+                    looping: active.looping,
+                },
+            );
+        }
+
+        state
+            .bake_cursors
+            .retain(|_, cursor| cursor.take_id != take_id);
+
         if let Some(path) = path {
             if let Err(err) = fs::remove_file(&path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
+                    // Policy: surface the filesystem error to the caller. The
+                    // take stays tombstoned (deleted=true, TakeDeleted already
+                    // emitted), so replicas remain consistent; only the orphan
+                    // recording file is left behind for manual cleanup.
                     return Err(ServerError::Take(err.to_string()));
                 }
             }
@@ -1650,18 +2300,6 @@ impl ServerHandle {
                 .purge_take(take_id)
                 .map_err(ServerError::Take)?;
         }
-
-        if matches!(state.active_playback.as_ref(), Some(active) if active.take_id == take_id) {
-            state.active_playback = None;
-            state
-                .runtime
-                .set_recording(RecordingState::Inactive)
-                .map_err(ServerError::Core)?;
-        }
-
-        state
-            .bake_cursors
-            .retain(|_, cursor| cursor.take_id != take_id);
         Ok(())
     }
 
@@ -1981,6 +2619,7 @@ async fn handle_set_data_flow(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
+    session_id: Uuid,
     state: DataFlowState,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
@@ -1997,7 +2636,7 @@ async fn handle_set_data_flow(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    match server.set_data_flow(state).await {
+    match server.set_data_flow_from(state, Some(session_id)).await {
         Ok(()) => {
             let active_mode = server.mode().await;
             control
@@ -2022,6 +2661,7 @@ async fn handle_set_recording(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
+    session_id: Uuid,
     state: RecordingState,
 ) -> Result<HandlerOutcome, ServerError> {
     if !client_hello.roles.contains(&ClientRole::Operator) {
@@ -2038,7 +2678,7 @@ async fn handle_set_recording(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    match server.set_recording(state).await {
+    match server.set_recording_from(state, Some(session_id)).await {
         Ok(()) => {
             let active_mode = server.mode().await;
             control
@@ -2063,6 +2703,7 @@ async fn handle_baseline_control(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
+    session_id: Uuid,
     msg: ControlMessage,
 ) -> Result<HandlerOutcome, ServerError> {
     let reject_reason = match &msg {
@@ -2089,18 +2730,18 @@ async fn handle_baseline_control(
     }
     let result: Result<(BaselineAction, u32), ServerError> = match msg {
         ControlMessage::ResetSceneToBaseline { scene_id } => server
-            .reset_scene_to_baseline(scene_id)
+            .reset_scene_to_baseline_from(scene_id, Some(session_id))
             .await
             .map(|n| (BaselineAction::ResetScene, n)),
         ControlMessage::CommitSceneBaseline { scene_id } => server
-            .commit_scene_baseline(scene_id)
+            .commit_scene_baseline_from(scene_id, Some(session_id))
             .await
             .map(|n| (BaselineAction::CommitScene, n)),
         ControlMessage::CommitObjectBaseline {
             scene_id,
             object_id,
         } => server
-            .commit_object_baseline(scene_id, object_id)
+            .commit_object_baseline_from(scene_id, object_id, Some(session_id))
             .await
             .map(|n| (BaselineAction::CommitObject, n)),
         _ => unreachable!(),
@@ -2132,6 +2773,7 @@ async fn handle_take_management(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
+    session_id: Uuid,
     msg: ControlMessage,
 ) -> Result<HandlerOutcome, ServerError> {
     let reject_reason = match &msg {
@@ -2158,7 +2800,10 @@ async fn handle_take_management(
                 .await
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
         }
-        ControlMessage::SelectTake { take_id } => match server.select_take(take_id).await {
+        ControlMessage::SelectTake { take_id } => match server
+            .select_take_from(take_id, Some(session_id))
+            .await
+        {
             Ok(selected) => {
                 control
                     .send(&ControlMessage::TakeSelected {
@@ -2177,7 +2822,10 @@ async fn handle_take_management(
                 }
             }
         },
-        ControlMessage::DeleteTake { take_id } => match server.delete_take(take_id).await {
+        ControlMessage::DeleteTake { take_id } => match server
+            .delete_take_from(take_id, Some(session_id))
+            .await
+        {
             Ok(()) => {
                 control
                     .send(&ControlMessage::TakeDeleted { take_id })
@@ -2199,10 +2847,12 @@ async fn handle_take_management(
     Ok(ControlFlow::Continue(()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_playback_control(
     control: &mut motionstage_transport_quic::ControlChannel,
     server: &ServerHandle,
     client_hello: &ClientHello,
+    session_id: Uuid,
     take_id: Uuid,
     action: PlaybackAction,
     seek_ns: Option<u64>,
@@ -2222,13 +2872,16 @@ async fn handle_playback_control(
         }
         return Ok(ControlFlow::Continue(()));
     }
+    let origin = Some(session_id);
     let result = match action {
-        PlaybackAction::Play => server.playback_play(take_id, looping).await,
-        PlaybackAction::Pause => server.playback_pause(take_id).await,
-        PlaybackAction::Stop => server.playback_stop(take_id).await,
+        PlaybackAction::Play => server.playback_play_from(take_id, looping, origin).await,
+        PlaybackAction::Pause => server.playback_pause_from(take_id, origin).await,
+        PlaybackAction::Stop => server.playback_stop_from(take_id, origin).await,
         PlaybackAction::Seek => {
             let seek = seek_ns.unwrap_or_default();
-            server.playback_seek(take_id, seek, looping).await
+            server
+                .playback_seek_from(take_id, seek, looping, origin)
+                .await
         }
     };
     match result {
@@ -2587,12 +3240,14 @@ async fn handle_quic_peer(
         }
     };
 
-    match server.register(client_hello.device_id, register_req).await {
+    let session_id = match server.register(client_hello.device_id, register_req).await {
         Ok(accepted) => {
+            let session_id = accepted.session_id;
             control
                 .send(&ControlMessage::RegisterAccepted(accepted))
                 .await
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            session_id
         }
         Err(ServerError::RegisterRejected(rejected)) => {
             control
@@ -2606,11 +3261,22 @@ async fn handle_quic_peer(
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Err(err);
         }
-    }
+    };
 
+    // Subscribe before taking the snapshot so no event between snapshot and
+    // subscription is lost; events already folded into the snapshot are
+    // deduplicated by the client via the snapshot's `seq`.
+    let mut state_events = server.subscribe_state_events();
+
+    // SceneSynced means what it says: the client received the initial world
+    // snapshot before activation.
+    let snapshot = server.scene_snapshot_payload().await;
+    control
+        .send(&ControlMessage::SceneSnapshot(snapshot))
+        .await
+        .map_err(|err| ServerError::Runtime(err.to_string()))?;
     server.scene_synced(client_hello.device_id).await?;
     server.activate(client_hello.device_id).await?;
-    let mut mode_updates = server.subscribe_mode_updates();
 
     loop {
         tokio::select! {
@@ -2637,21 +3303,39 @@ async fn handle_quic_peer(
                         break;
                     }
                     Ok(ControlMessage::SetDataFlow(state)) => {
-                        match handle_set_data_flow(&mut control, &server, &client_hello, state).await? {
+                        match handle_set_data_flow(&mut control, &server, &client_hello, session_id, state).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
                     }
                     Ok(ControlMessage::SetRecording(state)) => {
-                        match handle_set_recording(&mut control, &server, &client_hello, state).await? {
+                        match handle_set_recording(&mut control, &server, &client_hello, session_id, state).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
+                        }
+                    }
+                    Ok(ControlMessage::ResyncRequest { last_seq }) => {
+                        match server.resync_from(last_seq).await {
+                            ResyncResponse::Replay(envelopes) => {
+                                for envelope in envelopes {
+                                    control
+                                        .send(&ControlMessage::StateEventMsg(envelope))
+                                        .await
+                                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                                }
+                            }
+                            ResyncResponse::Snapshot(payload) => {
+                                control
+                                    .send(&ControlMessage::SceneSnapshot(payload))
+                                    .await
+                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                            }
                         }
                     }
                     Ok(msg @ (ControlMessage::ResetSceneToBaseline { .. }
                         | ControlMessage::CommitSceneBaseline { .. }
                         | ControlMessage::CommitObjectBaseline { .. })) => {
-                        match handle_baseline_control(&mut control, &server, &client_hello, msg).await? {
+                        match handle_baseline_control(&mut control, &server, &client_hello, session_id, msg).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
@@ -2659,13 +3343,13 @@ async fn handle_quic_peer(
                     Ok(msg @ (ControlMessage::ListTakes { .. }
                         | ControlMessage::SelectTake { .. }
                         | ControlMessage::DeleteTake { .. })) => {
-                        match handle_take_management(&mut control, &server, &client_hello, msg).await? {
+                        match handle_take_management(&mut control, &server, &client_hello, session_id, msg).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
                     }
                     Ok(ControlMessage::PlaybackControl { take_id, action, seek_ns, looping }) => {
-                        match handle_playback_control(&mut control, &server, &client_hello, take_id, action, seek_ns, looping).await? {
+                        match handle_playback_control(&mut control, &server, &client_hello, session_id, take_id, action, seek_ns, looping).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
@@ -2705,7 +3389,9 @@ async fn handle_quic_peer(
                     | Ok(ControlMessage::ClientHello(_))
                     | Ok(ControlMessage::RegisterRequest(_))
                     | Ok(ControlMessage::RegisterAccepted(_))
-                    | Ok(ControlMessage::RegisterRejected(_)) => {
+                    | Ok(ControlMessage::RegisterRejected(_))
+                    | Ok(ControlMessage::StateEventMsg(_))
+                    | Ok(ControlMessage::SceneSnapshot(_)) => {
                         if send_protocol_error(&mut control, RejectCode::RoleDenied, "unsupported control message in active loop".into()).await.is_err() {
                             let _ = server.close_session(client_hello.device_id, now_ns()).await;
                             break;
@@ -2734,26 +3420,42 @@ async fn handle_quic_peer(
                     }
                 }
             }
-            mode_update = mode_updates.recv() => {
-                match mode_update {
-                    Ok(active_mode) => {
-                        if control.send(&ControlMessage::ModeState(active_mode)).await.is_err() {
+            event = state_events.recv() => {
+                match event_delivery_message(&server, event).await {
+                    Some(message) => {
+                        if control.send(&message).await.is_err() {
                             let _ = server.close_session(client_hello.device_id, now_ns()).await;
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                    None => break,
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Map a state-event broadcast recv result to the outbound control message:
+/// forward events as [`ControlMessage::StateEventMsg`]; on `Lagged` (the
+/// receiver fell behind the broadcast buffer) resync with a fresh
+/// [`ControlMessage::SceneSnapshot`] instead of dropping events silently.
+/// `None` means the event bus closed and the session loop should end.
+async fn event_delivery_message(
+    server: &ServerHandle,
+    event: Result<StateEventEnvelope, broadcast::error::RecvError>,
+) -> Option<ControlMessage> {
+    match event {
+        Ok(envelope) => Some(ControlMessage::StateEventMsg(envelope)),
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            warn!(skipped, "state event receiver lagged; resyncing with snapshot");
+            Some(ControlMessage::SceneSnapshot(
+                server.scene_snapshot_payload().await,
+            ))
+        }
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 async fn send_protocol_error(
@@ -2842,18 +3544,61 @@ fn recorded_to_bake_attribute(recorded: RecordedAttribute) -> TakeBakeAttribute 
     TakeBakeAttribute {
         object_id: recorded.object_id,
         attribute: recorded.attribute,
-        value: match recorded.value {
-            AttributeValue::Bool(v) => BakeAttributeValue::Bool(v),
-            AttributeValue::Int32(v) => BakeAttributeValue::Int32(v),
-            AttributeValue::Float32(v) => BakeAttributeValue::Float32(v),
-            AttributeValue::Float64(v) => BakeAttributeValue::Float64(v),
-            AttributeValue::Vec2f(v) => BakeAttributeValue::Vec2f(v),
-            AttributeValue::Vec3f(v) => BakeAttributeValue::Vec3f(v),
-            AttributeValue::Vec4f(v) => BakeAttributeValue::Vec4f(v),
-            AttributeValue::Quatf(v) => BakeAttributeValue::Quatf(v),
-            AttributeValue::Mat4f(v) => BakeAttributeValue::Mat4f(v),
-            AttributeValue::Trigger(v) => BakeAttributeValue::Trigger(v),
-        },
+        value: attribute_value_to_bake(&recorded.value),
+    }
+}
+
+fn attribute_value_to_bake(value: &AttributeValue) -> BakeAttributeValue {
+    match value {
+        AttributeValue::Bool(v) => BakeAttributeValue::Bool(*v),
+        AttributeValue::Int32(v) => BakeAttributeValue::Int32(*v),
+        AttributeValue::Float32(v) => BakeAttributeValue::Float32(*v),
+        AttributeValue::Float64(v) => BakeAttributeValue::Float64(*v),
+        AttributeValue::Vec2f(v) => BakeAttributeValue::Vec2f(*v),
+        AttributeValue::Vec3f(v) => BakeAttributeValue::Vec3f(*v),
+        AttributeValue::Vec4f(v) => BakeAttributeValue::Vec4f(*v),
+        AttributeValue::Quatf(v) => BakeAttributeValue::Quatf(*v),
+        AttributeValue::Mat4f(v) => BakeAttributeValue::Mat4f(*v),
+        AttributeValue::Trigger(v) => BakeAttributeValue::Trigger(*v),
+    }
+}
+
+fn mapping_to_summary(mapping: &motionstage_core::Mapping) -> MappingSummary {
+    MappingSummary {
+        mapping_id: mapping.id,
+        source_device: mapping.source_device,
+        source_output: mapping.source_output.clone(),
+        target_scene: mapping.target_scene,
+        target_object: mapping.target_object,
+        target_attribute: mapping.target_attribute.clone(),
+        component_mask: mapping.component_mask.clone(),
+        lock: mapping.lock,
+    }
+}
+
+fn scene_to_snapshot(scene: &Scene) -> SnapshotScene {
+    SnapshotScene {
+        scene_id: scene.id,
+        name: scene.name.clone(),
+        objects: scene
+            .objects
+            .values()
+            .map(|object| SnapshotObject {
+                object_id: object.id,
+                name: object.name.clone(),
+                attributes: object
+                    .attributes
+                    .values()
+                    .map(|attr| SnapshotAttribute {
+                        name: attr.name.clone(),
+                        default_value: attribute_value_to_bake(&attr.default_value),
+                        current_value: attribute_value_to_bake(&attr.current_value),
+                        live_enabled: attr.live_enabled,
+                        record_enabled: attr.record_enabled,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -2924,19 +3669,34 @@ mod tests {
         VideoStreamDescriptor,
     };
     use motionstage_protocol::{
-        AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole,
-        ControlMessage, DataFlowState, Feature, Mode, RecordingState, RegisterRequest, RejectCode,
-        SamplingMode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        AttributeDescriptor, AttributeKind, BakeAttributeValue, BaselineAction, ClientHello,
+        ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackRuntimeState,
+        RecordingState, RegisterRequest, RejectCode, SamplingMode, SessionState, StateEvent,
+        StateEventEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
 
-    use crate::{SecurityMode, ServerConfig, ServerError, ServerHandle};
+    use crate::{
+        event_delivery_message, now_ns, ResyncResponse, SecurityMode, ServerConfig, ServerError,
+        ServerHandle,
+    };
     use motionstage_recording::{read_recording, RecordingFormatVersion, RecordingMarker};
     use motionstage_transport_quic::{
         AttributeUpdateFrame, ControlChannel, MotionDatagram, QuicClient, QuicPeer,
     };
     use motionstage_webrtc::WebRtcSession;
+
+    /// Server config whose take catalog lives in a fresh tempdir. Every test
+    /// that can write the take catalog (recording, take select/delete) must
+    /// use this so `cargo test` never touches the tracked
+    /// `recordings/takes_catalog.json` (the crate-relative default path).
+    fn config_with_temp_catalog() -> (ServerConfig, tempfile::TempDir) {
+        let temp = tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = temp.path().join("takes.json");
+        (config, temp)
+    }
 
     async fn connect_active_quic_client(
         addr: SocketAddr,
@@ -2984,7 +3744,44 @@ mod tests {
             control.recv().await.unwrap(),
             ControlMessage::RegisterAccepted(_)
         ));
+        // The SceneSynced handshake step sends the initial world snapshot.
+        assert!(matches!(
+            control.recv().await.unwrap(),
+            ControlMessage::SceneSnapshot(_)
+        ));
         (peer, control)
+    }
+
+    /// Receive the next non-event control message. Sessions receive the full
+    /// replicated event stream (including their own echoes), so tests waiting
+    /// on a direct response skip `StateEventMsg` frames.
+    async fn recv_skipping_events(control: &mut ControlChannel) -> ControlMessage {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), control.recv())
+                .await
+                .expect("control message within timeout")
+                .unwrap()
+            {
+                ControlMessage::StateEventMsg(_) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// Receive control messages until one matches the predicate.
+    async fn recv_until(
+        control: &mut ControlChannel,
+        predicate: impl Fn(&ControlMessage) -> bool,
+    ) -> ControlMessage {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), control.recv())
+                .await
+                .expect("control message within timeout")
+                .unwrap();
+            if predicate(&message) {
+                return message;
+            }
+        }
     }
 
     #[tokio::test]
@@ -3116,7 +3913,8 @@ mod tests {
 
     #[tokio::test]
     async fn recording_blocks_remap_and_writes_cmtrk() {
-        let server = ServerHandle::new(ServerConfig::default());
+        let (config, _temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
         let device_id = Uuid::now_v7();
 
         let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
@@ -3589,7 +4387,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let response = control.recv().await.unwrap();
+        let response = recv_skipping_events(&mut control).await;
         match response {
             ControlMessage::VideoOffer(sdp) => {
                 assert_eq!(sdp.ty, SdpType::Offer);
@@ -3620,7 +4418,7 @@ mod tests {
             .send(&ControlMessage::GetVideoStreamStatus)
             .await
             .unwrap();
-        let initial = control.recv().await.unwrap();
+        let initial = recv_skipping_events(&mut control).await;
         match initial {
             ControlMessage::VideoStreamStatus(status) => {
                 assert!(!status.available);
@@ -3653,7 +4451,7 @@ mod tests {
             .send(&ControlMessage::GetVideoStreamStatus)
             .await
             .unwrap();
-        let active = control.recv().await.unwrap();
+        let active = recv_skipping_events(&mut control).await;
         match active {
             ControlMessage::VideoStreamStatus(status) => {
                 assert!(status.available);
@@ -3688,7 +4486,7 @@ mod tests {
             .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
-        match control.recv().await.unwrap() {
+        match recv_skipping_events(&mut control).await {
             ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
@@ -3718,7 +4516,7 @@ mod tests {
             .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
-        match control.recv().await.unwrap() {
+        match recv_skipping_events(&mut control).await {
             ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
@@ -3754,17 +4552,28 @@ mod tests {
             .await
             .unwrap();
 
-        let ack = tokio::time::timeout(Duration::from_secs(1), control_b.recv())
-            .await
-            .expect("requesting client should get mode ack")
-            .unwrap();
+        let ack = recv_skipping_events(&mut control_b).await;
         assert!(matches!(ack, ControlMessage::ModeState(Mode::LIVE)));
 
-        let pushed = tokio::time::timeout(Duration::from_secs(1), control_a.recv())
-            .await
-            .expect("other active client should get mode broadcast")
-            .unwrap();
-        assert!(matches!(pushed, ControlMessage::ModeState(Mode::LIVE)));
+        // The other active client observes the change as a replicated state
+        // event carrying the originating session.
+        let pushed = recv_until(&mut control_a, |message| {
+            matches!(
+                message,
+                ControlMessage::StateEventMsg(StateEventEnvelope {
+                    event: StateEvent::ModeChanged { mode: Mode::LIVE },
+                    ..
+                })
+            )
+        })
+        .await;
+        match pushed {
+            ControlMessage::StateEventMsg(envelope) => {
+                assert!(envelope.origin_session.is_some());
+                assert_ne!(envelope.origin_session, Some(server.host_session_id()));
+            }
+            other => panic!("expected StateEventMsg, got {other:?}"),
+        }
 
         runtime.shutdown().await.unwrap();
     }
@@ -3798,7 +4607,7 @@ mod tests {
             })
             .await
             .unwrap();
-        match control.recv().await.unwrap() {
+        match recv_skipping_events(&mut control).await {
             ControlMessage::BaselineActionApplied {
                 action,
                 changed_attributes,
@@ -3840,7 +4649,7 @@ mod tests {
             .send(&ControlMessage::CommitSceneBaseline { scene_id: None })
             .await
             .unwrap();
-        match control.recv().await.unwrap() {
+        match recv_skipping_events(&mut control).await {
             ControlMessage::Error { code, .. } => assert_eq!(code, RejectCode::RoleDenied),
             other => panic!("expected protocol error, got {other:?}"),
         }
@@ -3885,7 +4694,7 @@ mod tests {
             .unwrap();
 
         control_b.send(&ControlMessage::DrainSignals).await.unwrap();
-        let response = control_b.recv().await.unwrap();
+        let response = recv_skipping_events(&mut control_b).await;
         match response {
             ControlMessage::SignalsBatch(batch) => {
                 assert_eq!(batch.len(), 1);
@@ -4078,7 +4887,8 @@ mod tests {
 
     #[tokio::test]
     async fn recording_persists_resolved_runtime_values_after_relative_composition() {
-        let server = ServerHandle::new(ServerConfig::default());
+        let (config, _temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
         let device_id = Uuid::now_v7();
 
         let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
@@ -4330,5 +5140,1077 @@ mod tests {
         server.delete_take(manifest.recording_id).await.unwrap();
         assert!(!recording_path.exists());
         assert!(server.list_takes(None).await.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Event plane (P1)
+    // -----------------------------------------------------------------------
+
+    fn drain_events(
+        rx: &mut tokio::sync::broadcast::Receiver<StateEventEnvelope>,
+    ) -> Vec<StateEventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            events.push(envelope);
+        }
+        events
+    }
+
+    fn camera_scene() -> (Scene, Uuid, Uuid) {
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([10.0, 20.0, 30.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        (scene, scene_id, object_id)
+    }
+
+    #[tokio::test]
+    async fn host_session_is_registered_at_startup() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let sessions = server.sessions().await;
+        let host = sessions
+            .iter()
+            .find(|s| s.is_host)
+            .expect("host session exists");
+        assert_eq!(host.device_name, "host");
+        assert_eq!(host.device_id, server.host_device_id());
+        assert_eq!(host.session_id, Some(server.host_session_id()));
+        assert_eq!(host.state, SessionState::Active);
+        assert!(host.roles.contains(&ClientRole::SceneAuthor));
+        assert!(host.roles.contains(&ClientRole::Operator));
+
+        // The host join is event seq 1, replayable from the ring buffer.
+        match server.resync_from(0).await {
+            ResyncResponse::Replay(events) => {
+                assert_eq!(events[0].seq, 1);
+                assert!(matches!(
+                    &events[0].event,
+                    StateEvent::SessionJoined { session_id, device_name, .. }
+                        if *session_id == server.host_session_id() && device_name == "host"
+                ));
+            }
+            other => panic!("expected replay from seq 0, got {other:?}"),
+        }
+
+        // The host does not consume client capacity.
+        let mut config = ServerConfig::default();
+        config.max_sessions = 1;
+        let server = ServerHandle::new(config);
+        server.discovered(Uuid::now_v7(), "ipad").await.unwrap();
+        assert_eq!(server.session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn host_api_mutations_stamp_host_session_origin() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let mut rx = server.subscribe_state_events();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].origin_session, Some(server.host_session_id()));
+        assert!(matches!(
+            events[0].event,
+            StateEvent::ModeChanged { mode: Mode::LIVE }
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_mutator_emits_exactly_the_expected_events() {
+        let temp = tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = temp.path().join("takes.json");
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let host = Some(server.host_session_id());
+        let mut rx = server.subscribe_state_events();
+        let mut all_seqs: Vec<u64> = Vec::new();
+
+        macro_rules! expect_events {
+            ($($pattern:pat),+ $(,)?) => {{
+                let events = drain_events(&mut rx);
+                for envelope in &events {
+                    assert_eq!(envelope.origin_session, host);
+                    all_seqs.push(envelope.seq);
+                }
+                let mut iter = events.iter();
+                $(
+                    let envelope = iter.next().expect("missing expected event");
+                    assert!(
+                        matches!(&envelope.event, $pattern),
+                        "unexpected event {:?}, expected {}",
+                        envelope.event,
+                        stringify!($pattern),
+                    );
+                )+
+                assert!(iter.next().is_none(), "extra events emitted: {events:?}");
+                events
+            }};
+        }
+
+        // load_scene
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        expect_events!(StateEvent::SceneLoaded { .. });
+
+        // set_active_scene
+        server.set_active_scene(scene_id).await.unwrap();
+        expect_events!(StateEvent::SceneActivated { .. });
+
+        // set_data_flow
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
+        expect_events!(StateEvent::ModeChanged { mode: Mode::LIVE });
+
+        // set_recording
+        server
+            .set_recording(RecordingState::Recording)
+            .await
+            .unwrap();
+        expect_events!(StateEvent::ModeChanged {
+            mode: Mode::RECORDING
+        });
+        server
+            .set_recording(RecordingState::Inactive)
+            .await
+            .unwrap();
+        expect_events!(StateEvent::ModeChanged { mode: Mode::LIVE });
+
+        // create_mapping
+        let mapping_id = server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let events = expect_events!(StateEvent::MappingCreated { .. });
+        match &events[0].event {
+            StateEvent::MappingCreated { mapping } => {
+                assert_eq!(mapping.mapping_id, mapping_id);
+                assert_eq!(mapping.source_device, device_id);
+                assert_eq!(mapping.source_output, "pose_pos");
+                assert_eq!(mapping.target_scene, scene_id);
+                assert_eq!(mapping.target_object, object_id);
+                assert_eq!(mapping.target_attribute, "position");
+                assert_eq!(mapping.component_mask, None);
+                assert!(!mapping.lock);
+            }
+            other => panic!("expected MappingCreated, got {other:?}"),
+        }
+
+        // update_mapping
+        server
+            .update_mapping(
+                mapping_id,
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: Some(vec![0, 1]),
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        expect_events!(StateEvent::MappingUpdated { .. });
+
+        // set_mapping_lock
+        server.set_mapping_lock(mapping_id, true).await.unwrap();
+        expect_events!(StateEvent::MappingLockChanged { lock: true, .. });
+        server.set_mapping_lock(mapping_id, false).await.unwrap();
+        expect_events!(StateEvent::MappingLockChanged { lock: false, .. });
+
+        // baseline actions
+        server.commit_scene_baseline(Some(scene_id)).await.unwrap();
+        expect_events!(StateEvent::BaselineApplied {
+            action: BaselineAction::CommitScene,
+            ..
+        });
+        server
+            .reset_scene_to_baseline(Some(scene_id))
+            .await
+            .unwrap();
+        expect_events!(StateEvent::BaselineApplied {
+            action: BaselineAction::ResetScene,
+            ..
+        });
+        server
+            .commit_object_baseline(Some(scene_id), object_id)
+            .await
+            .unwrap();
+        expect_events!(StateEvent::BaselineApplied {
+            action: BaselineAction::CommitObject,
+            ..
+        });
+
+        // start_recording: mode transition + recording start
+        let recording_id = server.start_recording(&recording_path, 102).await.unwrap();
+        let events = expect_events!(
+            StateEvent::ModeChanged {
+                mode: Mode::RECORDING
+            },
+            StateEvent::RecordingStarted { .. },
+        );
+        assert!(matches!(
+            &events[1].event,
+            StateEvent::RecordingStarted { take_id, scene_id: sid }
+                if *take_id == recording_id && *sid == scene_id
+        ));
+
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                103,
+            )
+            .await
+            .unwrap();
+        assert!(drain_events(&mut rx).is_empty(), "data plane emits no events");
+
+        // stop_recording: stop + take registration + mode transition
+        let manifest = server.stop_recording().await.unwrap();
+        let events = expect_events!(
+            StateEvent::RecordingStopped { .. },
+            StateEvent::TakeRegistered { .. },
+            StateEvent::ModeChanged { mode: Mode::LIVE },
+        );
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::RecordingStopped { take_id, frame_count }
+                if *take_id == manifest.recording_id && *frame_count == 1
+        ));
+        assert!(matches!(
+            &events[1].event,
+            StateEvent::TakeRegistered { take } if take.take_id == manifest.recording_id
+        ));
+
+        // select_take
+        server.select_take(manifest.recording_id).await.unwrap();
+        expect_events!(StateEvent::TakeSelected { .. });
+
+        // playback controls
+        server
+            .playback_play(manifest.recording_id, false)
+            .await
+            .unwrap();
+        expect_events!(
+            StateEvent::ModeChanged {
+                mode: Mode::PLAYBACK
+            },
+            StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Playing,
+                ..
+            },
+        );
+        server
+            .playback_pause(manifest.recording_id)
+            .await
+            .unwrap();
+        expect_events!(StateEvent::PlaybackChanged {
+            state: PlaybackRuntimeState::Paused,
+            ..
+        });
+        server
+            .playback_seek(manifest.recording_id, 0, false)
+            .await
+            .unwrap();
+        expect_events!(StateEvent::PlaybackChanged { .. });
+        server.playback_stop(manifest.recording_id).await.unwrap();
+        expect_events!(
+            StateEvent::ModeChanged { mode: Mode::LIVE },
+            StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Stopped,
+                ..
+            },
+        );
+
+        // remove_mapping
+        server.remove_mapping(mapping_id).await.unwrap();
+        expect_events!(StateEvent::MappingRemoved { .. });
+
+        // delete_take
+        server.delete_take(manifest.recording_id).await.unwrap();
+        expect_events!(StateEvent::TakeDeleted { .. });
+
+        // Every event seq across the whole run is strictly monotonic and
+        // contiguous (emitted under the state write lock).
+        assert!(!all_seqs.is_empty());
+        for pair in all_seqs.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "seq gap or reorder: {all_seqs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_recording_without_active_scene_mutates_nothing_and_emits_nothing() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let mut rx = server.subscribe_state_events();
+        let seq_before = server.current_event_seq().await;
+        assert_eq!(server.mode().await, Mode::IDLE);
+
+        let err = server
+            .start_recording(temp.path().join("never.cmtrk"), 100)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("no active scene"));
+
+        // The failed precondition left the authoritative state untouched and
+        // the event stream silent: no half-applied Live/Recording mode.
+        assert_eq!(server.mode().await, Mode::IDLE);
+        assert_eq!(server.current_event_seq().await, seq_before);
+        assert!(drain_events(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_recording_over_active_playback_emits_terminal_playback_stopped() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        server
+            .start_recording(temp.path().join("take-001.cmtrk"), 101)
+            .await
+            .unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+        server
+            .playback_play(manifest.recording_id, true)
+            .await
+            .unwrap();
+
+        let mut rx = server.subscribe_state_events();
+        server
+            .start_recording(temp.path().join("take-002.cmtrk"), 200)
+            .await
+            .unwrap();
+
+        // Discarding the loaded playback is replicated like every other
+        // playback-terminating path, before the mode flips to recording.
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Stopped,
+                take_id,
+                looping: true,
+                ..
+            } if *take_id == manifest.recording_id
+        ));
+        assert!(matches!(
+            &events[1].event,
+            StateEvent::ModeChanged {
+                mode: Mode::RECORDING
+            }
+        ));
+        assert!(matches!(&events[2].event, StateEvent::RecordingStarted { .. }));
+        assert!(server.playback_status().await.is_none());
+
+        server.stop_recording().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scene_snapshot_recovers_sessions_takes_and_playback() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        server
+            .start_recording(temp.path().join("take-001.cmtrk"), 101)
+            .await
+            .unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+        server
+            .playback_play(manifest.recording_id, true)
+            .await
+            .unwrap();
+
+        // One session all the way to Active (registered), one merely
+        // discovered (no session_id — must not appear in the snapshot).
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::MotionSource],
+                features: vec![Feature::Motion],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        let accepted = server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.scene_synced(device_id).await.unwrap();
+        server.activate(device_id).await.unwrap();
+
+        let ghost_device = Uuid::now_v7();
+        server.discovered(ghost_device, "ghost").await.unwrap();
+
+        let payload = server.scene_snapshot_payload().await;
+
+        // Sessions: exactly the registered set (host + ipad), no ghost.
+        assert_eq!(payload.sessions.len(), 2, "sessions: {:?}", payload.sessions);
+        let host = payload
+            .sessions
+            .iter()
+            .find(|s| s.is_host)
+            .expect("host session in snapshot");
+        assert_eq!(host.session_id, server.host_session_id());
+        assert_eq!(host.device_name, "host");
+        let client = payload
+            .sessions
+            .iter()
+            .find(|s| !s.is_host)
+            .expect("registered client in snapshot");
+        assert_eq!(client.session_id, accepted.session_id);
+        assert_eq!(client.device_id, device_id);
+        assert_eq!(client.device_name, "ipad");
+        assert_eq!(client.roles, vec![ClientRole::MotionSource]);
+        assert!(!payload.sessions.iter().any(|s| s.device_id == ghost_device));
+
+        // Takes: the registered catalog.
+        assert_eq!(payload.takes.len(), 1);
+        assert_eq!(payload.takes[0].take_id, manifest.recording_id);
+
+        // Playback: the loaded transport.
+        let playback = payload.playback.expect("playback in snapshot");
+        assert_eq!(playback.state, PlaybackRuntimeState::Playing);
+        assert_eq!(playback.take_id, manifest.recording_id);
+        assert!(playback.looping);
+
+        // Full payload still round-trips serde.
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let decoded: motionstage_protocol::SceneSnapshotPayload =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, payload);
+
+        // A session closed after registration leaves the snapshot again.
+        server.close_session(device_id, now_ns()).await.unwrap();
+        let payload = server.scene_snapshot_payload().await;
+        assert_eq!(payload.sessions.len(), 1);
+        assert!(payload.sessions[0].is_host);
+    }
+
+    #[tokio::test]
+    async fn rediscovery_of_registered_session_emits_superseded_session_left() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        let accepted = server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.scene_synced(device_id).await.unwrap();
+        server.activate(device_id).await.unwrap();
+
+        // Reconnect while the old registered session is still half-open:
+        // replacing its record must close it on the event stream first.
+        let mut rx = server.subscribe_state_events();
+        server.discovered(device_id, "ipad").await.unwrap();
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::SessionLeft { session_id, reason }
+                if *session_id == accepted.session_id
+                    && reason.as_deref() == Some("superseded by reconnect")
+        ));
+        assert_eq!(events[0].origin_session, Some(accepted.session_id));
+
+        // Re-discovering a session that never registered emits nothing: it
+        // never joined the event stream, so it has nothing to leave.
+        server.discovered(device_id, "ipad").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+
+        // Discovering a brand-new device emits nothing.
+        let fresh_device = Uuid::now_v7();
+        server.discovered(fresh_device, "fresh").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+
+        // A record already Closed had its SessionLeft emitted at close time;
+        // rediscovery must not emit a second one.
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.close_session(device_id, now_ns()).await.unwrap();
+        let closed_events = drain_events(&mut rx);
+        assert_eq!(closed_events.len(), 1, "events: {closed_events:?}");
+        assert!(matches!(
+            &closed_events[0].event,
+            StateEvent::SessionLeft { reason, .. } if reason.is_none()
+        ));
+        server.discovered(device_id, "ipad").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_take_emits_event_even_when_file_removal_fails() {
+        let (config, temp) = config_with_temp_catalog();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+
+        // Sabotage the filesystem removal: a directory at the recording path
+        // makes fs::remove_file fail with a non-NotFound error.
+        std::fs::remove_file(&recording_path).unwrap();
+        std::fs::create_dir(&recording_path).unwrap();
+
+        let mut rx = server.subscribe_state_events();
+        let err = server.delete_take(manifest.recording_id).await.unwrap_err();
+        assert!(matches!(err, ServerError::Take(_)), "got {err:?}");
+
+        // The catalog mutation was replicated before the fs failure surfaced.
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::TakeDeleted { take_id } if *take_id == manifest.recording_id
+        ));
+
+        // The take is tombstoned: gone from listings and from the snapshot.
+        assert!(server.list_takes(None).await.is_empty());
+        assert!(server.scene_snapshot_payload().await.takes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_emits_joined_and_left_events() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        let mut rx = server.subscribe_state_events();
+
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        let accepted = server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.scene_synced(device_id).await.unwrap();
+        server.activate(device_id).await.unwrap();
+        server
+            .close_session_with_reason(device_id, now_ns(), Some("goodbye".into()))
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::SessionJoined { session_id, device_name, .. }
+                if *session_id == accepted.session_id && device_name == "ipad"
+        ));
+        assert_eq!(events[0].origin_session, Some(accepted.session_id));
+        assert!(matches!(
+            &events[1].event,
+            StateEvent::SessionLeft { session_id, reason }
+                if *session_id == accepted.session_id
+                    && reason.as_deref() == Some("goodbye")
+        ));
+    }
+
+    #[tokio::test]
+    async fn interleaved_origins_keep_seq_strictly_monotonic() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let other_session = Uuid::new_v4();
+        let mut rx = server.subscribe_state_events();
+
+        for i in 0..20 {
+            if i % 2 == 0 {
+                server.set_data_flow(DataFlowState::Live).await.unwrap();
+            } else {
+                server
+                    .set_data_flow_from(DataFlowState::Idle, Some(other_session))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 20);
+        for pair in events.windows(2) {
+            assert!(pair[1].seq > pair[0].seq);
+            assert_eq!(pair[1].seq, pair[0].seq + 1);
+        }
+        assert_eq!(
+            events[0].origin_session,
+            Some(server.host_session_id())
+        );
+        assert_eq!(events[1].origin_session, Some(other_session));
+    }
+
+    #[tokio::test]
+    async fn resync_replays_exactly_the_missing_gap() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let (scene, scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+        server.set_active_scene(scene_id).await.unwrap();
+        let last_seen = server.current_event_seq().await;
+
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
+        server.commit_scene_baseline(Some(scene_id)).await.unwrap();
+        let current = server.current_event_seq().await;
+        assert_eq!(current, last_seen + 2);
+
+        match server.resync_from(last_seen).await {
+            ResyncResponse::Replay(events) => {
+                let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+                assert_eq!(seqs, vec![last_seen + 1, last_seen + 2]);
+                assert!(matches!(
+                    events[0].event,
+                    StateEvent::ModeChanged { mode: Mode::LIVE }
+                ));
+                assert!(matches!(
+                    events[1].event,
+                    StateEvent::BaselineApplied { .. }
+                ));
+            }
+            other => panic!("expected replay, got {other:?}"),
+        }
+
+        // Fully caught up: empty replay.
+        match server.resync_from(current).await {
+            ResyncResponse::Replay(events) => assert!(events.is_empty()),
+            other => panic!("expected empty replay, got {other:?}"),
+        }
+
+        // A seq from the future (another server epoch) forces a snapshot.
+        assert!(matches!(
+            server.resync_from(current + 100).await,
+            ResyncResponse::Snapshot(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resync_falls_back_to_snapshot_when_gap_left_ring_buffer() {
+        let server = ServerHandle::new(ServerConfig::default());
+        // Push well past the ring buffer capacity (1024).
+        for _ in 0..1100 {
+            server.set_data_flow(DataFlowState::Live).await.unwrap();
+        }
+        match server.resync_from(0).await {
+            ResyncResponse::Snapshot(payload) => {
+                assert_eq!(payload.seq, server.current_event_seq().await);
+            }
+            other => panic!("expected snapshot fallback, got {other:?}"),
+        }
+        // A recent seq is still replayable.
+        let current = server.current_event_seq().await;
+        match server.resync_from(current - 5).await {
+            ResyncResponse::Replay(events) => assert_eq!(events.len(), 5),
+            other => panic!("expected replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scene_snapshot_payload_carries_world_and_round_trips_serde() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                101,
+            )
+            .await
+            .unwrap();
+
+        let payload = server.scene_snapshot_payload().await;
+        assert_eq!(payload.mode, Mode::LIVE);
+        assert_eq!(payload.active_scene, Some(scene_id));
+        assert_eq!(payload.seq, server.current_event_seq().await);
+        assert!(payload.seq > 0);
+
+        assert_eq!(payload.scenes.len(), 1);
+        let scene = &payload.scenes[0];
+        assert_eq!(scene.scene_id, scene_id);
+        assert_eq!(scene.name, "shot");
+        assert_eq!(scene.objects.len(), 1);
+        let object = &scene.objects[0];
+        assert_eq!(object.object_id, object_id);
+        assert_eq!(object.name, "camera");
+        let attr = &object.attributes[0];
+        assert_eq!(attr.name, "position");
+        assert_eq!(attr.default_value, BakeAttributeValue::Vec3f([10.0, 20.0, 30.0]));
+        // Relative composition applied the delta onto the baseline.
+        assert_eq!(attr.current_value, BakeAttributeValue::Vec3f([11.0, 22.0, 33.0]));
+        assert!(attr.live_enabled);
+        assert!(attr.record_enabled);
+
+        assert_eq!(payload.mappings.len(), 1);
+        assert_eq!(payload.mappings[0].source_device, device_id);
+        assert_eq!(payload.mappings[0].target_object, object_id);
+
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let decoded: motionstage_protocol::SceneSnapshotPayload =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn lagged_event_receiver_is_resynced_with_snapshot() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let mut rx = server.subscribe_state_events();
+        // Overrun the broadcast capacity (256) without draining.
+        for _ in 0..300 {
+            server.set_data_flow(DataFlowState::Live).await.unwrap();
+        }
+        let lagged = rx.recv().await;
+        assert!(matches!(
+            lagged,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+        match event_delivery_message(&server, lagged).await {
+            Some(ControlMessage::SceneSnapshot(payload)) => {
+                assert_eq!(payload.seq, server.current_event_seq().await);
+            }
+            other => panic!("expected snapshot on lag, got {other:?}"),
+        }
+        // A healthy receive forwards the envelope unchanged.
+        let ok = rx.recv().await;
+        match event_delivery_message(&server, ok).await {
+            Some(ControlMessage::StateEventMsg(_)) => {}
+            other => panic!("expected forwarded event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_sends_scene_snapshot_before_activation() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+
+        let (scene, scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+
+        let runtime = server.start_quic_runtime().await.unwrap();
+        let client = QuicClient::new_insecure_for_local_dev().unwrap();
+        let peer = client.connect(runtime.local_addr).await.unwrap();
+        let mut control = peer.accept_control_stream().await.unwrap();
+
+        assert!(matches!(
+            control.recv().await.unwrap(),
+            ControlMessage::ServerHello(_)
+        ));
+        control
+            .send(&ControlMessage::ClientHello(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id: Uuid::now_v7(),
+                device_name: "peer".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        control
+            .send(&ControlMessage::RegisterRequest(RegisterRequest {
+                pairing_token: None,
+                api_key: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            control.recv().await.unwrap(),
+            ControlMessage::RegisterAccepted(_)
+        ));
+        match control.recv().await.unwrap() {
+            ControlMessage::SceneSnapshot(payload) => {
+                assert_eq!(payload.scenes.len(), 1);
+                assert_eq!(payload.scenes[0].scene_id, scene_id);
+                assert_eq!(payload.active_scene, Some(scene_id));
+                assert_eq!(payload.mode, Mode::IDLE);
+            }
+            other => panic!("expected SceneSnapshot after registration, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resync_request_over_wire_replays_from_ring_buffer() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::ResyncRequest { last_seq: 0 })
+            .await
+            .unwrap();
+
+        // Seq 1 (the host SessionJoined) is only observable via replay: the
+        // live stream started after it.
+        let replayed = recv_until(&mut control, |message| {
+            matches!(
+                message,
+                ControlMessage::StateEventMsg(StateEventEnvelope { seq: 1, .. })
+            )
+        })
+        .await;
+        match replayed {
+            ControlMessage::StateEventMsg(envelope) => {
+                assert!(matches!(
+                    &envelope.event,
+                    StateEvent::SessionJoined { device_name, .. } if device_name == "host"
+                ));
+            }
+            other => panic!("expected replayed event, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_mutation_is_replicated_to_other_session_without_polling() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer_a, mut control_a) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+        let (_peer_b, mut control_b) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        // A host-side mutation reaches both wire sessions as an event.
+        server.commit_scene_baseline(Some(scene_id)).await.unwrap();
+        for control in [&mut control_a, &mut control_b] {
+            let observed = recv_until(control, |message| {
+                matches!(
+                    message,
+                    ControlMessage::StateEventMsg(StateEventEnvelope {
+                        event: StateEvent::BaselineApplied { .. },
+                        ..
+                    })
+                )
+            })
+            .await;
+            match observed {
+                ControlMessage::StateEventMsg(envelope) => {
+                    assert_eq!(envelope.origin_session, Some(server.host_session_id()));
+                }
+                other => panic!("expected BaselineApplied event, got {other:?}"),
+            }
+        }
+
+        runtime.shutdown().await.unwrap();
     }
 }

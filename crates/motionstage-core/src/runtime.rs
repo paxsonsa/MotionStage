@@ -79,6 +79,10 @@ impl RuntimeCore {
         self.mode
     }
 
+    pub fn active_scene(&self) -> Option<SceneId> {
+        self.active_scene
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             scenes: self.scenes.clone(),
@@ -313,7 +317,11 @@ impl RuntimeCore {
         Ok(())
     }
 
-    pub fn scheduler_tick(&mut self, now_ns: u64) {
+    /// Advance lease bookkeeping. Returns the ids of mappings whose lease was
+    /// released on this tick (source device disconnected and lease expired),
+    /// so the caller can replicate the release.
+    pub fn scheduler_tick(&mut self, now_ns: u64) -> Vec<MappingId> {
+        let mut released = Vec::new();
         for mapping in self.mappings.values_mut() {
             if mapping.state != MappingState::Active {
                 continue;
@@ -323,8 +331,10 @@ impl RuntimeCore {
             let expired = now_ns.saturating_sub(mapping.last_heartbeat_ns) >= self.lease.timeout_ns;
             if !source_connected && expired {
                 mapping.state = MappingState::Released;
+                released.push(mapping.id);
             }
         }
+        released
     }
 
     pub fn apply_updates(

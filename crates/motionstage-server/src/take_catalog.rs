@@ -22,7 +22,7 @@ pub struct TakeEntry {
 }
 
 impl TakeEntry {
-    fn to_take_info(&self) -> TakeInfo {
+    pub(crate) fn to_take_info(&self) -> TakeInfo {
         TakeInfo {
             take_id: self.take_id,
             scene_id: self.scene_id,

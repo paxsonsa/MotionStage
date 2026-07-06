@@ -6,8 +6,9 @@
 
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
 use motionstage_protocol::{
-    BakeAttributeValue, ClientRole, DataFlowState, Feature, Mode, PlaybackRuntimeState,
-    RecordingState, SamplingMode,
+    BakeAttributeValue, BaselineAction, ClientRole, DataFlowState, Feature, MappingSummary, Mode,
+    PlaybackRuntimeState, RecordingState, SamplingMode, SceneSnapshotPayload, StateEvent,
+    StateEventEnvelope, TakeInfo,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
@@ -17,7 +18,8 @@ use pyo3::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Set `MOTIONSTAGE_DEBUG_H264=1` to dump H.264 to the default path, or
@@ -35,6 +37,18 @@ pub struct PyMotionStageServer {
     debug_h264_path: Option<String>,
     // Companion UI listener, lazily started on first request and held alive here.
     companion_ui: std::sync::Mutex<Option<motionstage_server::companion_ui::CompanionUiHandle>>,
+    // The bridge IS the host session: `ServerHandle::new` registers it with
+    // roles [SceneAuthor, Operator] and every no-suffix mutator stamps its
+    // session id as the event origin. This receiver is that session's inbound
+    // event stream, drained by `drain_state_events`.
+    state_events: std::sync::Mutex<broadcast::Receiver<StateEventEnvelope>>,
+}
+
+/// One item pulled off the broadcast receiver: either a real envelope or a
+/// lag marker (the receiver fell behind and `skipped` events were dropped).
+enum DrainedItem {
+    Event(StateEventEnvelope),
+    Lagged(u64),
 }
 
 #[pymethods]
@@ -83,15 +97,105 @@ impl PyMotionStageServer {
             Some(path)
         });
 
+        let server = ServerHandle::new(config);
+        let state_events = std::sync::Mutex::new(server.subscribe_state_events());
         Ok(Self {
-            server: ServerHandle::new(config),
+            server,
             rt,
             encoder: Arc::new(std::sync::Mutex::new(None)),
             video_fps: std::sync::atomic::AtomicU32::new(24),
             video_encode_inflight: Arc::new(AtomicBool::new(false)),
             debug_h264_path,
             companion_ui: std::sync::Mutex::new(None),
+            state_events,
         })
+    }
+
+    /// Session id of the in-process host session this bridge acts as.
+    /// Host-API mutations carry this id as their event `origin_session`.
+    pub fn host_session_id(&self) -> String {
+        self.server.host_session_id().to_string()
+    }
+
+    /// Device id of the in-process host session.
+    pub fn host_device_id(&self) -> String {
+        self.server.host_device_id().to_string()
+    }
+
+    /// Sequence number of the most recently emitted state event.
+    pub fn current_event_seq(&self, py: Python<'_>) -> u64 {
+        py.allow_threads(|| self.rt.block_on(self.server.current_event_seq()))
+    }
+
+    /// Full world snapshot (scenes, mappings, mode, active scene) stamped with
+    /// the event seq it is consistent with. Events with `seq` less than or
+    /// equal to the snapshot's `seq` are already folded in.
+    pub fn initial_scene_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let payload = py.allow_threads(|| self.rt.block_on(self.server.scene_snapshot_payload()));
+        scene_snapshot_payload_to_dict(py, &payload)
+    }
+
+    /// Block up to `timeout_ms` for the next state event, then batch everything
+    /// currently queued. `timeout_ms == 0` is a non-blocking drain. Each event
+    /// is a dict with `seq`, `origin_session`, `timestamp_ns`, a snake_case
+    /// `type` discriminator, and the event payload flattened alongside. A
+    /// receiver that lagged the broadcast yields a
+    /// `{"type": "event_stream_lagged", "skipped": n}` marker; callers should
+    /// refetch `initial_scene_snapshot` when they see one.
+    #[pyo3(signature = (timeout_ms=0))]
+    pub fn drain_state_events<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        // The blocking wait releases the GIL: this is called from the SDK's
+        // background pump thread and must not stall the interpreter.
+        let items = py.allow_threads(|| {
+            let mut rx = match self.state_events.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut items: Vec<DrainedItem> = Vec::new();
+            self.rt.block_on(async {
+                if timeout_ms > 0 {
+                    match tokio::time::timeout(Duration::from_millis(timeout_ms), rx.recv()).await
+                    {
+                        Ok(Ok(envelope)) => items.push(DrainedItem::Event(envelope)),
+                        Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                            items.push(DrainedItem::Lagged(skipped))
+                        }
+                        Ok(Err(broadcast::error::RecvError::Closed)) => {}
+                        Err(_elapsed) => {}
+                    }
+                }
+                loop {
+                    match rx.try_recv() {
+                        Ok(envelope) => items.push(DrainedItem::Event(envelope)),
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            items.push(DrainedItem::Lagged(skipped))
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            items
+        });
+
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                DrainedItem::Event(envelope) => {
+                    out.push(state_event_envelope_to_dict(py, &envelope)?)
+                }
+                DrainedItem::Lagged(skipped) => {
+                    let d = PyDict::new_bound(py);
+                    d.set_item("type", "event_stream_lagged")?;
+                    d.set_item("skipped", skipped)?;
+                    out.push(d);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn start(&self) -> PyResult<String> {
@@ -483,6 +587,10 @@ impl PyMotionStageServer {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
+    /// Raw diagnostics listing of every session record (all lifecycle states,
+    /// including the in-process host session — distinguishable via the final
+    /// `is_host` element). The Python SDK derives its client catalog from this
+    /// by dropping host and pre-registration rows.
     pub fn sessions(
         &self,
     ) -> PyResult<
@@ -494,6 +602,7 @@ impl PyMotionStageServer {
             Vec<String>,
             Vec<String>,
             String,
+            bool,
         )>,
     > {
         let sessions = self.rt.block_on(self.server.sessions());
@@ -522,6 +631,7 @@ impl PyMotionStageServer {
                         .map(|ad| ad.path)
                         .collect(),
                     format!("{:?}", session.state),
+                    session.is_host,
                 )
             })
             .collect())
@@ -863,6 +973,7 @@ fn role_to_str(role: ClientRole) -> &'static str {
         ClientRole::CameraController => "camera_controller",
         ClientRole::VideoSink => "video_sink",
         ClientRole::Operator => "operator",
+        ClientRole::SceneAuthor => "scene_author",
     }
 }
 
@@ -883,6 +994,277 @@ fn playback_state_to_str(state: PlaybackRuntimeState) -> &'static str {
         PlaybackRuntimeState::Playing => "playing",
         PlaybackRuntimeState::Paused => "paused",
     }
+}
+
+fn data_flow_to_str(state: DataFlowState) -> &'static str {
+    match state {
+        DataFlowState::Idle => "idle",
+        DataFlowState::Live => "live",
+    }
+}
+
+fn recording_state_to_str(state: RecordingState) -> &'static str {
+    match state {
+        RecordingState::Inactive => "inactive",
+        RecordingState::Recording => "recording",
+        RecordingState::Playback => "playback",
+    }
+}
+
+fn baseline_action_to_str(action: BaselineAction) -> &'static str {
+    match action {
+        BaselineAction::ResetScene => "reset_scene",
+        BaselineAction::CommitScene => "commit_scene",
+        BaselineAction::CommitObject => "commit_object",
+    }
+}
+
+/// Write the composite mode onto `dict` as the legacy string plus both axes.
+fn set_mode_items(dict: &Bound<'_, PyDict>, mode: Mode) -> PyResult<()> {
+    dict.set_item("mode", mode_to_str(mode))?;
+    dict.set_item("data_flow", data_flow_to_str(mode.data_flow))?;
+    dict.set_item("recording", recording_state_to_str(mode.recording))?;
+    Ok(())
+}
+
+fn mapping_summary_to_dict<'py>(
+    py: Python<'py>,
+    mapping: &MappingSummary,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("mapping_id", mapping.mapping_id.to_string())?;
+    d.set_item("source_device", mapping.source_device.to_string())?;
+    d.set_item("source_output", mapping.source_output.as_str())?;
+    d.set_item("target_scene", mapping.target_scene.to_string())?;
+    d.set_item("target_object", mapping.target_object.to_string())?;
+    d.set_item("target_attribute", mapping.target_attribute.as_str())?;
+    d.set_item("component_mask", mapping.component_mask.clone())?;
+    d.set_item("lock", mapping.lock)?;
+    Ok(d)
+}
+
+fn take_info_to_dict<'py>(py: Python<'py>, take: &TakeInfo) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("take_id", take.take_id.to_string())?;
+    d.set_item("scene_id", take.scene_id.to_string())?;
+    d.set_item("name", take.name.as_str())?;
+    d.set_item("path", take.path.as_str())?;
+    d.set_item("created_ns", take.created_ns)?;
+    d.set_item("frame_count", take.frame_count)?;
+    d.set_item("selected", take.selected)?;
+    d.set_item("deleted", take.deleted)?;
+    Ok(d)
+}
+
+fn state_event_envelope_to_dict<'py>(
+    py: Python<'py>,
+    envelope: &StateEventEnvelope,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("seq", envelope.seq)?;
+    d.set_item(
+        "origin_session",
+        envelope.origin_session.map(|id| id.to_string()),
+    )?;
+    d.set_item("timestamp_ns", envelope.timestamp_ns)?;
+    match &envelope.event {
+        StateEvent::ModeChanged { mode } => {
+            d.set_item("type", "mode_changed")?;
+            set_mode_items(&d, *mode)?;
+        }
+        StateEvent::SceneLoaded { scene_id, name } => {
+            d.set_item("type", "scene_loaded")?;
+            d.set_item("scene_id", scene_id.to_string())?;
+            d.set_item("name", name.as_str())?;
+        }
+        StateEvent::SceneActivated { scene_id } => {
+            d.set_item("type", "scene_activated")?;
+            d.set_item("scene_id", scene_id.to_string())?;
+        }
+        StateEvent::MappingCreated { mapping } => {
+            d.set_item("type", "mapping_created")?;
+            d.set_item("mapping", mapping_summary_to_dict(py, mapping)?)?;
+        }
+        StateEvent::MappingUpdated { mapping } => {
+            d.set_item("type", "mapping_updated")?;
+            d.set_item("mapping", mapping_summary_to_dict(py, mapping)?)?;
+        }
+        StateEvent::MappingRemoved { mapping_id } => {
+            d.set_item("type", "mapping_removed")?;
+            d.set_item("mapping_id", mapping_id.to_string())?;
+        }
+        StateEvent::MappingLockChanged { mapping_id, lock } => {
+            d.set_item("type", "mapping_lock_changed")?;
+            d.set_item("mapping_id", mapping_id.to_string())?;
+            d.set_item("lock", *lock)?;
+        }
+        StateEvent::MappingReleased { mapping_id, reason } => {
+            d.set_item("type", "mapping_released")?;
+            d.set_item("mapping_id", mapping_id.to_string())?;
+            d.set_item("reason", reason.as_str())?;
+        }
+        StateEvent::BaselineApplied {
+            action,
+            changed_attributes,
+        } => {
+            d.set_item("type", "baseline_applied")?;
+            d.set_item("action", baseline_action_to_str(*action))?;
+            d.set_item("changed_attributes", *changed_attributes)?;
+        }
+        StateEvent::SessionJoined {
+            session_id,
+            device_id,
+            device_name,
+            roles,
+        } => {
+            d.set_item("type", "session_joined")?;
+            d.set_item("session_id", session_id.to_string())?;
+            d.set_item("device_id", device_id.to_string())?;
+            d.set_item("device_name", device_name.as_str())?;
+            d.set_item(
+                "roles",
+                roles.iter().map(|role| role_to_str(*role)).collect::<Vec<_>>(),
+            )?;
+        }
+        StateEvent::SessionLeft { session_id, reason } => {
+            d.set_item("type", "session_left")?;
+            d.set_item("session_id", session_id.to_string())?;
+            d.set_item("reason", reason.clone())?;
+        }
+        StateEvent::RecordingStarted { take_id, scene_id } => {
+            d.set_item("type", "recording_started")?;
+            d.set_item("take_id", take_id.to_string())?;
+            d.set_item("scene_id", scene_id.to_string())?;
+        }
+        StateEvent::RecordingStopped {
+            take_id,
+            frame_count,
+        } => {
+            d.set_item("type", "recording_stopped")?;
+            d.set_item("take_id", take_id.to_string())?;
+            d.set_item("frame_count", *frame_count)?;
+        }
+        StateEvent::TakeRegistered { take } => {
+            d.set_item("type", "take_registered")?;
+            d.set_item("take", take_info_to_dict(py, take)?)?;
+        }
+        StateEvent::TakeSelected { take_id, scene_id } => {
+            d.set_item("type", "take_selected")?;
+            d.set_item("take_id", take_id.to_string())?;
+            d.set_item("scene_id", scene_id.to_string())?;
+        }
+        StateEvent::TakeDeleted { take_id } => {
+            d.set_item("type", "take_deleted")?;
+            d.set_item("take_id", take_id.to_string())?;
+        }
+        StateEvent::PlaybackChanged {
+            state,
+            take_id,
+            playhead_ns,
+            looping,
+        } => {
+            d.set_item("type", "playback_changed")?;
+            d.set_item("state", playback_state_to_str(*state))?;
+            d.set_item("take_id", take_id.to_string())?;
+            d.set_item("playhead_ns", *playhead_ns)?;
+            d.set_item("looping", *looping)?;
+        }
+    }
+    Ok(d)
+}
+
+fn scene_snapshot_payload_to_dict<'py>(
+    py: Python<'py>,
+    payload: &SceneSnapshotPayload,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("seq", payload.seq)?;
+    set_mode_items(&d, payload.mode)?;
+    d.set_item(
+        "active_scene",
+        payload.active_scene.map(|id| id.to_string()),
+    )?;
+
+    let mut scenes = Vec::with_capacity(payload.scenes.len());
+    for scene in &payload.scenes {
+        let scene_dict = PyDict::new_bound(py);
+        scene_dict.set_item("scene_id", scene.scene_id.to_string())?;
+        scene_dict.set_item("name", scene.name.as_str())?;
+        let mut objects = Vec::with_capacity(scene.objects.len());
+        for object in &scene.objects {
+            let object_dict = PyDict::new_bound(py);
+            object_dict.set_item("object_id", object.object_id.to_string())?;
+            object_dict.set_item("name", object.name.as_str())?;
+            let mut attributes = Vec::with_capacity(object.attributes.len());
+            for attribute in &object.attributes {
+                let attribute_dict = PyDict::new_bound(py);
+                attribute_dict.set_item("name", attribute.name.as_str())?;
+                attribute_dict.set_item(
+                    "default_value",
+                    bake_attribute_value_to_py(py, &attribute.default_value),
+                )?;
+                attribute_dict.set_item(
+                    "current_value",
+                    bake_attribute_value_to_py(py, &attribute.current_value),
+                )?;
+                attribute_dict.set_item("live_enabled", attribute.live_enabled)?;
+                attribute_dict.set_item("record_enabled", attribute.record_enabled)?;
+                attributes.push(attribute_dict);
+            }
+            object_dict.set_item("attributes", attributes)?;
+            objects.push(object_dict);
+        }
+        scene_dict.set_item("objects", objects)?;
+        scenes.push(scene_dict);
+    }
+    d.set_item("scenes", scenes)?;
+
+    let mut mappings = Vec::with_capacity(payload.mappings.len());
+    for mapping in &payload.mappings {
+        mappings.push(mapping_summary_to_dict(py, mapping)?);
+    }
+    d.set_item("mappings", mappings)?;
+
+    // Registered sessions (the host included, flagged via is_host), the take
+    // catalog, and the playback transport: the snapshot recovers every
+    // event-replicated domain, not just the scene graph.
+    let mut sessions = Vec::with_capacity(payload.sessions.len());
+    for session in &payload.sessions {
+        let session_dict = PyDict::new_bound(py);
+        session_dict.set_item("session_id", session.session_id.to_string())?;
+        session_dict.set_item("device_id", session.device_id.to_string())?;
+        session_dict.set_item("device_name", session.device_name.as_str())?;
+        session_dict.set_item(
+            "roles",
+            session
+                .roles
+                .iter()
+                .map(|role| role_to_str(*role))
+                .collect::<Vec<_>>(),
+        )?;
+        session_dict.set_item("is_host", session.is_host)?;
+        sessions.push(session_dict);
+    }
+    d.set_item("sessions", sessions)?;
+
+    let mut takes = Vec::with_capacity(payload.takes.len());
+    for take in &payload.takes {
+        takes.push(take_info_to_dict(py, take)?);
+    }
+    d.set_item("takes", takes)?;
+
+    match &payload.playback {
+        Some(playback) => {
+            let playback_dict = PyDict::new_bound(py);
+            playback_dict.set_item("state", playback_state_to_str(playback.state))?;
+            playback_dict.set_item("take_id", playback.take_id.to_string())?;
+            playback_dict.set_item("playhead_ns", playback.playhead_ns)?;
+            playback_dict.set_item("looping", playback.looping)?;
+            d.set_item("playback", playback_dict)?;
+        }
+        None => d.set_item("playback", py.None())?,
+    }
+    Ok(d)
 }
 
 fn parse_sampling_mode(value: &str) -> PyResult<SamplingMode> {
@@ -1236,6 +1618,8 @@ fn bake_attribute_value_to_py(py: Python<'_>, value: &BakeAttributeValue) -> PyO
 #[cfg(test)]
 mod tests {
     use super::PyMotionStageServer;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
 
     #[test]
     fn rust_binding_constructs_server() {
@@ -1243,5 +1627,225 @@ mod tests {
             .expect("py server should build");
         let _ = server.start().expect("start should succeed");
         server.stop().expect("stop should succeed");
+    }
+
+    #[test]
+    fn sessions_expose_the_host_marker() {
+        let server = PyMotionStageServer::new(Some("py-sessions".into()), false, None)
+            .expect("py server should build");
+        let rows = server.sessions().expect("sessions should list");
+        assert_eq!(rows.len(), 1, "only the in-process host session exists");
+        let host = &rows[0];
+        assert_eq!(host.1, "host");
+        assert!(host.2.is_some(), "the host session is registered");
+        assert!(host.7, "the host row carries is_host = true");
+    }
+
+    fn event_types(events: &[Bound<'_, PyDict>]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                event
+                    .get_item("type")
+                    .expect("type lookup")
+                    .expect("type present")
+                    .extract::<String>()
+                    .expect("type is a string")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drain_state_events_streams_host_mutations() {
+        pyo3::prepare_freethreaded_python();
+        let server = PyMotionStageServer::new(Some("py-events".into()), false, None)
+            .expect("py server should build");
+
+        // The bridge is the host session with a valid identity.
+        let host_session = server.host_session_id();
+        assert!(uuid::Uuid::parse_str(&host_session).is_ok());
+        assert!(uuid::Uuid::parse_str(&server.host_device_id()).is_ok());
+
+        server.set_live_mode().expect("set live mode");
+
+        Python::with_gil(|py| {
+            let events = server
+                .drain_state_events(py, 1_000)
+                .expect("drain should succeed");
+            let types = event_types(&events);
+            assert!(
+                types.iter().any(|t| t == "mode_changed"),
+                "expected mode_changed in {types:?}"
+            );
+            // `set_mode` walks both axes, emitting one ModeChanged per axis;
+            // the last one carries the settled composite mode.
+            let mode_event = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event
+                        .get_item("type")
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.extract::<String>().ok())
+                        .as_deref()
+                        == Some("mode_changed")
+                })
+                .expect("mode_changed event");
+            assert_eq!(
+                mode_event
+                    .get_item("mode")
+                    .expect("mode lookup")
+                    .expect("mode present")
+                    .extract::<String>()
+                    .expect("mode string"),
+                "live"
+            );
+            assert_eq!(
+                mode_event
+                    .get_item("origin_session")
+                    .expect("origin lookup")
+                    .expect("origin present")
+                    .extract::<String>()
+                    .expect("origin string"),
+                host_session
+            );
+            assert!(mode_event
+                .get_item("seq")
+                .expect("seq lookup")
+                .expect("seq present")
+                .extract::<u64>()
+                .expect("seq u64")
+                >= 1);
+
+            // Caught up: a non-blocking drain returns nothing.
+            let empty = server
+                .drain_state_events(py, 0)
+                .expect("empty drain should succeed");
+            assert!(empty.is_empty());
+
+            // The snapshot reflects the mutation and carries a consistent seq.
+            let snapshot = server
+                .initial_scene_snapshot(py)
+                .expect("snapshot should build");
+            assert_eq!(
+                snapshot
+                    .get_item("mode")
+                    .expect("mode lookup")
+                    .expect("mode present")
+                    .extract::<String>()
+                    .expect("mode string"),
+                "live"
+            );
+            let snapshot_seq = snapshot
+                .get_item("seq")
+                .expect("seq lookup")
+                .expect("seq present")
+                .extract::<u64>()
+                .expect("seq u64");
+            assert_eq!(snapshot_seq, server.current_event_seq(py));
+
+            // The snapshot also recovers sessions, takes, and playback.
+            let sessions = snapshot
+                .get_item("sessions")
+                .expect("sessions lookup")
+                .expect("sessions present")
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .expect("sessions list");
+            assert_eq!(sessions.len(), 1, "only the host session is registered");
+            assert!(sessions[0]
+                .get_item("is_host")
+                .expect("is_host lookup")
+                .expect("is_host present")
+                .extract::<bool>()
+                .expect("is_host bool"));
+            let takes = snapshot
+                .get_item("takes")
+                .expect("takes lookup")
+                .expect("takes present")
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .expect("takes list");
+            assert!(takes.is_empty());
+            assert!(snapshot
+                .get_item("playback")
+                .expect("playback lookup")
+                .expect("playback present")
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn drain_state_events_reports_scene_and_mapping_lifecycle() {
+        pyo3::prepare_freethreaded_python();
+        let server = PyMotionStageServer::new(Some("py-events-scene".into()), false, None)
+            .expect("py server should build");
+
+        Python::with_gil(|py| {
+            let spec = PyDict::new_bound(py);
+            spec.set_item("name", "shot").expect("set name");
+            let object = PyDict::new_bound(py);
+            object.set_item("name", "camera").expect("set object name");
+            let attribute = PyDict::new_bound(py);
+            attribute.set_item("name", "position").expect("set attr");
+            attribute.set_item("type", "vec3f").expect("set type");
+            attribute
+                .set_item("default_value", vec![0.0f32, 0.0, 0.0])
+                .expect("set default");
+            object
+                .set_item("attributes", vec![attribute])
+                .expect("set attributes");
+            spec.set_item("objects", vec![object]).expect("set objects");
+            let scene_id = server.upsert_scene(&spec).expect("scene loads");
+
+            let events = server
+                .drain_state_events(py, 1_000)
+                .expect("drain should succeed");
+            let types = event_types(&events);
+            assert!(
+                types.iter().any(|t| t == "scene_loaded"),
+                "expected scene_loaded in {types:?}"
+            );
+            let loaded = events
+                .iter()
+                .find(|event| {
+                    event
+                        .get_item("type")
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.extract::<String>().ok())
+                        .as_deref()
+                        == Some("scene_loaded")
+                })
+                .expect("scene_loaded event");
+            assert_eq!(
+                loaded
+                    .get_item("scene_id")
+                    .expect("scene_id lookup")
+                    .expect("scene_id present")
+                    .extract::<String>()
+                    .expect("scene_id string"),
+                scene_id
+            );
+
+            let snapshot = server
+                .initial_scene_snapshot(py)
+                .expect("snapshot should build");
+            let scenes = snapshot
+                .get_item("scenes")
+                .expect("scenes lookup")
+                .expect("scenes present")
+                .extract::<Vec<Bound<'_, PyDict>>>()
+                .expect("scenes list");
+            assert_eq!(scenes.len(), 1);
+            assert_eq!(
+                scenes[0]
+                    .get_item("name")
+                    .expect("name lookup")
+                    .expect("name present")
+                    .extract::<String>()
+                    .expect("name string"),
+                "shot"
+            );
+        });
     }
 }

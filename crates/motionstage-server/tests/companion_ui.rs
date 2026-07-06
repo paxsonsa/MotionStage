@@ -161,6 +161,202 @@ async fn ws_snapshot_carries_takes_and_bridges_host_requests() {
     ui.shutdown().await.expect("shutdown");
 }
 
+/// Bring a device session all the way to `Active` through the host-side
+/// lifecycle API, as the QUIC handshake would.
+async fn join_device(server: &motionstage_server::ServerHandle, device_id: uuid::Uuid, name: &str) {
+    use motionstage_protocol::{
+        AttributeDescriptor, AttributeKind, ClientHello, ClientRole, Feature, RegisterRequest,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    };
+
+    server.discovered(device_id, name).await.unwrap();
+    server.transport_connected(device_id).await.unwrap();
+    server
+        .hello_exchanged(ClientHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            device_id,
+            device_name: name.into(),
+            roles: vec![ClientRole::MotionSource],
+            features: vec![Feature::Motion],
+            advertised_attributes: vec![AttributeDescriptor {
+                path: "pose_pos".into(),
+                value_type: AttributeKind::Vec3f,
+            }],
+        })
+        .await
+        .unwrap();
+    server.authenticate(device_id).await.unwrap();
+    server
+        .register(
+            device_id,
+            RegisterRequest {
+                pairing_token: None,
+                api_key: None,
+            },
+        )
+        .await
+        .unwrap();
+    server.scene_synced(device_id).await.unwrap();
+    server.activate(device_id).await.unwrap();
+}
+
+/// Skip unrelated frames (e.g. polled metrics) until one of the given type
+/// arrives.
+async fn next_of_type<S>(ws: &mut S, ty: &str) -> serde_json::Value
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    for _ in 0..20 {
+        let msg = next_json(ws).await;
+        if msg["type"] == ty {
+            return msg;
+        }
+    }
+    panic!("no '{ty}' frame within 20 frames");
+}
+
+/// Structural changes must reach the browser via the state-event plane. The
+/// server is never `start()`ed here, so the publish loop is not running and
+/// `last_published_snapshot` stays `None` — the poll/diff path cannot produce
+/// any of the frames asserted below.
+#[tokio::test]
+async fn ws_pushes_structural_changes_from_events_without_polling() {
+    use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
+
+    let server = ServerHandle::new(ServerConfig::default());
+    let ui = serve_companion_ui(server.clone(), None).await.expect("bind");
+    let url = format!("ws://127.0.0.1:{}/ws", ui.port());
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+    let snap = next_json(&mut ws).await;
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["scene"]["scenes"].as_array().unwrap().len(), 0);
+    // The in-process host session rides the event plane but is not a "client";
+    // the UI sessions list only carries device operators.
+    assert_eq!(snap["sessions"].as_array().unwrap().len(), 0);
+
+    // Scene load -> snapshot_changed.
+    let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+        "position",
+        AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+    ));
+    let object_id = object.id;
+    let scene = Scene::new("shot").with_object(object);
+    let scene_id = scene.id;
+    server.load_scene(scene).await;
+
+    let msg = next_of_type(&mut ws, "snapshot_changed").await;
+    assert_eq!(msg["scenes"][0]["name"], "shot");
+    assert_eq!(msg["scenes"][0]["objects"][0]["name"], "camera");
+
+    // Session activation -> session_upserted carrying the full session shape
+    // (advertised outputs come from the session table, not the event payload).
+    let device_id = uuid::Uuid::now_v7();
+    join_device(&server, device_id, "ipad").await;
+    let msg = next_of_type(&mut ws, "session_upserted").await;
+    assert_eq!(msg["session"]["device_id"], device_id.to_string());
+    assert_eq!(msg["session"]["device_name"], "ipad");
+    assert_eq!(msg["session"]["state"], "Active");
+    assert_eq!(
+        msg["session"]["advertised_attributes"][0]["path"],
+        "pose_pos"
+    );
+
+    // Mapping create -> snapshot_changed listing the mapping.
+    let mapping_id = server
+        .create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            100,
+        )
+        .await
+        .expect("create mapping");
+    let msg = next_of_type(&mut ws, "snapshot_changed").await;
+    assert_eq!(msg["mappings"].as_array().unwrap().len(), 1);
+    assert_eq!(msg["mappings"][0]["target_attribute"], "position");
+
+    // Mapping remove -> snapshot_changed without it.
+    server.remove_mapping(mapping_id).await.expect("remove mapping");
+    let msg = next_of_type(&mut ws, "snapshot_changed").await;
+    assert_eq!(msg["mappings"].as_array().unwrap().len(), 0);
+
+    // Session close -> session_removed keyed by *device* id (the event carries
+    // the session id; the handler translates).
+    server.close_session(device_id, 200).await.expect("close session");
+    let msg = next_of_type(&mut ws, "session_removed").await;
+    assert_eq!(msg["device_id"], device_id.to_string());
+
+    ui.shutdown().await.expect("shutdown");
+}
+
+/// Ordering: the connect-time snapshot already folds in earlier events, so the
+/// connection must not replay them — the first frame after the snapshot is the
+/// one for the first post-connect mutation.
+#[tokio::test]
+async fn ws_snapshot_gates_events_already_folded_in() {
+    use motionstage_core::{AttributeValue, Scene, SceneAttribute, SceneObject};
+
+    let server = ServerHandle::new(ServerConfig::default());
+
+    // Mutations *before* the browser connects.
+    let scene = Scene::new("pre").with_object(SceneObject::new("camera").with_attribute(
+        SceneAttribute::new("position", AttributeValue::Vec3f([0.0, 0.0, 0.0])),
+    ));
+    server.load_scene(scene).await;
+    let device_id = uuid::Uuid::now_v7();
+    join_device(&server, device_id, "ipad").await;
+    // A device that was discovered but never registered has no session_id and
+    // never emits SessionJoined/SessionLeft: the snapshot must not list it.
+    let ghost_device = uuid::Uuid::now_v7();
+    server.discovered(ghost_device, "ghost").await.unwrap();
+
+    let ui = serve_companion_ui(server.clone(), None).await.expect("bind");
+    let url = format!("ws://127.0.0.1:{}/ws", ui.port());
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+    // The snapshot reflects the pre-connect state: only registered clients.
+    let snap = next_json(&mut ws).await;
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["scene"]["scenes"][0]["name"], "pre");
+    assert_eq!(snap["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(snap["sessions"][0]["device_name"], "ipad");
+
+    // The very next frame must be for the post-connect mutation — nothing
+    // between the snapshot and it (no duplicate session_upserted or
+    // snapshot_changed for pre-connect events; the idle server emits no polls).
+    let scene2 = Scene::new("post").with_object(SceneObject::new("light").with_attribute(
+        SceneAttribute::new("energy", AttributeValue::Float32(1.0)),
+    ));
+    server.load_scene(scene2).await;
+
+    let msg = next_json(&mut ws).await;
+    assert_eq!(
+        msg["type"], "snapshot_changed",
+        "expected the post-connect scene load to be the first delta, got: {msg}"
+    );
+    let names: Vec<_> = msg["scenes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"post".to_string()), "scenes: {names:?}");
+
+    ui.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn shutdown_releases_the_port() {
     let server = ServerHandle::new(ServerConfig::default());
