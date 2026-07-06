@@ -3,9 +3,16 @@ dist/*.xcframework
 swift/MotionStageClient/Artifacts/*.xcframework
 swift/**/.build/
 swift/**/.swiftpm/
+dist/
 
 .vscode/
 .DS_Store
 python/.venv/
 python/.pytest_cache/
 python/**/__pycache__/
+
+# Companion UI (React): ignore deps; the built dist/ is committed so the Rust
+# crate's rust_embed `#[folder = "ui/dist"]` compiles without a Node toolchain.
+crates/motionstage-server/ui/node_modules/
+crates/motionstage-server/ui/.vite/
+*.tsbuildinfo

@@ -95,7 +95,7 @@ mod tests {
             markers: Vec::new(),
             frames: vec![RecordedFrame {
                 timestamp_ns: 0,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![RecordedAttribute {
                     object_id: Uuid::nil(),
                     attribute: "focal".into(),
@@ -120,7 +120,7 @@ mod tests {
             markers: Vec::new(),
             frames: vec![RecordedFrame {
                 timestamp_ns: 0,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![RecordedAttribute {
                     object_id: Uuid::nil(),
                     attribute: "xform".into(),
@@ -154,7 +154,7 @@ mod tests {
             markers: Vec::new(),
             frames: vec![RecordedFrame {
                 timestamp_ns: 0,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![RecordedAttribute {
                     object_id: Uuid::nil(),
                     attribute: "position".into(),

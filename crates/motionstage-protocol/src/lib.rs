@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MAJOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -35,11 +35,131 @@ pub enum Feature {
     SdrFallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AttributeKind {
+    Bool,
+    Int32,
+    Float32,
+    Float64,
+    Vec2f,
+    Vec3f,
+    Vec4f,
+    Quatf,
+    Mat4f,
+    Trigger,
+}
+
+impl AttributeKind {
+    /// Map FFI component counts to attribute kinds.
+    /// 1=Float32, 2=Vec2f, 3=Vec3f, 4=Quatf, 16=Mat4f
+    pub fn from_component_count(count: u32) -> Option<AttributeKind> {
+        match count {
+            1 => Some(AttributeKind::Float32),
+            2 => Some(AttributeKind::Vec2f),
+            3 => Some(AttributeKind::Vec3f),
+            4 => Some(AttributeKind::Quatf),
+            16 => Some(AttributeKind::Mat4f),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributeDescriptor {
+    pub path: String,
+    pub value_type: AttributeKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Mode {
+pub enum DataFlowState {
     Idle,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordingState {
+    Inactive,
     Recording,
+    Playback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mode {
+    pub data_flow: DataFlowState,
+    pub recording: RecordingState,
+}
+
+impl Mode {
+    pub const IDLE: Self = Self {
+        data_flow: DataFlowState::Idle,
+        recording: RecordingState::Inactive,
+    };
+    pub const LIVE: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Inactive,
+    };
+    pub const RECORDING: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Recording,
+    };
+    pub const PLAYBACK: Self = Self {
+        data_flow: DataFlowState::Live,
+        recording: RecordingState::Playback,
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeInfo {
+    pub take_id: Uuid,
+    pub scene_id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub created_ns: u64,
+    pub frame_count: u64,
+    pub selected: bool,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaybackAction {
+    Play,
+    Pause,
+    Stop,
+    Seek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaybackRuntimeState {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SamplingMode {
+    Captured,
+    FixedFps { fps: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BakeAttributeValue {
+    Bool(bool),
+    Int32(i32),
+    Float32(f32),
+    Float64(f64),
+    Vec2f([f32; 2]),
+    Vec3f([f32; 3]),
+    Vec4f([f32; 4]),
+    Quatf([f32; 4]),
+    Mat4f([[f32; 4]; 4]),
+    Trigger(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakeBakeAttribute {
+    pub object_id: Uuid,
+    pub attribute: String,
+    pub value: BakeAttributeValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +236,7 @@ pub struct ClientHello {
     pub device_name: String,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
-    pub advertised_attributes: Vec<String>,
+    pub advertised_attributes: Vec<AttributeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +289,15 @@ pub struct SignalMessage {
     pub payload: SignalPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStreamStatus {
+    pub available: bool,
+    pub descriptor_set: bool,
+    pub peer_count: u32,
+    pub last_frame_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     ServerHello(ServerHello),
     ClientHello(ClientHello),
@@ -184,13 +312,76 @@ pub enum ControlMessage {
         track_id: String,
     },
     VideoOffer(SdpMessage),
+    GetVideoStreamStatus,
+    VideoStreamStatus(VideoStreamStatus),
+    ListTakes {
+        scene_id: Option<Uuid>,
+    },
+    TakeList {
+        takes: Vec<TakeInfo>,
+    },
+    SelectTake {
+        take_id: Uuid,
+    },
+    TakeSelected {
+        take_id: Uuid,
+    },
+    PlaybackControl {
+        take_id: Uuid,
+        action: PlaybackAction,
+        seek_ns: Option<u64>,
+        looping: bool,
+    },
+    PlaybackState {
+        take_id: Uuid,
+        state: PlaybackRuntimeState,
+        playhead_ns: u64,
+        looping: bool,
+    },
+    DeleteTake {
+        take_id: Uuid,
+    },
+    TakeDeleted {
+        take_id: Uuid,
+    },
+    OpenTakeBakeCursor {
+        take_id: Uuid,
+        sampling_mode: SamplingMode,
+    },
+    TakeBakeCursorOpened {
+        cursor_id: Uuid,
+        total_frames: u64,
+    },
+    ReadTakeBakeFrame {
+        cursor_id: Uuid,
+    },
+    SeekTakeBakeFrame {
+        cursor_id: Uuid,
+        frame_index: u64,
+    },
+    TakeBakeFrame {
+        cursor_id: Uuid,
+        frame_index: u64,
+        timestamp_ns: u64,
+        attributes: Vec<TakeBakeAttribute>,
+    },
+    CloseTakeBakeCursor {
+        cursor_id: Uuid,
+    },
+    TakeBakeCursorClosed {
+        cursor_id: Uuid,
+    },
     Error {
         code: RejectCode,
         reason: String,
     },
     Ping,
     Pong,
-    SetMode(Mode),
+    ClientGoodbye {
+        reason: Option<String>,
+    },
+    SetDataFlow(DataFlowState),
+    SetRecording(RecordingState),
     ModeState(Mode),
     ResetSceneToBaseline {
         scene_id: Option<Uuid>,
@@ -263,22 +454,22 @@ mod tests {
 
     #[test]
     fn version_negotiation_accepts_backward_minor() {
-        let result = negotiate_version(ProtocolVersion::new(1, 4), ProtocolVersion::new(1, 1))
+        let result = negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 0))
             .expect("compatible versions should negotiate");
-        assert_eq!(result.selected, ProtocolVersion::new(1, 1));
+        assert_eq!(result.selected, ProtocolVersion::new(2, 0));
     }
 
     #[test]
     fn version_negotiation_rejects_major_mismatch() {
         let err =
-            negotiate_version(ProtocolVersion::new(1, 1), ProtocolVersion::new(2, 0)).unwrap_err();
+            negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(1, 0)).unwrap_err();
         assert!(format!("{err}").contains("unsupported major"));
     }
 
     #[test]
     fn version_negotiation_rejects_client_newer_minor() {
         let err =
-            negotiate_version(ProtocolVersion::new(1, 1), ProtocolVersion::new(1, 2)).unwrap_err();
+            negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 1)).unwrap_err();
         assert!(format!("{err}").contains("client minor version is newer"));
     }
 
@@ -307,6 +498,37 @@ mod tests {
         let message = ControlMessage::CommitObjectBaseline {
             scene_id: None,
             object_id,
+        };
+        let encoded = bincode::serialize(&message).expect("control message serializes");
+        let decoded: ControlMessage =
+            bincode::deserialize(&encoded).expect("control message deserializes");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn control_message_supports_take_variants() {
+        let take_id = Uuid::now_v7();
+        let cursor_id = Uuid::now_v7();
+        let message = ControlMessage::TakeBakeFrame {
+            cursor_id,
+            frame_index: 3,
+            timestamp_ns: 123,
+            attributes: vec![TakeBakeAttribute {
+                object_id: Uuid::nil(),
+                attribute: "position".into(),
+                value: BakeAttributeValue::Vec3f([1.0, 2.0, 3.0]),
+            }],
+        };
+        let encoded = bincode::serialize(&message).expect("control message serializes");
+        let decoded: ControlMessage =
+            bincode::deserialize(&encoded).expect("control message deserializes");
+        assert_eq!(decoded, message);
+
+        let message = ControlMessage::PlaybackControl {
+            take_id,
+            action: PlaybackAction::Seek,
+            seek_ns: Some(1_000),
+            looping: true,
         };
         let encoded = bincode::serialize(&message).expect("control message serializes");
         let decoded: ControlMessage =

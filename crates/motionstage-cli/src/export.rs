@@ -67,6 +67,7 @@ pub fn render(args: &ExportArgs) -> Result<String> {
             &recording,
             &UsdExportOptions {
                 time_codes_per_second: args.fps,
+                ..UsdExportOptions::default()
             },
         ),
         ExportFormat::Chan => motionstage_export_chan::export(&recording),
@@ -97,7 +98,7 @@ mod tests {
         for i in 0..3u64 {
             writer.push_frame(RecordedFrame {
                 timestamp_ns: i * 25_000_000,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![RecordedAttribute {
                     object_id,
                     attribute: "position".into(),

@@ -1,0 +1,84 @@
+{
+  "takes": [
+    {
+      "take_id": "019f391d-f4d6-72b3-8368-ccf7fc4507f1",
+      "scene_id": "019f391d-f4d6-72b3-8368-ccd1b67750b6",
+      "name": "Take 001",
+      "path": "/tmp/.tmpTcTpgT",
+      "created_ns": 101,
+      "frame_count": 0,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391d-f4d7-7b82-9a83-1304a71a4442",
+      "scene_id": "019f391d-f4d7-7b82-9a83-12e85f3d60de",
+      "name": "Take 001",
+      "path": "/tmp/.tmpVKd3cQ",
+      "created_ns": 101,
+      "frame_count": 1,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391d-fbdd-7390-9e77-11f30ada4f1f",
+      "scene_id": "019f391d-fbdd-7390-9e77-11d0106d1259",
+      "name": "Take 001",
+      "path": "/tmp/.tmpyYw6St",
+      "created_ns": 101,
+      "frame_count": 0,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391d-fbde-7263-a72c-22a11984ab4c",
+      "scene_id": "019f391d-fbde-7263-a72c-228f14075e82",
+      "name": "Take 001",
+      "path": "/tmp/.tmpeRmI13",
+      "created_ns": 101,
+      "frame_count": 1,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391f-e9c1-79b0-b77c-a155a2d5a3eb",
+      "scene_id": "019f391f-e9c1-79b0-b77c-a1235a9a7675",
+      "name": "Take 001",
+      "path": "/tmp/.tmpBe4mMU",
+      "created_ns": 101,
+      "frame_count": 0,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391f-e9c2-76a1-b595-2546fb828f8f",
+      "scene_id": "019f391f-e9c2-76a1-b595-252507b61178",
+      "name": "Take 001",
+      "path": "/tmp/.tmpNL3J3a",
+      "created_ns": 101,
+      "frame_count": 1,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391f-f0ab-7b03-ad95-dfc063bbcb9b",
+      "scene_id": "019f391f-f0ab-7b03-ad95-dfae93b878fd",
+      "name": "Take 001",
+      "path": "/tmp/.tmpwxIFHz",
+      "created_ns": 101,
+      "frame_count": 0,
+      "selected": true,
+      "deleted": false
+    },
+    {
+      "take_id": "019f391f-f0af-73b3-ab3a-9f91e51055b6",
+      "scene_id": "019f391f-f0af-73b3-ab3a-9f76c07140c6",
+      "name": "Take 001",
+      "path": "/tmp/.tmpt22vxn",
+      "created_ns": 101,
+      "frame_count": 1,
+      "selected": true,
+      "deleted": false
+    }
+  ]
+}

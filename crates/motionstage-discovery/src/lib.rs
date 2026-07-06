@@ -17,11 +17,14 @@ pub struct DiscoveryAdvertisement {
     pub protocol_minor: u16,
     pub features: Vec<Feature>,
     pub security_mode: String,
+    /// SHA-256 hex fingerprint of the server's TLS certificate (TOFU).
+    pub cert_fingerprint: Option<String>,
 }
 
 impl DiscoveryAdvertisement {
     pub fn to_txt_records(&self) -> Vec<String> {
-        vec![
+        let mut records = vec![
+            format!("port={}", self.bind_port),
             format!("name={}", self.service_name),
             format!("proto_major={}", self.protocol_major),
             format!("proto_minor={}", self.protocol_minor),
@@ -34,7 +37,11 @@ impl DiscoveryAdvertisement {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
-        ]
+        ];
+        if let Some(fp) = &self.cert_fingerprint {
+            records.push(format!("cert_fp={fp}"));
+        }
+        records
     }
 
     pub fn default_for(name: impl Into<String>, port: u16) -> Self {
@@ -53,6 +60,7 @@ impl DiscoveryAdvertisement {
                 Feature::SdrFallback,
             ],
             security_mode: "trusted_lan".into(),
+            cert_fingerprint: None,
         }
     }
 
@@ -165,12 +173,19 @@ impl DiscoveryBrowser {
         &self,
         timeout: Duration,
     ) -> Result<Option<DiscoveredService>, DiscoveryError> {
-        let Some(event) = self.recv_timeout(timeout)? else {
-            return Ok(None);
-        };
-        match event {
-            ServiceEvent::ServiceResolved(info) => Ok(Some(DiscoveredService::from_info(&info))),
-            _ => Ok(None),
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline.duration_since(now);
+            let Some(event) = self.recv_timeout(remaining)? else {
+                return Ok(None);
+            };
+            if let ServiceEvent::ServiceResolved(info) = event {
+                return Ok(Some(DiscoveredService::from_info(&info)));
+            }
         }
     }
 
@@ -198,6 +213,8 @@ pub struct DiscoveredService {
     pub port: u16,
     pub protocol_major: Option<u16>,
     pub protocol_minor: Option<u16>,
+    /// SHA-256 hex fingerprint of the server's TLS certificate (TOFU).
+    pub cert_fingerprint: Option<String>,
 }
 
 impl DiscoveredService {
@@ -216,6 +233,7 @@ impl DiscoveredService {
         let protocol_minor = info
             .get_property_val_str("proto_minor")
             .and_then(|v| v.parse::<u16>().ok());
+        let cert_fingerprint = info.get_property_val_str("cert_fp").map(str::to_owned);
 
         Self {
             service_name,
@@ -225,6 +243,7 @@ impl DiscoveredService {
             port: info.get_port(),
             protocol_major,
             protocol_minor,
+            cert_fingerprint,
         }
     }
 }
@@ -249,7 +268,8 @@ mod tests {
     fn txt_records_include_version_and_security() {
         let adv = DiscoveryAdvertisement::default_for("cine", 7788);
         let txt = adv.to_txt_records();
-        assert!(txt.iter().any(|s| s.contains("proto_major=1")));
+        assert!(txt.iter().any(|s| s.contains("port=7788")));
+        assert!(txt.iter().any(|s| s.contains("proto_major=2")));
         assert!(txt.iter().any(|s| s.contains("security=trusted_lan")));
     }
 

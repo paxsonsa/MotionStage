@@ -17,18 +17,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use motionstage_core::{AttributeValue, ObjectId};
 use motionstage_recording::{RecordingFile, RecordingMarker};
 
+/// Stage up-axis declared in the layer metadata.
+///
+/// MotionStage captures in Z-up/meters (the server-side convention); export
+/// as `Y` only for consumers that require it — values are re-expressed for
+/// the declared axis at export time, never at capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpAxis {
+    #[default]
+    Z,
+    Y,
+}
+
+impl UpAxis {
+    fn token(self) -> &'static str {
+        match self {
+            UpAxis::Z => "Z",
+            UpAxis::Y => "Y",
+        }
+    }
+}
+
 /// Options controlling `.usda` generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsdExportOptions {
     /// USD `timeCodesPerSecond`. Each sample's timeCode is
     /// `(timestamp_ns - started_ns) * time_codes_per_second / 1e9`.
     pub time_codes_per_second: u32,
+    /// Stage `upAxis` metadata. Defaults to `Z` (capture convention).
+    pub up_axis: UpAxis,
 }
 
 impl Default for UsdExportOptions {
     fn default() -> Self {
         Self {
             time_codes_per_second: 120,
+            up_axis: UpAxis::Z,
         }
     }
 }
@@ -51,7 +75,7 @@ pub fn export_with_options(recording: &RecordingFile, options: &UsdExportOptions
     let objects = collect_objects(recording, started_ns, tcps);
 
     let mut out = String::new();
-    write_header(&mut out, recording, tcps);
+    write_header(&mut out, recording, tcps, options.up_axis);
 
     for (object_id, object) in &objects {
         write_object_prim(&mut out, object_id, object);
@@ -203,10 +227,10 @@ fn sort_and_dedupe_samples(samples: &mut Vec<(f64, String)>) {
     });
 }
 
-fn write_header(out: &mut String, recording: &RecordingFile, tcps: u32) {
+fn write_header(out: &mut String, recording: &RecordingFile, tcps: u32, up_axis: UpAxis) {
     let started_ns = recording.manifest.started_ns;
     out.push_str("#usda 1.0\n(\n");
-    out.push_str("    upAxis = \"Z\"\n");
+    out.push_str(&format!("    upAxis = \"{}\"\n", up_axis.token()));
     out.push_str("    metersPerUnit = 1\n");
     out.push_str(&format!("    timeCodesPerSecond = {tcps}\n"));
     if !recording.frames.is_empty() {
@@ -371,13 +395,29 @@ fn write_markers_scope(out: &mut String, markers: &[RecordingMarker]) {
     out.push_str("}\n");
 }
 
+/// Compact human-readable label for a composite `Mode`.
+fn mode_label(mode: &motionstage_protocol::Mode) -> &'static str {
+    use motionstage_protocol::Mode;
+    match *mode {
+        Mode::IDLE => "idle",
+        Mode::LIVE => "live",
+        Mode::RECORDING => "recording",
+        Mode::PLAYBACK => "playback",
+        _ => "unknown",
+    }
+}
+
 fn summarize_marker(marker: &RecordingMarker) -> String {
     match marker {
         RecordingMarker::ModeTransition {
             timestamp_ns,
             from,
             to,
-        } => format!("ModeTransition timestamp_ns={timestamp_ns} from={from:?} to={to:?}"),
+        } => format!(
+            "ModeTransition timestamp_ns={timestamp_ns} from={} to={}",
+            mode_label(from),
+            mode_label(to)
+        ),
         RecordingMarker::MappingCreated {
             timestamp_ns,
             mapping_id,
@@ -399,6 +439,23 @@ fn summarize_marker(marker: &RecordingMarker) -> String {
         } => {
             format!("MappingLockSet timestamp_ns={timestamp_ns} mapping_id={mapping_id} lock={lock}")
         }
+        RecordingMarker::ClientJoined {
+            timestamp_ns,
+            device_id,
+            device_name,
+        } => format!(
+            "ClientJoined timestamp_ns={timestamp_ns} device_id={device_id} device_name={device_name}"
+        ),
+        RecordingMarker::ClientLeft {
+            timestamp_ns,
+            device_id,
+            reason,
+        } => match reason {
+            Some(reason) => format!(
+                "ClientLeft timestamp_ns={timestamp_ns} device_id={device_id} reason={reason}"
+            ),
+            None => format!("ClientLeft timestamp_ns={timestamp_ns} device_id={device_id}"),
+        },
     }
 }
 
@@ -578,7 +635,7 @@ mod tests {
             .map(|i| RecordedFrame {
                 // 25 ms per frame = exactly 3 timeCodes at 120 tcps.
                 timestamp_ns: i * 25_000_000,
-                mode: Mode::Recording,
+                mode: Mode::RECORDING,
                 attributes: vec![
                     RecordedAttribute {
                         object_id,
@@ -669,6 +726,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
             &camera_take(),
             &UsdExportOptions {
                 time_codes_per_second: 24,
+                ..UsdExportOptions::default()
             },
         );
         assert!(usda.contains("timeCodesPerSecond = 24"));
@@ -681,7 +739,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let object_id = Uuid::nil();
         let recording = recording_with_frames(vec![RecordedFrame {
             timestamp_ns: 0,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![
                 RecordedAttribute {
                     object_id,
@@ -714,13 +772,13 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let mut recording = recording_with_frames(Vec::new());
         recording.markers.push(RecordingMarker::ModeTransition {
             timestamp_ns: 100,
-            from: Mode::Live,
-            to: Mode::Recording,
+            from: Mode::LIVE,
+            to: Mode::RECORDING,
         });
         let usda = export(&recording);
         assert!(usda.contains("def Scope \"markers\""));
         assert!(usda.contains(
-            "custom string m_0000 = \"ModeTransition timestamp_ns=100 from=Live to=Recording\""
+            "custom string m_0000 = \"ModeTransition timestamp_ns=100 from=live to=recording\""
         ));
     }
 
@@ -731,7 +789,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
     ) -> RecordedFrame {
         RecordedFrame {
             timestamp_ns,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![RecordedAttribute {
                 object_id: Uuid::nil(),
                 attribute: attribute.into(),
@@ -770,7 +828,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let object_id = Uuid::nil();
         let recording = recording_with_frames(vec![RecordedFrame {
             timestamp_ns: 0,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![
                 RecordedAttribute {
                     object_id,
@@ -807,7 +865,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let object_id = Uuid::nil();
         let recording = recording_with_frames(vec![RecordedFrame {
             timestamp_ns: 0,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![
                 RecordedAttribute {
                     object_id,
@@ -852,7 +910,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let object_id = Uuid::nil();
         let recording = recording_with_frames(vec![RecordedFrame {
             timestamp_ns: 0,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![
                 RecordedAttribute {
                     object_id,
@@ -901,7 +959,7 @@ def Xform \"o_00000000_0000_0000_0000_000000000000\" (
         let object_id = Uuid::nil();
         let recording = recording_with_frames(vec![RecordedFrame {
             timestamp_ns: 0,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![
                 RecordedAttribute {
                     object_id,

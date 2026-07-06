@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -17,6 +19,16 @@ motionstage-recording.workspace = true
 motionstage-discovery.workspace = true
 motionstage-transport-quic.workspace = true
 motionstage-webrtc.workspace = true
+futures.workspace = true
+axum = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+
+[features]
+companion-ui = ["dep:axum", "dep:rust-embed", "dep:mime_guess"]
 
 [dev-dependencies]
 tempfile = "3.14"
+motionstage-transport-quic = { workspace = true, features = ["insecure"] }
+tokio-tungstenite = "0.29"
+serde_json.workspace = true

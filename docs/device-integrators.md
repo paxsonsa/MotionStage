@@ -135,6 +135,7 @@ Server behavior:
 - Rejects updates without active mapping
 - Applies component-mask transform and filter chain
 - Increments ingest metrics (`motion_datagrams`, `motion_updates`)
+- Ignores live ingest while runtime is in `Playback` mode
 
 ## Video/Signaling Contract
 

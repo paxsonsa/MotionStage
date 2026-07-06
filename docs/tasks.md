@@ -13,6 +13,7 @@ Status legend: `DONE`, `IN_PROGRESS`, `TODO`
 | [x] | P7 | Hardening + Observability | Expanded soak tests (multi-client + scheduler checks), structured tracing for signaling/scheduler/motion paths, and CI gates for Rust/Python/native packaging. | CI matrix and local validation pass. | DONE |
 | [x] | P8 | Docs + Final Matrix | Updated protocol/hardening/readme docs for signaling, recording compatibility, runtime lifecycle, and quality gates. | Docs align with implementation and no stale TODO rows remain. | DONE |
 | [x] | P9 | iOS Swift Binding Build Pipeline | Added `motionstage-sdk-swift` FFI crate, exported C header/module map, created iOS XCFramework build script, and added Swift package wrapper client surface for iOS device apps. | `cargo test -p motionstage-sdk-swift` passes and `./scripts/build-swift-ios.sh` generates XCFramework artifacts for Swift consumption. | DONE |
+| [x] | P10 | Take Catalog + Playback + Bake Cursor | Added take catalog persistence, take selection/deletion, dedicated playback mode controls, and frame-by-frame bake cursor APIs across protocol/server/SDK/CLI. | Operators can list/select/play/delete takes, replay take data deterministically, and pull bake frames through cursor APIs. | DONE |
 
 ## Validation Snapshot
 

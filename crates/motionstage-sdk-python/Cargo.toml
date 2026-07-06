@@ -15,7 +15,8 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 pyo3.workspace = true
 tokio.workspace = true
-motionstage-server.workspace = true
+motionstage-server = { workspace = true, features = ["companion-ui"] }
 motionstage-core.workspace = true
+motionstage-media.workspace = true
 motionstage-protocol.workspace = true
 uuid.workspace = true

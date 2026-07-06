@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use bevy_ecs::{prelude::Resource, world::World};
 use indexmap::IndexMap;
-use motionstage_protocol::Mode;
+use motionstage_protocol::{DataFlowState, Mode, RecordingState};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -44,18 +43,14 @@ pub struct RuntimeSnapshot {
     pub mappings: IndexMap<MappingId, Mapping>,
 }
 
-#[derive(Resource, Default)]
-struct RuntimeStats {
-    tick_count: u64,
-}
-
 #[derive(Debug)]
 pub struct RuntimeCore {
-    world: World,
+    tick_count: u64,
     scenes: IndexMap<SceneId, Scene>,
     active_scene: Option<SceneId>,
     mode: Mode,
     mappings: IndexMap<MappingId, Mapping>,
+    mapping_index: HashMap<(Uuid, String), MappingId>,
     lease: LeaseConfig,
     connected_devices: BTreeSet<Uuid>,
 }
@@ -68,15 +63,13 @@ impl Default for RuntimeCore {
 
 impl RuntimeCore {
     pub fn new(lease: LeaseConfig) -> Self {
-        let mut world = World::new();
-        world.insert_resource(RuntimeStats::default());
-
         Self {
-            world,
+            tick_count: 0,
             scenes: IndexMap::new(),
             active_scene: None,
-            mode: Mode::Idle,
+            mode: Mode::IDLE,
             mappings: IndexMap::new(),
+            mapping_index: HashMap::new(),
             lease,
             connected_devices: BTreeSet::new(),
         }
@@ -112,28 +105,67 @@ impl RuntimeCore {
         Ok(())
     }
 
-    pub fn set_mode(&mut self, mode: Mode) -> Result<(), CoreError> {
-        let valid = matches!(
-            (self.mode, mode),
-            (Mode::Idle, Mode::Live)
-                | (Mode::Live, Mode::Idle)
-                | (Mode::Live, Mode::Recording)
-                | (Mode::Recording, Mode::Live)
-                | (Mode::Recording, Mode::Idle)
-                | (Mode::Idle, Mode::Idle)
-                | (Mode::Live, Mode::Live)
-                | (Mode::Recording, Mode::Recording)
-        );
-
-        if !valid {
+    pub fn set_data_flow(&mut self, state: DataFlowState) -> Result<(), CoreError> {
+        if state == DataFlowState::Idle && self.mode.recording != RecordingState::Inactive {
             return Err(CoreError::InvalidModeTransition {
                 from: self.mode,
-                to: mode,
+                to: Mode {
+                    data_flow: state,
+                    recording: self.mode.recording,
+                },
             });
         }
+        self.mode.data_flow = state;
+        Ok(())
+    }
 
-        self.mode = mode;
+    pub fn set_recording(&mut self, state: RecordingState) -> Result<(), CoreError> {
+        if state != RecordingState::Inactive && self.mode.data_flow != DataFlowState::Live {
+            return Err(CoreError::InvalidModeTransition {
+                from: self.mode,
+                to: Mode {
+                    data_flow: self.mode.data_flow,
+                    recording: state,
+                },
+            });
+        }
+        self.mode.recording = state;
+        Ok(())
+    }
 
+    pub fn set_mode(&mut self, mode: Mode) -> Result<(), CoreError> {
+        // Order matters: stop recording/playback before reducing data flow,
+        // but start data flow before enabling recording/playback.
+        if mode.recording == RecordingState::Inactive {
+            self.set_recording(mode.recording)?;
+            self.set_data_flow(mode.data_flow)?;
+        } else {
+            self.set_data_flow(mode.data_flow)?;
+            self.set_recording(mode.recording)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_scene_attribute_value(
+        &mut self,
+        scene_id: SceneId,
+        object_id: ObjectId,
+        attribute_name: &str,
+        value: AttributeValue,
+    ) -> Result<(), CoreError> {
+        let scene = self
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or(CoreError::SceneNotFound(scene_id))?;
+        let object = scene
+            .objects
+            .get_mut(&object_id)
+            .ok_or(CoreError::ObjectNotFound(object_id))?;
+        let attr = object
+            .attributes
+            .get_mut(attribute_name)
+            .ok_or_else(|| CoreError::AttributeNotFound(attribute_name.to_owned()))?;
+        attr.current_value = value;
         Ok(())
     }
 
@@ -164,7 +196,7 @@ impl RuntimeCore {
         req: MappingRequest,
         now_ns: u64,
     ) -> Result<MappingId, CoreError> {
-        if self.mode == Mode::Recording {
+        if self.mode.recording == RecordingState::Recording {
             return Err(CoreError::MappingBlockedInRecording);
         }
 
@@ -195,6 +227,8 @@ impl RuntimeCore {
         }
 
         let id = Uuid::now_v7();
+        self.mapping_index
+            .insert((req.source_device, req.source_output.clone()), id);
         self.mappings.insert(
             id,
             Mapping {
@@ -216,7 +250,7 @@ impl RuntimeCore {
     }
 
     pub fn set_mapping_lock(&mut self, mapping_id: MappingId, lock: bool) -> Result<(), CoreError> {
-        if self.mode == Mode::Recording {
+        if self.mode.recording == RecordingState::Recording {
             return Err(CoreError::MappingBlockedInRecording);
         }
         let Some(mapping) = self.mappings.get_mut(&mapping_id) else {
@@ -227,12 +261,14 @@ impl RuntimeCore {
     }
 
     pub fn remove_mapping(&mut self, mapping_id: MappingId) -> Result<(), CoreError> {
-        if self.mode == Mode::Recording {
+        if self.mode.recording == RecordingState::Recording {
             return Err(CoreError::MappingBlockedInRecording);
         }
-        let Some(_) = self.mappings.shift_remove(&mapping_id) else {
+        let Some(mapping) = self.mappings.shift_remove(&mapping_id) else {
             return Err(CoreError::MappingDenied("mapping not found".into()));
         };
+        self.mapping_index
+            .remove(&(mapping.source_device, mapping.source_output));
         Ok(())
     }
 
@@ -242,7 +278,7 @@ impl RuntimeCore {
         req: MappingRequest,
         now_ns: u64,
     ) -> Result<(), CoreError> {
-        if self.mode == Mode::Recording {
+        if self.mode.recording == RecordingState::Recording {
             return Err(CoreError::MappingBlockedInRecording);
         }
         self.ensure_target_exists(req.target_scene, req.target_object, &req.target_attribute)?;
@@ -259,6 +295,7 @@ impl RuntimeCore {
             return Err(CoreError::MappingDenied("mapping is locked".into()));
         }
 
+        let old_key = (mapping.source_device, mapping.source_output.clone());
         mapping.source_device = req.source_device;
         mapping.source_output = req.source_output;
         mapping.target_scene = req.target_scene;
@@ -267,6 +304,12 @@ impl RuntimeCore {
         mapping.component_mask = req.component_mask;
         mapping.last_heartbeat_ns = now_ns;
         mapping.disconnected_at_ns = None;
+
+        self.mapping_index.remove(&old_key);
+        self.mapping_index.insert(
+            (mapping.source_device, mapping.source_output.clone()),
+            mapping_id,
+        );
         Ok(())
     }
 
@@ -291,7 +334,9 @@ impl RuntimeCore {
         now_ns: u64,
     ) -> Result<BTreeMap<String, AttributeValue>, CoreError> {
         self.heartbeat(device_id, now_ns);
-        if self.mode == Mode::Idle {
+        if self.mode.data_flow == DataFlowState::Idle
+            || self.mode.recording == RecordingState::Playback
+        {
             return Ok(BTreeMap::new());
         }
 
@@ -301,26 +346,37 @@ impl RuntimeCore {
 
         let mut applied = BTreeMap::new();
         for update in updates {
-            let mapping = self
-                .mappings
-                .values()
-                .find(|m| {
-                    m.state == MappingState::Active
-                        && m.source_device == device_id
-                        && source_output_matches(
-                            &m.source_output,
-                            device_id,
-                            update.output_attribute.as_str(),
-                        )
-                        && m.target_scene == active_scene
-                })
-                .ok_or_else(|| {
-                    CoreError::MappingDenied(format!(
-                        "no active mapping for output '{}'",
-                        update.output_attribute
-                    ))
-                })?
-                .clone();
+            // Fast path: O(1) index lookup for exact-match keys.
+            let indexed = self
+                .mapping_index
+                .get(&(device_id, update.output_attribute.clone()))
+                .and_then(|id| self.mappings.get(id))
+                .filter(|m| m.state == MappingState::Active && m.target_scene == active_scene)
+                .cloned();
+
+            let mapping = match indexed {
+                Some(m) => m,
+                None => self
+                    .mappings
+                    .values()
+                    .find(|m| {
+                        m.state == MappingState::Active
+                            && m.source_device == device_id
+                            && source_output_matches(
+                                &m.source_output,
+                                device_id,
+                                update.output_attribute.as_str(),
+                            )
+                            && m.target_scene == active_scene
+                    })
+                    .ok_or_else(|| {
+                        CoreError::MappingDenied(format!(
+                            "no active mapping for output '{}'",
+                            update.output_attribute
+                        ))
+                    })?
+                    .clone(),
+            };
 
             let scene = self
                 .scenes
@@ -361,12 +417,12 @@ impl RuntimeCore {
             );
         }
 
-        self.world.resource_mut::<RuntimeStats>().tick_count += 1;
+        self.tick_count += 1;
         Ok(applied)
     }
 
     pub fn tick_count(&self) -> u64 {
-        self.world.resource::<RuntimeStats>().tick_count
+        self.tick_count
     }
 
     pub fn reset_scene_to_baseline(&mut self, scene_id: SceneId) -> Result<u32, CoreError> {
@@ -898,7 +954,7 @@ fn mat4_multiply(base: [[f32; 4]; 4], delta: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
+pub fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
     if mapping_output == update_output {
         return true;
     }
@@ -1010,6 +1066,8 @@ fn apply_clamp(current: &AttributeValue, min: f32, max: f32) -> AttributeValue {
 #[cfg(test)]
 mod tests {
     use motionstage_protocol::Mode;
+    #[allow(unused_imports)]
+    use motionstage_protocol::{DataFlowState, RecordingState};
     use uuid::Uuid;
 
     use crate::{
@@ -1047,7 +1105,7 @@ mod tests {
             100,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         let updates = vec![AttributeUpdate {
             output_attribute: "pose_pos".into(),
@@ -1074,7 +1132,7 @@ mod tests {
             100,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         let updates = vec![AttributeUpdate {
             output_attribute: "pose_pos".into(),
@@ -1099,7 +1157,7 @@ mod tests {
             100,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         let updates = vec![AttributeUpdate {
             output_attribute: format!("{device_id}.pose_pos"),
@@ -1112,7 +1170,7 @@ mod tests {
     #[test]
     fn unmapped_updates_are_rejected() {
         let (mut core, device_id, _, _) = build_core();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         let updates = vec![AttributeUpdate {
             output_attribute: "missing".into(),
@@ -1127,8 +1185,8 @@ mod tests {
     #[test]
     fn recording_blocks_mapping_changes() {
         let (mut core, device_id, scene_id, object_id) = build_core();
-        core.set_mode(Mode::Live).unwrap();
-        core.set_mode(Mode::Recording).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
+        core.set_mode(Mode::RECORDING).unwrap();
 
         let err = core
             .create_mapping(
@@ -1262,7 +1320,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         let small = vec![AttributeUpdate {
             output_attribute: "pose_pos".into(),
@@ -1337,7 +1395,7 @@ mod tests {
             10,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1391,7 +1449,7 @@ mod tests {
             20,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1477,7 +1535,7 @@ mod tests {
             40,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1532,7 +1590,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1587,7 +1645,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1597,7 +1655,7 @@ mod tests {
             2,
         )
         .unwrap();
-        core.set_mode(Mode::Idle).unwrap();
+        core.set_mode(Mode::IDLE).unwrap();
         let current_before_reset = match core
             .scenes
             .get(&scene_id)
@@ -1667,7 +1725,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1723,7 +1781,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
 
         // 90 degrees around Z
         let half_angle = std::f32::consts::FRAC_PI_4;
@@ -1786,7 +1844,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1880,7 +1938,7 @@ mod tests {
             1,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         core.apply_updates(
             device_id,
             &[AttributeUpdate {
@@ -1929,7 +1987,7 @@ mod tests {
             50,
         )
         .unwrap();
-        core.set_mode(Mode::Live).unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
         let err = core
             .apply_updates(
                 device_id,

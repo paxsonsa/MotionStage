@@ -1,35 +1,48 @@
 use std::{
     collections::BTreeMap,
+    fs,
     net::SocketAddr,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use bytes::Bytes;
+
 use motionstage_core::{
-    AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId, MappingRequest, ObjectId,
-    RuntimeCore, RuntimeSnapshot, Scene, SceneId,
+    source_output_matches, AttributeUpdate, AttributeValue, CoreError, LeaseConfig, MappingId,
+    MappingRequest, ObjectId, RuntimeCore, RuntimeSnapshot, Scene, SceneId,
 };
 use motionstage_discovery::{DiscoveryAdvertisement, DiscoveryPublisher};
 use motionstage_media::{
-    negotiate_stream, NegotiatedVideoStream, SignalingHub, VideoClientCapability,
+    negotiate_stream, NegotiatedVideoStream, SignalingHub, VideoClientCapability, VideoCodec,
     VideoStreamDescriptor,
 };
 use motionstage_protocol::{
-    negotiate_version, BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode,
-    ProtocolError, ProtocolVersion, RegisterAccepted, RegisterRejected, RegisterRequest,
-    RejectCode, SdpMessage, SdpType, ServerHello, SessionState, SignalMessage, SignalPayload,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    negotiate_version, AttributeDescriptor, BakeAttributeValue, BaselineAction, ClientHello,
+    ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackAction, PlaybackRuntimeState,
+    ProtocolError, ProtocolVersion, RecordingState, RegisterAccepted, RegisterRejected,
+    RegisterRequest, RejectCode, SamplingMode, SdpMessage, SdpType, ServerHello, SessionState,
+    SignalMessage, SignalPayload, TakeBakeAttribute, TakeInfo, VideoStreamStatus, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 use motionstage_recording::{
-    RecordedAttribute, RecordedFrame, RecordingManifest, RecordingMarker, RecordingWriter,
+    read_recording, RecordedAttribute, RecordedFrame, RecordingFile, RecordingManifest,
+    RecordingMarker, RecordingWriter,
 };
 use motionstage_transport_quic::{MotionDatagram, QuicServer};
 use motionstage_webrtc::WebRtcSession;
 use thiserror::Error;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
+
+mod take_catalog;
+use take_catalog::TakeCatalog;
+
+#[cfg(feature = "companion-ui")]
+pub mod companion_ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityMode {
@@ -63,6 +76,7 @@ pub struct ServerConfig {
     pub lease: LeaseConfig,
     pub pairing_token: Option<String>,
     pub api_key: Option<String>,
+    pub take_catalog_path: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +100,7 @@ impl Default for ServerConfig {
             lease: LeaseConfig::default(),
             pairing_token: None,
             api_key: None,
+            take_catalog_path: PathBuf::from("recordings/takes_catalog.json"),
         }
     }
 }
@@ -97,13 +112,35 @@ pub struct SessionInfo {
     pub session_id: Option<Uuid>,
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
-    pub advertised_attributes: Vec<String>,
+    pub advertised_attributes: Vec<AttributeDescriptor>,
     pub state: SessionState,
+    /// Nanosecond timestamp of last activity (control message or motion datagram).
+    pub last_activity_ns: u64,
 }
 
 struct ActiveRecording {
     path: PathBuf,
     writer: RecordingWriter,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePlayback {
+    take_id: Uuid,
+    recording: RecordingFile,
+    state: PlaybackRuntimeState,
+    looping: bool,
+    playhead_ns: u64,
+    started_wall_ns: Option<u64>,
+    started_playhead_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TakeBakeCursor {
+    take_id: Uuid,
+    sampling_mode: SamplingMode,
+    recording: RecordingFile,
+    next_index: u64,
+    total_frames: u64,
 }
 
 struct VideoPeerSession {
@@ -126,13 +163,25 @@ struct ServerState {
     metrics: ServerMetrics,
     running: bool,
     active_recording: Option<ActiveRecording>,
+    active_playback: Option<ActivePlayback>,
+    take_catalog: TakeCatalog,
+    bake_cursors: BTreeMap<Uuid, TakeBakeCursor>,
     master_video_descriptor: Option<VideoStreamDescriptor>,
+    last_video_frame_ns: Option<u64>,
+    video_keyframe_needed: bool,
     signaling: SignalingHub,
     video_peers: BTreeMap<Uuid, VideoPeerSession>,
     runtime_resources: Option<RuntimeResources>,
     active_advertisement: Option<DiscoveryAdvertisement>,
     last_published_snapshot: Option<RuntimeSnapshot>,
+    /// DCC-side actions requested by the companion UI, drained by the plugin on its
+    /// main-thread tick. The runtime never executes these itself.
+    host_requests: Vec<HostRequest>,
+    /// Object names selected in the host DCC, pushed by the plugin for UI highlight.
+    host_selection: Vec<String>,
 }
+
+const VIDEO_STREAM_ACTIVITY_WINDOW_NS: u64 = 2_000_000_000;
 
 impl ServerState {
     fn change_session_state(
@@ -160,30 +209,30 @@ impl ServerState {
         match self.config.security_mode {
             SecurityMode::TrustedLan => Ok(()),
             SecurityMode::PairingRequired => {
-                let expected = self
-                    .config
-                    .pairing_token
-                    .as_deref()
-                    .unwrap_or("motionstage");
+                let Some(expected) = self.config.pairing_token.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match req.pairing_token.as_deref() {
                     Some(token) if token == expected => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
                 }
             }
             SecurityMode::ApiKey => {
-                let expected = self.config.api_key.as_deref().unwrap_or("motionstage");
+                let Some(expected) = self.config.api_key.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match req.api_key.as_deref() {
                     Some(key) if key == expected => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
                 }
             }
             SecurityMode::ApiKeyPlusPairing => {
-                let pair = self
-                    .config
-                    .pairing_token
-                    .as_deref()
-                    .unwrap_or("motionstage");
-                let key = self.config.api_key.as_deref().unwrap_or("motionstage");
+                let Some(pair) = self.config.pairing_token.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
+                let Some(key) = self.config.api_key.as_deref() else {
+                    return Err(RejectCode::AuthFailed);
+                };
                 match (req.pairing_token.as_deref(), req.api_key.as_deref()) {
                     (Some(p), Some(k)) if p == pair && k == key => Ok(()),
                     _ => Err(RejectCode::AuthFailed),
@@ -234,11 +283,117 @@ impl ServerState {
         }
         Ok(())
     }
+
+    fn apply_playback_frame(&mut self, frame: &RecordedFrame, scene_id: SceneId) {
+        for attr in &frame.attributes {
+            let _ = self.runtime.set_scene_attribute_value(
+                scene_id,
+                attr.object_id,
+                &attr.attribute,
+                attr.value.clone(),
+            );
+        }
+    }
+
+    fn playback_duration_ns(recording: &RecordingFile) -> u64 {
+        let Some(first) = recording.frames.first() else {
+            return 0;
+        };
+        let Some(last) = recording.frames.last() else {
+            return 0;
+        };
+        last.timestamp_ns.saturating_sub(first.timestamp_ns)
+    }
+
+    fn frame_for_playhead(recording: &RecordingFile, playhead_ns: u64) -> Option<RecordedFrame> {
+        let first_ts = recording.frames.first()?.timestamp_ns;
+        let target = first_ts.saturating_add(playhead_ns);
+        let mut chosen = recording.frames.first()?.clone();
+        for frame in &recording.frames {
+            if frame.timestamp_ns > target {
+                break;
+            }
+            chosen = frame.clone();
+        }
+        Some(chosen)
+    }
+
+    fn tick_playback(&mut self, now_ns: u64) {
+        let Some(playback) = self.active_playback.as_mut() else {
+            return;
+        };
+        if playback.state != PlaybackRuntimeState::Playing {
+            return;
+        }
+
+        let Some(started_wall_ns) = playback.started_wall_ns else {
+            playback.started_wall_ns = Some(now_ns);
+            return;
+        };
+
+        let elapsed = now_ns.saturating_sub(started_wall_ns);
+        let mut playhead = playback.started_playhead_ns.saturating_add(elapsed);
+        let duration = Self::playback_duration_ns(&playback.recording);
+        if duration > 0 && playhead > duration {
+            if playback.looping {
+                playhead %= duration;
+                playback.started_wall_ns = Some(now_ns);
+                playback.started_playhead_ns = playhead;
+            } else {
+                playhead = duration;
+                playback.state = PlaybackRuntimeState::Stopped;
+                playback.started_wall_ns = None;
+                playback.started_playhead_ns = playhead;
+            }
+        }
+
+        playback.playhead_ns = playhead;
+        let scene_id = playback.recording.manifest.scene_id;
+        if let Some(frame) = Self::frame_for_playhead(&playback.recording, playback.playhead_ns) {
+            self.apply_playback_frame(&frame, scene_id);
+        }
+    }
+}
+
+/// A DCC-side action the companion UI asked for that the runtime cannot perform
+/// itself (it must run on the host's main thread: reading/writing the DCC scene,
+/// GPU capture, baking onto the host timeline). The plugin drains these from its
+/// main-thread tick via [`ServerHandle::drain_host_requests`] and executes them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostRequest {
+    /// Re-enumerate the DCC scene into the runtime (objects + attributes).
+    ResyncScene,
+    /// Begin viewport video capture + streaming.
+    StartVideo {
+        width: u32,
+        height: u32,
+        fps: u32,
+        source: Option<String>,
+    },
+    /// Stop viewport video capture.
+    StopVideo,
+    /// Bake a recorded take onto the host timeline as keyframes.
+    BakeTake {
+        take_id: Uuid,
+        fps: u32,
+        start_frame: i32,
+    },
+}
+
+/// Snapshot of playback transport state for the companion UI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackStatus {
+    pub take_id: Uuid,
+    pub state: PlaybackRuntimeState,
+    pub position_ns: u64,
+    pub duration_ns: u64,
+    pub looping: bool,
 }
 
 #[derive(Clone)]
 pub struct ServerHandle {
     state: Arc<RwLock<ServerState>>,
+    mode_updates: broadcast::Sender<Mode>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -254,6 +409,8 @@ pub struct ServerMetrics {
 
 pub struct QuicRuntime {
     pub local_addr: SocketAddr,
+    /// SHA-256 hex fingerprint of the server's TLS certificate.
+    pub cert_fingerprint_hex: String,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
 }
@@ -270,23 +427,42 @@ impl QuicRuntime {
 
 impl ServerHandle {
     pub fn new(config: ServerConfig) -> Self {
+        let (mode_updates, _mode_updates_rx) = broadcast::channel(64);
         let state = ServerState {
             runtime: RuntimeCore::new(config.lease),
             sessions: BTreeMap::new(),
             metrics: ServerMetrics::default(),
             running: false,
             active_recording: None,
+            active_playback: None,
+            take_catalog: TakeCatalog::load_or_new(&config.take_catalog_path).unwrap_or_else(
+                |err| {
+                    warn!(
+                        path = %config.take_catalog_path.display(),
+                        error = %err,
+                        "failed to load take catalog, starting empty"
+                    );
+                    TakeCatalog::load_or_new("recordings/takes_catalog.json")
+                        .unwrap_or_else(|_| panic!("fallback take catalog must be creatable"))
+                },
+            ),
+            bake_cursors: BTreeMap::new(),
             master_video_descriptor: None,
+            last_video_frame_ns: None,
+            video_keyframe_needed: false,
             signaling: SignalingHub::default(),
             video_peers: BTreeMap::new(),
             runtime_resources: None,
             active_advertisement: None,
             last_published_snapshot: None,
+            host_requests: Vec::new(),
+            host_selection: Vec::new(),
             config,
         };
 
         Self {
             state: Arc::new(RwLock::new(state)),
+            mode_updates,
         }
     }
 
@@ -322,6 +498,7 @@ impl ServerHandle {
             protocol_minor: PROTOCOL_MINOR,
             features,
             security_mode,
+            cert_fingerprint: Some(quic_runtime.cert_fingerprint_hex.clone()),
         };
 
         let discovery = if enable_discovery {
@@ -435,6 +612,26 @@ impl ServerHandle {
                         }
                         let now = now_ns();
                         state.runtime.scheduler_tick(now);
+                        state.tick_playback(now);
+
+                        // Evict sessions that have been idle beyond the configured timeout (4.4).
+                        let idle_timeout = state.config.lease.session_idle_timeout_ns;
+                        if idle_timeout > 0 {
+                            let expired: Vec<Uuid> = state.sessions.values()
+                                .filter(|s| {
+                                    s.state != SessionState::Closed
+                                        && s.state != SessionState::Discovered
+                                        && now.saturating_sub(s.last_activity_ns) >= idle_timeout
+                                })
+                                .map(|s| s.device_id)
+                                .collect();
+                            for device_id in expired {
+                                warn!(%device_id, "session idle timeout; closing");
+                                state.runtime.register_device_disconnected(device_id, now);
+                                let _ = state.change_session_state(device_id, SessionState::Closed);
+                            }
+                        }
+
                         state.metrics.scheduler_ticks += 1;
                         trace!(scheduler_ticks = state.metrics.scheduler_ticks, "scheduler tick");
                     }
@@ -476,6 +673,7 @@ impl ServerHandle {
         let local_addr = quic
             .local_addr()
             .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        let cert_fingerprint_hex = quic.cert_fingerprint_hex();
         let runtime_server = self.clone();
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -502,6 +700,7 @@ impl ServerHandle {
 
         Ok(QuicRuntime {
             local_addr,
+            cert_fingerprint_hex,
             shutdown_tx,
             join,
         })
@@ -537,6 +736,7 @@ impl ServerHandle {
                 features: Vec::new(),
                 advertised_attributes: Vec::new(),
                 state: SessionState::Discovered,
+                last_activity_ns: now_ns(),
             },
         );
         debug!(%device_id, device_name = %device_name, "session discovered");
@@ -654,7 +854,7 @@ impl ServerHandle {
             }));
         }
 
-        let session_id = Uuid::now_v7();
+        let session_id = Uuid::new_v4();
         session.session_id = Some(session_id);
         state.change_session_state(device_id, SessionState::Registered)?;
         state.metrics.accepted_sessions += 1;
@@ -674,11 +874,48 @@ impl ServerHandle {
     pub async fn activate(&self, device_id: Uuid) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         state.runtime.register_device_connected(device_id);
-        state.change_session_state(device_id, SessionState::Active)
+        state.change_session_state(device_id, SessionState::Active)?;
+        let device_name = state
+            .sessions
+            .get(&device_id)
+            .map(|s| s.device_name.clone())
+            .unwrap_or_default();
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording.writer.push_marker(RecordingMarker::ClientJoined {
+                timestamp_ns: now_ns(),
+                device_id,
+                device_name,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn touch_session_activity(&self, device_id: Uuid) {
+        let mut state = self.state.write().await;
+        if let Some(session) = state.sessions.get_mut(&device_id) {
+            session.last_activity_ns = now_ns();
+        }
     }
 
     pub async fn close_session(&self, device_id: Uuid, now_ns: u64) -> Result<(), ServerError> {
+        self.close_session_with_reason(device_id, now_ns, None)
+            .await
+    }
+
+    pub async fn close_session_with_reason(
+        &self,
+        device_id: Uuid,
+        now_ns: u64,
+        reason: Option<String>,
+    ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording.writer.push_marker(RecordingMarker::ClientLeft {
+                timestamp_ns: now_ns,
+                device_id,
+                reason,
+            });
+        }
         state
             .runtime
             .register_device_disconnected(device_id, now_ns);
@@ -699,18 +936,104 @@ impl ServerHandle {
             .map_err(ServerError::Core)
     }
 
-    pub async fn set_mode(&self, mode: Mode) -> Result<(), ServerError> {
+    pub async fn set_data_flow(&self, data_flow: DataFlowState) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
         let from = state.runtime.mode();
-        state.runtime.set_mode(mode).map_err(ServerError::Core)?;
+        state
+            .runtime
+            .set_data_flow(data_flow)
+            .map_err(ServerError::Core)?;
+        let to = state.runtime.mode();
+        if to.recording != RecordingState::Playback {
+            state.active_playback = None;
+        }
         if let Some(recording) = state.active_recording.as_mut() {
             recording
                 .writer
                 .push_marker(RecordingMarker::ModeTransition {
                     timestamp_ns: now_ns(),
                     from,
-                    to: mode,
+                    to,
                 });
+        }
+        let _ = self.mode_updates.send(to);
+        Ok(())
+    }
+
+    pub async fn set_recording(&self, recording: RecordingState) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let from = state.runtime.mode();
+        state
+            .runtime
+            .set_recording(recording)
+            .map_err(ServerError::Core)?;
+        let to = state.runtime.mode();
+        if to.recording != RecordingState::Playback {
+            state.active_playback = None;
+        }
+        if let Some(rec) = state.active_recording.as_mut() {
+            rec.writer.push_marker(RecordingMarker::ModeTransition {
+                timestamp_ns: now_ns(),
+                from,
+                to,
+            });
+        }
+        let _ = self.mode_updates.send(to);
+        Ok(())
+    }
+
+    pub fn subscribe_mode_updates(&self) -> broadcast::Receiver<Mode> {
+        self.mode_updates.subscribe()
+    }
+
+    /// Queue a DCC-side action requested by the companion UI. The plugin drains and
+    /// executes it on its main thread (the runtime never touches the DCC directly).
+    pub async fn enqueue_host_request(&self, request: HostRequest) {
+        let mut state = self.state.write().await;
+        state.host_requests.push(request);
+    }
+
+    /// Drain pending host requests for the plugin to execute on its main thread.
+    pub async fn drain_host_requests(&self) -> Vec<HostRequest> {
+        let mut state = self.state.write().await;
+        std::mem::take(&mut state.host_requests)
+    }
+
+    /// Record the objects selected in the host DCC (by name), for UI highlight.
+    pub async fn set_host_selection(&self, names: Vec<String>) {
+        let mut state = self.state.write().await;
+        state.host_selection = names;
+    }
+
+    /// Objects currently selected in the host DCC (by name).
+    pub async fn host_selection(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state.host_selection.clone()
+    }
+
+    /// Current playback transport status, if a take is loaded.
+    pub async fn playback_status(&self) -> Option<PlaybackStatus> {
+        let state = self.state.read().await;
+        let playback = state.active_playback.as_ref()?;
+        Some(PlaybackStatus {
+            take_id: playback.take_id,
+            state: playback.state,
+            position_ns: playback.playhead_ns,
+            duration_ns: ServerState::playback_duration_ns(&playback.recording),
+            looping: playback.looping,
+        })
+    }
+
+    /// Convenience: set both axes of the composite mode in one call.
+    pub async fn set_mode(&self, mode: Mode) -> Result<(), ServerError> {
+        // Order matters: stop recording/playback before reducing data flow,
+        // but start data flow before enabling recording/playback.
+        if mode.recording == RecordingState::Inactive {
+            self.set_recording(mode.recording).await?;
+            self.set_data_flow(mode.data_flow).await?;
+        } else {
+            self.set_data_flow(mode.data_flow).await?;
+            self.set_recording(mode.recording).await?;
         }
         Ok(())
     }
@@ -994,17 +1317,18 @@ impl ServerHandle {
         now_ns: u64,
     ) -> Result<Uuid, ServerError> {
         let mut state = self.state.write().await;
+        state.active_playback = None;
         let mut from_mode = state.runtime.mode();
-        if from_mode == Mode::Idle {
+        if from_mode.data_flow == DataFlowState::Idle {
             state
                 .runtime
-                .set_mode(Mode::Live)
+                .set_data_flow(DataFlowState::Live)
                 .map_err(ServerError::Core)?;
-            from_mode = Mode::Live;
+            from_mode = state.runtime.mode();
         }
         state
             .runtime
-            .set_mode(Mode::Recording)
+            .set_recording(RecordingState::Recording)
             .map_err(ServerError::Core)?;
 
         let active_scene = state
@@ -1027,7 +1351,7 @@ impl ServerHandle {
                 .push_marker(RecordingMarker::ModeTransition {
                     timestamp_ns: now_ns,
                     from: from_mode,
-                    to: Mode::Recording,
+                    to: Mode::RECORDING,
                 });
 
             for mapping in snapshot.mappings.values() {
@@ -1056,26 +1380,289 @@ impl ServerHandle {
         let Some(mut recording) = state.active_recording.take() else {
             return Err(ServerError::Recording("no active recording".into()));
         };
+        let recording_path = recording.path.clone();
 
         recording
             .writer
             .push_marker(RecordingMarker::ModeTransition {
                 timestamp_ns: now_ns(),
-                from: Mode::Recording,
-                to: Mode::Live,
+                from: Mode::RECORDING,
+                to: Mode::LIVE,
             });
 
         let manifest = recording
             .writer
-            .finish(&recording.path)
+            .finish(&recording_path)
             .map_err(|err| ServerError::Recording(err.to_string()))?;
 
         state
+            .take_catalog
+            .register_take(
+                manifest.recording_id,
+                manifest.scene_id,
+                recording_path,
+                manifest.started_ns,
+                manifest.frame_count,
+            )
+            .map_err(ServerError::Take)?;
+
+        state
             .runtime
-            .set_mode(Mode::Live)
+            .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
 
         Ok(manifest)
+    }
+
+    pub async fn list_takes(&self, scene_id: Option<SceneId>) -> Vec<TakeInfo> {
+        let state = self.state.read().await;
+        state.take_catalog.list(scene_id)
+    }
+
+    pub async fn select_take(&self, take_id: Uuid) -> Result<TakeInfo, ServerError> {
+        let mut state = self.state.write().await;
+        state
+            .take_catalog
+            .select_take(take_id)
+            .map_err(ServerError::Take)
+    }
+
+    pub async fn playback_play(
+        &self,
+        take_id: Uuid,
+        looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let take = state
+            .take_catalog
+            .get(take_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
+        let recording =
+            read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        state
+            .runtime
+            .set_active_scene(recording.manifest.scene_id)
+            .map_err(ServerError::Core)?;
+        state
+            .runtime
+            .set_data_flow(DataFlowState::Live)
+            .map_err(ServerError::Core)?;
+        state
+            .runtime
+            .set_recording(RecordingState::Playback)
+            .map_err(ServerError::Core)?;
+        let playback = ActivePlayback {
+            take_id,
+            recording,
+            state: PlaybackRuntimeState::Playing,
+            looping,
+            playhead_ns: 0,
+            started_wall_ns: Some(now_ns()),
+            started_playhead_ns: 0,
+        };
+        if let Some(frame) = ServerState::frame_for_playhead(&playback.recording, 0) {
+            state.apply_playback_frame(&frame, playback.recording.manifest.scene_id);
+        }
+        let playhead_ns = playback.playhead_ns;
+        let looping = playback.looping;
+        state.active_playback = Some(playback);
+        Ok((PlaybackRuntimeState::Playing, playhead_ns, looping))
+    }
+
+    pub async fn playback_pause(
+        &self,
+        take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let Some(playback) = state.active_playback.as_mut() else {
+            return Err(ServerError::Take("no active playback".into()));
+        };
+        if playback.take_id != take_id {
+            return Err(ServerError::Take(format!(
+                "active playback is not take {take_id}"
+            )));
+        }
+        if playback.state == PlaybackRuntimeState::Playing {
+            let started = playback.started_wall_ns.unwrap_or_else(now_ns);
+            let elapsed = now_ns().saturating_sub(started);
+            playback.playhead_ns = playback.started_playhead_ns.saturating_add(elapsed);
+        }
+        playback.state = PlaybackRuntimeState::Paused;
+        playback.started_wall_ns = None;
+        playback.started_playhead_ns = playback.playhead_ns;
+        Ok((playback.state, playback.playhead_ns, playback.looping))
+    }
+
+    pub async fn playback_seek(
+        &self,
+        take_id: Uuid,
+        seek_ns: u64,
+        looping: bool,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let (status, playhead, loop_state, scene_id, frame) = {
+            let Some(playback) = state.active_playback.as_mut() else {
+                return Err(ServerError::Take("no active playback".into()));
+            };
+            if playback.take_id != take_id {
+                return Err(ServerError::Take(format!(
+                    "active playback is not take {take_id}"
+                )));
+            }
+            let duration = ServerState::playback_duration_ns(&playback.recording);
+            let seek = if duration == 0 {
+                0
+            } else if looping {
+                seek_ns % duration
+            } else {
+                seek_ns.min(duration)
+            };
+            playback.looping = looping;
+            playback.playhead_ns = seek;
+            playback.started_wall_ns = Some(now_ns());
+            playback.started_playhead_ns = seek;
+            let scene_id = playback.recording.manifest.scene_id;
+            let frame = ServerState::frame_for_playhead(&playback.recording, seek);
+            (
+                playback.state,
+                playback.playhead_ns,
+                playback.looping,
+                scene_id,
+                frame,
+            )
+        };
+        if let Some(frame) = frame {
+            state.apply_playback_frame(&frame, scene_id);
+        }
+        Ok((status, playhead, loop_state))
+    }
+
+    pub async fn playback_stop(
+        &self,
+        take_id: Uuid,
+    ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
+        let mut state = self.state.write().await;
+        let Some(playback) = state.active_playback.take() else {
+            return Err(ServerError::Take("no active playback".into()));
+        };
+        if playback.take_id != take_id {
+            state.active_playback = Some(playback);
+            return Err(ServerError::Take(format!(
+                "active playback is not take {take_id}"
+            )));
+        }
+        state
+            .runtime
+            .set_recording(RecordingState::Inactive)
+            .map_err(ServerError::Core)?;
+        Ok((
+            PlaybackRuntimeState::Stopped,
+            playback.playhead_ns,
+            playback.looping,
+        ))
+    }
+
+    pub async fn open_take_bake_cursor(
+        &self,
+        take_id: Uuid,
+        sampling_mode: SamplingMode,
+    ) -> Result<(Uuid, u64), ServerError> {
+        let mut state = self.state.write().await;
+        let take = state
+            .take_catalog
+            .get(take_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
+        let recording =
+            read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        let total_frames = take_bake_total_frames(&recording, sampling_mode);
+        let cursor_id = Uuid::now_v7();
+        state.bake_cursors.insert(
+            cursor_id,
+            TakeBakeCursor {
+                take_id,
+                sampling_mode,
+                recording,
+                next_index: 0,
+                total_frames,
+            },
+        );
+        Ok((cursor_id, total_frames))
+    }
+
+    pub async fn read_take_bake_frame(
+        &self,
+        cursor_id: Uuid,
+    ) -> Result<Option<(u64, u64, Vec<TakeBakeAttribute>)>, ServerError> {
+        let mut state = self.state.write().await;
+        let Some(cursor) = state.bake_cursors.get_mut(&cursor_id) else {
+            return Err(ServerError::Take(format!(
+                "unknown bake cursor: {cursor_id}"
+            )));
+        };
+        let frame_index = cursor.next_index;
+        let Some((timestamp_ns, attributes)) = take_bake_frame_for_index(cursor, frame_index)
+        else {
+            return Ok(None);
+        };
+        cursor.next_index = cursor.next_index.saturating_add(1);
+        Ok(Some((frame_index, timestamp_ns, attributes)))
+    }
+
+    pub async fn seek_take_bake_frame(
+        &self,
+        cursor_id: Uuid,
+        frame_index: u64,
+    ) -> Result<Option<(u64, u64, Vec<TakeBakeAttribute>)>, ServerError> {
+        let mut state = self.state.write().await;
+        let Some(cursor) = state.bake_cursors.get_mut(&cursor_id) else {
+            return Err(ServerError::Take(format!(
+                "unknown bake cursor: {cursor_id}"
+            )));
+        };
+        cursor.next_index = frame_index.saturating_add(1);
+        Ok(take_bake_frame_for_index(cursor, frame_index)
+            .map(|(timestamp_ns, attributes)| (frame_index, timestamp_ns, attributes)))
+    }
+
+    pub async fn close_take_bake_cursor(&self, cursor_id: Uuid) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let _ = state.bake_cursors.remove(&cursor_id);
+        Ok(())
+    }
+
+    pub async fn delete_take(&self, take_id: Uuid) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let path = state
+            .take_catalog
+            .mark_deleted(take_id)
+            .map_err(ServerError::Take)?;
+
+        if let Some(path) = path {
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(ServerError::Take(err.to_string()));
+                }
+            }
+            state
+                .take_catalog
+                .purge_take(take_id)
+                .map_err(ServerError::Take)?;
+        }
+
+        if matches!(state.active_playback.as_ref(), Some(active) if active.take_id == take_id) {
+            state.active_playback = None;
+            state
+                .runtime
+                .set_recording(RecordingState::Inactive)
+                .map_err(ServerError::Core)?;
+        }
+
+        state
+            .bake_cursors
+            .retain(|_, cursor| cursor.take_id != take_id);
+        Ok(())
     }
 
     pub async fn set_master_video_descriptor(
@@ -1122,13 +1709,22 @@ impl ServerHandle {
                 .unwrap_or(true)
         };
         if needs_track {
-            peer.add_h264_track(stream_id, track_id)
+            let codec = {
+                let state = self.state.read().await;
+                state
+                    .master_video_descriptor
+                    .as_ref()
+                    .map(|d| d.codec)
+                    .unwrap_or(VideoCodec::H264)
+            };
+            peer.add_video_track(codec, stream_id, track_id)
                 .await
                 .map_err(|err| ServerError::WebRtc(err.to_string()))?;
             let mut state = self.state.write().await;
             if let Some(entry) = state.video_peers.get_mut(&device_id) {
                 entry.track_added = true;
             }
+            state.video_keyframe_needed = true;
         }
 
         peer.create_offer()
@@ -1160,13 +1756,22 @@ impl ServerHandle {
                 };
                 if needs_track {
                     let stream_id = format!("motionstage-{device_id}");
-                    peer.add_h264_track(&stream_id, "video")
+                    let codec = {
+                        let state = self.state.read().await;
+                        state
+                            .master_video_descriptor
+                            .as_ref()
+                            .map(|d| d.codec)
+                            .unwrap_or(VideoCodec::H264)
+                    };
+                    peer.add_video_track(codec, &stream_id, "video")
                         .await
                         .map_err(|err| ServerError::WebRtc(err.to_string()))?;
                     let mut state = self.state.write().await;
                     if let Some(entry) = state.video_peers.get_mut(&device_id) {
                         entry.track_added = true;
                     }
+                    state.video_keyframe_needed = true;
                 }
 
                 let answer = peer
@@ -1190,6 +1795,73 @@ impl ServerHandle {
                 Ok(None)
             }
         }
+    }
+
+    pub async fn push_video_frame(
+        &self,
+        data: Bytes,
+        duration: Duration,
+    ) -> Result<(), ServerError> {
+        let peers_with_tracks: Vec<Arc<WebRtcSession>> = {
+            let mut state = self.state.write().await;
+            state.last_video_frame_ns = Some(now_ns());
+            state
+                .video_peers
+                .values()
+                .filter(|entry| entry.track_added)
+                .map(|entry| Arc::clone(&entry.peer))
+                .collect()
+        };
+
+        for peer in peers_with_tracks {
+            if let Err(err) = peer.write_sample(data.clone(), duration).await {
+                tracing::warn!("failed to write video sample to peer: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` (once) if a new video peer was added since the last call.
+    /// The caller should force an IDR keyframe so the new peer can start decoding.
+    pub async fn take_keyframe_needed(&self) -> bool {
+        let mut state = self.state.write().await;
+        let needed = state.video_keyframe_needed;
+        state.video_keyframe_needed = false;
+        needed
+    }
+
+    pub async fn video_stream_status(&self) -> VideoStreamStatus {
+        let state = self.state.read().await;
+        let descriptor_set = state.master_video_descriptor.is_some();
+        let peer_count = state
+            .video_peers
+            .values()
+            .filter(|entry| entry.track_added)
+            .count() as u32;
+        let now = now_ns();
+        let last_frame_age_ms = state
+            .last_video_frame_ns
+            .map(|last| now.saturating_sub(last) / 1_000_000);
+        let recent_frame = state
+            .last_video_frame_ns
+            .map(|last| now.saturating_sub(last) <= VIDEO_STREAM_ACTIVITY_WINDOW_NS)
+            .unwrap_or(false);
+
+        VideoStreamStatus {
+            available: descriptor_set && recent_frame,
+            descriptor_set,
+            peer_count,
+            last_frame_age_ms,
+        }
+    }
+
+    pub async fn video_peer_count(&self) -> u32 {
+        let state = self.state.read().await;
+        state
+            .video_peers
+            .values()
+            .filter(|entry| entry.track_added)
+            .count() as u32
     }
 
     pub async fn has_video_session(&self, device_id: Uuid) -> bool {
@@ -1302,6 +1974,571 @@ impl ServerHandle {
     }
 }
 
+// Break = exit session loop; Continue = keep looping
+type HandlerOutcome = ControlFlow<()>;
+
+async fn handle_set_data_flow(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    state: DataFlowState,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to change mode".into(),
+        )
+        .await
+        .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match server.set_data_flow(state).await {
+        Ok(()) => {
+            let active_mode = server.mode().await;
+            control
+                .send(&ControlMessage::ModeState(active_mode))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_set_recording(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    state: RecordingState,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to change mode".into(),
+        )
+        .await
+        .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match server.set_recording(state).await {
+        Ok(()) => {
+            let active_mode = server.mode().await;
+            control
+                .send(&ControlMessage::ModeState(active_mode))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_baseline_control(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::ResetSceneToBaseline { .. } => {
+            "operator role is required to reset baseline"
+        }
+        ControlMessage::CommitSceneBaseline { .. } => {
+            "operator role is required to commit scene baseline"
+        }
+        ControlMessage::CommitObjectBaseline { .. } => {
+            "operator role is required to commit object baseline"
+        }
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    let result: Result<(BaselineAction, u32), ServerError> = match msg {
+        ControlMessage::ResetSceneToBaseline { scene_id } => server
+            .reset_scene_to_baseline(scene_id)
+            .await
+            .map(|n| (BaselineAction::ResetScene, n)),
+        ControlMessage::CommitSceneBaseline { scene_id } => server
+            .commit_scene_baseline(scene_id)
+            .await
+            .map(|n| (BaselineAction::CommitScene, n)),
+        ControlMessage::CommitObjectBaseline {
+            scene_id,
+            object_id,
+        } => server
+            .commit_object_baseline(scene_id, object_id)
+            .await
+            .map(|n| (BaselineAction::CommitObject, n)),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok((action, changed_attributes)) => {
+            control
+                .send(&ControlMessage::BaselineActionApplied {
+                    action,
+                    changed_attributes,
+                })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_take_management(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::ListTakes { .. } => "operator role is required to list takes",
+        ControlMessage::SelectTake { .. } => "operator role is required to select takes",
+        ControlMessage::DeleteTake { .. } => "operator role is required to delete takes",
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match msg {
+        ControlMessage::ListTakes { scene_id } => {
+            let takes = server.list_takes(scene_id).await;
+            control
+                .send(&ControlMessage::TakeList { takes })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        ControlMessage::SelectTake { take_id } => match server.select_take(take_id).await {
+            Ok(selected) => {
+                control
+                    .send(&ControlMessage::TakeSelected {
+                        take_id: selected.take_id,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        },
+        ControlMessage::DeleteTake { take_id } => match server.delete_take(take_id).await {
+            Ok(()) => {
+                control
+                    .send(&ControlMessage::TakeDeleted { take_id })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        },
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_playback_control(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    take_id: Uuid,
+    action: PlaybackAction,
+    seek_ns: Option<u64>,
+    looping: bool,
+) -> Result<HandlerOutcome, ServerError> {
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(
+            control,
+            RejectCode::RoleDenied,
+            "operator role is required to control playback".into(),
+        )
+        .await
+        .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    let result = match action {
+        PlaybackAction::Play => server.playback_play(take_id, looping).await,
+        PlaybackAction::Pause => server.playback_pause(take_id).await,
+        PlaybackAction::Stop => server.playback_stop(take_id).await,
+        PlaybackAction::Seek => {
+            let seek = seek_ns.unwrap_or_default();
+            server.playback_seek(take_id, seek, looping).await
+        }
+    };
+    match result {
+        Ok((state, playhead_ns, looping)) => {
+            control
+                .send(&ControlMessage::PlaybackState {
+                    take_id,
+                    state,
+                    playhead_ns,
+                    looping,
+                })
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        Err(err) => {
+            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                .await
+                .is_err()
+            {
+                let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_bake_cursor(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    let reject_reason = match &msg {
+        ControlMessage::OpenTakeBakeCursor { .. } => {
+            "operator role is required to open bake cursors"
+        }
+        ControlMessage::ReadTakeBakeFrame { .. } => "operator role is required to read bake frames",
+        ControlMessage::SeekTakeBakeFrame { .. } => "operator role is required to seek bake frames",
+        ControlMessage::CloseTakeBakeCursor { .. } => {
+            "operator role is required to close bake cursors"
+        }
+        _ => unreachable!(),
+    };
+    if !client_hello.roles.contains(&ClientRole::Operator) {
+        if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match msg {
+        ControlMessage::OpenTakeBakeCursor {
+            take_id,
+            sampling_mode,
+        } => match server.open_take_bake_cursor(take_id, sampling_mode).await {
+            Ok((cursor_id, total_frames)) => {
+                control
+                    .send(&ControlMessage::TakeBakeCursorOpened {
+                        cursor_id,
+                        total_frames,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        },
+        ControlMessage::ReadTakeBakeFrame { cursor_id } => {
+            match server.read_take_bake_frame(cursor_id).await {
+                Ok(Some((frame_index, timestamp_ns, attributes))) => {
+                    control
+                        .send(&ControlMessage::TakeBakeFrame {
+                            cursor_id,
+                            frame_index,
+                            timestamp_ns,
+                            attributes,
+                        })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Ok(None) => {
+                    if send_protocol_error(
+                        control,
+                        RejectCode::ServerBusy,
+                        "bake cursor reached end of stream".into(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Err(err) => {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::SeekTakeBakeFrame {
+            cursor_id,
+            frame_index,
+        } => match server.seek_take_bake_frame(cursor_id, frame_index).await {
+            Ok(Some((resolved_index, timestamp_ns, attributes))) => {
+                control
+                    .send(&ControlMessage::TakeBakeFrame {
+                        cursor_id,
+                        frame_index: resolved_index,
+                        timestamp_ns,
+                        attributes,
+                    })
+                    .await
+                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
+            }
+            Ok(None) => {
+                if send_protocol_error(
+                    control,
+                    RejectCode::ServerBusy,
+                    "bake seek was out of range".into(),
+                )
+                .await
+                .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            Err(err) => {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        },
+        ControlMessage::CloseTakeBakeCursor { cursor_id } => {
+            match server.close_take_bake_cursor(cursor_id).await {
+                Ok(()) => {
+                    control
+                        .send(&ControlMessage::TakeBakeCursorClosed { cursor_id })
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+async fn handle_video_signaling(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    match msg {
+        ControlMessage::GetVideoStreamStatus => {
+            let status = server.video_stream_status().await;
+            control
+                .send(&ControlMessage::VideoStreamStatus(status))
+                .await
+                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+        }
+        ControlMessage::CreateVideoOffer {
+            stream_id,
+            track_id,
+        } => {
+            match server
+                .create_video_offer(client_hello.device_id, &stream_id, &track_id)
+                .await
+            {
+                Ok(offer) => {
+                    control
+                        .send(&ControlMessage::VideoOffer(offer))
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        ControlMessage::VideoSignal(signal) => {
+            if signal.from_device != client_hello.device_id {
+                if send_protocol_error(
+                    control,
+                    RejectCode::RoleDenied,
+                    "signal from_device does not match active session".into(),
+                )
+                .await
+                .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+                return Ok(ControlFlow::Continue(()));
+            }
+            if signal.to_device == client_hello.device_id {
+                match server
+                    .handle_video_signal(client_hello.device_id, signal.payload)
+                    .await
+                {
+                    Ok(Some(answer)) => {
+                        control
+                            .send(&ControlMessage::VideoOffer(answer))
+                            .await
+                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if send_protocol_error(
+                            control,
+                            map_server_error_to_reject(&err),
+                            err.to_string(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                }
+            } else if let Err(err) = server.push_signaling_message(signal).await {
+                if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+                    .await
+                    .is_err()
+                {
+                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        ControlMessage::DrainSignals => {
+            match server
+                .drain_signaling_messages(client_hello.device_id)
+                .await
+            {
+                Ok(messages) => {
+                    control
+                        .send(&ControlMessage::SignalsBatch(messages))
+                        .await
+                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                }
+                Err(err) => {
+                    if send_protocol_error(
+                        control,
+                        map_server_error_to_reject(&err),
+                        err.to_string(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 async fn handle_quic_peer(
     server: ServerHandle,
     peer: motionstage_transport_quic::QuicPeer,
@@ -1373,10 +2610,13 @@ async fn handle_quic_peer(
 
     server.scene_synced(client_hello.device_id).await?;
     server.activate(client_hello.device_id).await?;
+    let mut mode_updates = server.subscribe_mode_updates();
 
     loop {
         tokio::select! {
             ctrl = control.recv() => {
+                // Touch session activity on every control message (idle timeout 4.4).
+                server.touch_session_activity(client_hello.device_id).await;
                 match ctrl {
                     Ok(ControlMessage::Ping) => {
                         control.send(&ControlMessage::Pong).await.map_err(|err| ServerError::Runtime(err.to_string()))?;
@@ -1387,182 +2627,79 @@ async fn handle_quic_peer(
                             .map_err(|err| ServerError::Runtime(err.to_string()))?;
                     }
                     Ok(ControlMessage::Pong) => {}
-                    Ok(ControlMessage::SetMode(requested_mode)) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to change mode".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.set_mode(requested_mode).await {
-                            Ok(()) => {
-                                let active_mode = server.mode().await;
-                                control
-                                    .send(&ControlMessage::ModeState(active_mode))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(ControlMessage::ClientGoodbye { reason }) => {
+                        info!(
+                            device_id = %client_hello.device_id,
+                            reason = reason.as_deref().unwrap_or("none"),
+                            "client sent goodbye"
+                        );
+                        let _ = server.close_session_with_reason(client_hello.device_id, now_ns(), reason).await;
+                        break;
+                    }
+                    Ok(ControlMessage::SetDataFlow(state)) => {
+                        match handle_set_data_flow(&mut control, &server, &client_hello, state).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::ResetSceneToBaseline { scene_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to reset baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.reset_scene_to_baseline(scene_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::ResetScene,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(ControlMessage::SetRecording(state)) => {
+                        match handle_set_recording(&mut control, &server, &client_hello, state).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::CommitSceneBaseline { scene_id }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit scene baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.commit_scene_baseline(scene_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::CommitScene,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::ResetSceneToBaseline { .. }
+                        | ControlMessage::CommitSceneBaseline { .. }
+                        | ControlMessage::CommitObjectBaseline { .. })) => {
+                        match handle_baseline_control(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::CommitObjectBaseline {
-                        scene_id,
-                        object_id,
-                    }) => {
-                        if !client_hello.roles.contains(&ClientRole::Operator) {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "operator role is required to commit object baseline".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-                        match server.commit_object_baseline(scene_id, object_id).await {
-                            Ok(changed_attributes) => {
-                                control
-                                    .send(&ControlMessage::BaselineActionApplied {
-                                        action: BaselineAction::CommitObject,
-                                        changed_attributes,
-                                    })
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::ListTakes { .. }
+                        | ControlMessage::SelectTake { .. }
+                        | ControlMessage::DeleteTake { .. })) => {
+                        match handle_take_management(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::CreateVideoOffer { stream_id, track_id }) => {
-                        match server.create_video_offer(client_hello.device_id, &stream_id, &track_id).await {
-                            Ok(offer) => {
-                                control
-                                    .send(&ControlMessage::VideoOffer(offer))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(ControlMessage::PlaybackControl { take_id, action, seek_ns, looping }) => {
+                        match handle_playback_control(&mut control, &server, &client_hello, take_id, action, seek_ns, looping).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::VideoSignal(signal)) => {
-                        if signal.from_device != client_hello.device_id {
-                            if send_protocol_error(&mut control, RejectCode::RoleDenied, "signal from_device does not match active session".into()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
-                            continue;
-                        }
-
-                        if signal.to_device == client_hello.device_id {
-                            match server
-                                .handle_video_signal(client_hello.device_id, signal.payload)
-                                .await
-                            {
-                                Ok(Some(answer)) => {
-                                    control
-                                        .send(&ControlMessage::VideoOffer(answer))
-                                        .await
-                                        .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                        let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                        break;
-                                    }
-                                }
-                            }
-                        } else if let Err(err) = server.push_signaling_message(signal).await {
-                            if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                break;
-                            }
+                    Ok(msg @ (ControlMessage::OpenTakeBakeCursor { .. }
+                        | ControlMessage::ReadTakeBakeFrame { .. }
+                        | ControlMessage::SeekTakeBakeFrame { .. }
+                        | ControlMessage::CloseTakeBakeCursor { .. })) => {
+                        match handle_bake_cursor(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::DrainSignals) => {
-                        match server.drain_signaling_messages(client_hello.device_id).await {
-                            Ok(messages) => {
-                                control
-                                    .send(&ControlMessage::SignalsBatch(messages))
-                                    .await
-                                    .map_err(|err| ServerError::Runtime(err.to_string()))?;
-                            }
-                            Err(err) => {
-                                if send_protocol_error(&mut control, map_server_error_to_reject(&err), err.to_string()).await.is_err() {
-                                    let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                                    break;
-                                }
-                            }
+                    Ok(msg @ (ControlMessage::CreateVideoOffer { .. }
+                        | ControlMessage::GetVideoStreamStatus
+                        | ControlMessage::VideoSignal(_)
+                        | ControlMessage::DrainSignals)) => {
+                        match handle_video_signaling(&mut control, &server, &client_hello, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
                         }
                     }
                     Ok(ControlMessage::SignalsBatch(_))
                     | Ok(ControlMessage::VideoOffer(_))
+                    | Ok(ControlMessage::VideoStreamStatus(_))
                     | Ok(ControlMessage::ModeState(_))
                     | Ok(ControlMessage::BaselineActionApplied { .. })
+                    | Ok(ControlMessage::TakeList { .. })
+                    | Ok(ControlMessage::TakeSelected { .. })
+                    | Ok(ControlMessage::PlaybackState { .. })
+                    | Ok(ControlMessage::TakeDeleted { .. })
+                    | Ok(ControlMessage::TakeBakeCursorOpened { .. })
+                    | Ok(ControlMessage::TakeBakeFrame { .. })
+                    | Ok(ControlMessage::TakeBakeCursorClosed { .. })
                     | Ok(ControlMessage::Error { .. })
                     | Ok(ControlMessage::ServerHello(_))
                     | Ok(ControlMessage::ClientHello(_))
@@ -1582,6 +2719,8 @@ async fn handle_quic_peer(
                 }
             }
             datagram = peer.recv_motion_datagram() => {
+                // Touch session activity on motion datagrams (idle timeout 4.4).
+                server.touch_session_activity(client_hello.device_id).await;
                 match datagram {
                     Ok(frame) => {
                         if let Err(err) = server.ingest_motion_datagram(frame).await {
@@ -1591,6 +2730,22 @@ async fn handle_quic_peer(
                     Err(_) => {
                         warn!(device_id = %client_hello.device_id, "motion datagram channel closed; ending session");
                         let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                        break;
+                    }
+                }
+            }
+            mode_update = mode_updates.recv() => {
+                match mode_update {
+                    Ok(active_mode) => {
+                        if control.send(&ControlMessage::ModeState(active_mode)).await.is_err() {
+                            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
                         break;
                     }
                 }
@@ -1618,29 +2773,88 @@ fn map_server_error_to_reject(err: &ServerError) -> RejectCode {
         ServerError::SessionNotFound(_) => RejectCode::RoleDenied,
         ServerError::RegisterRejected(rejected) => rejected.code,
         ServerError::Video(_) | ServerError::Signaling(_) => RejectCode::RoleDenied,
-        ServerError::Core(_) | ServerError::Recording(_) | ServerError::WebRtc(_) => {
-            RejectCode::ServerBusy
-        }
+        ServerError::Core(_)
+        | ServerError::Recording(_)
+        | ServerError::WebRtc(_)
+        | ServerError::Take(_) => RejectCode::ServerBusy,
         ServerError::Discovery(_) | ServerError::Runtime(_) => RejectCode::ServerBusy,
     }
 }
 
-fn source_output_matches(mapping_output: &str, device_id: Uuid, update_output: &str) -> bool {
-    if mapping_output == update_output {
-        return true;
-    }
-    let prefix = format!("{device_id}.");
-    if let Some(stripped) = mapping_output.strip_prefix(&prefix) {
-        if stripped == update_output {
-            return true;
+fn take_bake_total_frames(recording: &RecordingFile, sampling_mode: SamplingMode) -> u64 {
+    match sampling_mode {
+        SamplingMode::Captured => recording.frames.len() as u64,
+        SamplingMode::FixedFps { fps } => {
+            if fps == 0 || recording.frames.is_empty() {
+                return 0;
+            }
+            let duration = ServerState::playback_duration_ns(recording);
+            let step_ns = (1_000_000_000_u64 / fps as u64).max(1);
+            if duration == 0 {
+                1
+            } else {
+                duration / step_ns + 1
+            }
         }
     }
-    if let Some(stripped) = update_output.strip_prefix(&prefix) {
-        if mapping_output == stripped {
-            return true;
+}
+
+fn take_bake_frame_for_index(
+    cursor: &TakeBakeCursor,
+    frame_index: u64,
+) -> Option<(u64, Vec<TakeBakeAttribute>)> {
+    if frame_index >= cursor.total_frames {
+        return None;
+    }
+    match cursor.sampling_mode {
+        SamplingMode::Captured => {
+            let frame = cursor.recording.frames.get(frame_index as usize)?;
+            Some((
+                frame.timestamp_ns,
+                frame
+                    .attributes
+                    .iter()
+                    .cloned()
+                    .map(recorded_to_bake_attribute)
+                    .collect(),
+            ))
+        }
+        SamplingMode::FixedFps { fps } => {
+            if fps == 0 || cursor.recording.frames.is_empty() {
+                return None;
+            }
+            let step_ns = (1_000_000_000_u64 / fps as u64).max(1);
+            let playhead_ns = frame_index.saturating_mul(step_ns);
+            let frame = ServerState::frame_for_playhead(&cursor.recording, playhead_ns)?;
+            Some((
+                frame.timestamp_ns,
+                frame
+                    .attributes
+                    .into_iter()
+                    .map(recorded_to_bake_attribute)
+                    .collect(),
+            ))
         }
     }
-    false
+}
+
+fn recorded_to_bake_attribute(recorded: RecordedAttribute) -> TakeBakeAttribute {
+    TakeBakeAttribute {
+        object_id: recorded.object_id,
+        attribute: recorded.attribute,
+        value: match recorded.value {
+            AttributeValue::Bool(v) => BakeAttributeValue::Bool(v),
+            AttributeValue::Int32(v) => BakeAttributeValue::Int32(v),
+            AttributeValue::Float32(v) => BakeAttributeValue::Float32(v),
+            AttributeValue::Float64(v) => BakeAttributeValue::Float64(v),
+            AttributeValue::Vec2f(v) => BakeAttributeValue::Vec2f(v),
+            AttributeValue::Vec3f(v) => BakeAttributeValue::Vec3f(v),
+            AttributeValue::Vec4f(v) => BakeAttributeValue::Vec4f(v),
+            AttributeValue::Quatf(v) => BakeAttributeValue::Quatf(v),
+            AttributeValue::Mat4f(v) => BakeAttributeValue::Mat4f(v),
+            AttributeValue::Trigger(v) => BakeAttributeValue::Trigger(v),
+        },
+    }
 }
 
 fn now_ns() -> u64 {
@@ -1653,10 +2867,22 @@ fn now_ns() -> u64 {
 
 fn advertised_host_for(addr: SocketAddr) -> String {
     if addr.ip().is_unspecified() {
-        "127.0.0.1".into()
+        local_lan_ip().unwrap_or_else(|| "127.0.0.1".into())
     } else {
         addr.ip().to_string()
     }
+}
+
+/// Resolve the primary LAN-facing IP by asking the OS which interface would
+/// route to an external address.  No traffic is actually sent.
+fn local_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    if local_addr.ip().is_loopback() || local_addr.ip().is_unspecified() {
+        return None;
+    }
+    Some(local_addr.ip().to_string())
 }
 
 #[derive(Debug, Error)]
@@ -1671,6 +2897,8 @@ pub enum ServerError {
     RegisterRejected(RegisterRejected),
     #[error("recording error: {0}")]
     Recording(String),
+    #[error("take error: {0}")]
+    Take(String),
     #[error("video error: {0}")]
     Video(String),
     #[error("webrtc error: {0}")]
@@ -1685,20 +2913,22 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, time::Duration};
 
     use motionstage_core::{
         AttributeUpdate, AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject,
     };
     use motionstage_media::{
         ColorPrimaries, DynamicRange, IceCandidate, SdpMessage, SdpType, SignalMessage,
-        SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoStreamDescriptor,
+        SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoCodec,
+        VideoStreamDescriptor,
     };
     use motionstage_protocol::{
-        BaselineAction, ClientHello, ClientRole, ControlMessage, Feature, Mode, RegisterRequest,
-        RejectCode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole,
+        ControlMessage, DataFlowState, Feature, Mode, RecordingState, RegisterRequest, RejectCode,
+        SamplingMode, SessionState, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
 
     use crate::{SecurityMode, ServerConfig, ServerError, ServerHandle};
@@ -1732,7 +2962,10 @@ mod tests {
                 roles: vec![role],
                 features: vec![feature],
                 advertised_attributes: if role == ClientRole::MotionSource {
-                    vec!["pose_pos".into()]
+                    vec![AttributeDescriptor {
+                        path: "pose_pos".into(),
+                        value_type: AttributeKind::Vec3f,
+                    }]
                 } else {
                     Vec::new()
                 },
@@ -1769,7 +3002,10 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -1799,7 +3035,10 @@ mod tests {
                 device_name: "ipad".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -1835,7 +3074,10 @@ mod tests {
                     device_name: "ipad".into(),
                     roles: vec![ClientRole::MotionSource],
                     features: vec![Feature::Motion],
-                    advertised_attributes: vec!["pose_pos".into()],
+                    advertised_attributes: vec![AttributeDescriptor {
+                        path: "pose_pos".into(),
+                        value_type: AttributeKind::Vec3f,
+                    }],
                 })
                 .await
                 .unwrap();
@@ -1929,7 +3171,10 @@ mod tests {
         assert!(recording.markers.iter().any(|marker| matches!(
             marker,
             RecordingMarker::ModeTransition {
-                to: Mode::Recording,
+                to: Mode {
+                    recording: RecordingState::Recording,
+                    ..
+                },
                 ..
             }
         )));
@@ -1958,7 +3203,10 @@ mod tests {
                 device_name: "controller".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap();
@@ -1991,6 +3239,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2001,6 +3250,7 @@ mod tests {
                 max_width: 1920,
                 max_height: 1080,
                 max_fps: 24,
+                supported_codecs: vec![VideoCodec::H264],
             })
             .await
             .unwrap();
@@ -2023,6 +3273,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2078,6 +3329,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2184,7 +3436,10 @@ mod tests {
                     roles: vec![role],
                     features: vec![feature],
                     advertised_attributes: if role == ClientRole::MotionSource {
-                        vec!["pose_pos".into()]
+                        vec![AttributeDescriptor {
+                            path: "pose_pos".into(),
+                            value_type: AttributeKind::Vec3f,
+                        }]
                     } else {
                         Vec::new()
                     },
@@ -2266,7 +3521,10 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             })
             .await
             .unwrap_err();
@@ -2309,6 +3567,7 @@ mod tests {
                 color_primaries: ColorPrimaries::Bt2020,
                 transfer: TransferFunction::Pq,
                 bit_depth: 10,
+                codec: VideoCodec::Vp9,
             })
             .await
             .unwrap();
@@ -2343,7 +3602,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_role_can_set_mode_over_control() {
+    async fn quic_control_can_query_video_stream_status() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+        let device_id = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::VideoSink,
+            Feature::Video,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::GetVideoStreamStatus)
+            .await
+            .unwrap();
+        let initial = control.recv().await.unwrap();
+        match initial {
+            ControlMessage::VideoStreamStatus(status) => {
+                assert!(!status.available);
+                assert!(!status.descriptor_set);
+                assert_eq!(status.peer_count, 0);
+                assert_eq!(status.last_frame_age_ms, None);
+            }
+            other => panic!("expected VideoStreamStatus response, got {other:?}"),
+        }
+
+        server
+            .set_master_video_descriptor(VideoStreamDescriptor {
+                width: 1920,
+                height: 1080,
+                fps: 24,
+                dynamic_range: DynamicRange::Hdr10,
+                color_primaries: ColorPrimaries::Bt2020,
+                transfer: TransferFunction::Pq,
+                bit_depth: 10,
+                codec: VideoCodec::Vp9,
+            })
+            .await
+            .unwrap();
+        server
+            .push_video_frame(bytes::Bytes::from_static(b"frame"), Duration::from_millis(33))
+            .await
+            .unwrap();
+
+        control
+            .send(&ControlMessage::GetVideoStreamStatus)
+            .await
+            .unwrap();
+        let active = control.recv().await.unwrap();
+        match active {
+            ControlMessage::VideoStreamStatus(status) => {
+                assert!(status.available);
+                assert!(status.descriptor_set);
+                assert_eq!(status.peer_count, 0);
+                assert!(status.last_frame_age_ms.is_some());
+            }
+            other => panic!("expected VideoStreamStatus response, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_role_can_set_data_flow_over_control() {
         let device_id = Uuid::now_v7();
         let mut config = ServerConfig::default();
         config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
@@ -2360,11 +3685,11 @@ mod tests {
         .await;
 
         control
-            .send(&ControlMessage::SetMode(Mode::Live))
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
         match control.recv().await.unwrap() {
-            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
 
@@ -2373,7 +3698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_role_can_set_mode_without_allowlist() {
+    async fn operator_role_can_set_data_flow_without_allowlist() {
         let mut config = ServerConfig::default();
         config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
         config.enable_discovery = false;
@@ -2390,13 +3715,56 @@ mod tests {
         .await;
 
         control
-            .send(&ControlMessage::SetMode(Mode::Live))
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
         match control.recv().await.unwrap() {
-            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::Live),
+            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
             other => panic!("expected ModeState, got {other:?}"),
         }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_change_is_broadcast_to_other_active_clients() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer_a, mut control_a) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+        let (_peer_b, mut control_b) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control_b
+            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
+            .await
+            .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), control_b.recv())
+            .await
+            .expect("requesting client should get mode ack")
+            .unwrap();
+        assert!(matches!(ack, ControlMessage::ModeState(Mode::LIVE)));
+
+        let pushed = tokio::time::timeout(Duration::from_secs(1), control_a.recv())
+            .await
+            .expect("other active client should get mode broadcast")
+            .unwrap();
+        assert!(matches!(pushed, ControlMessage::ModeState(Mode::LIVE)));
 
         runtime.shutdown().await.unwrap();
     }
@@ -2581,7 +3949,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.set_mode(Mode::Live).await.unwrap();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
 
         let runtime = server.start_quic_runtime().await.unwrap();
         let client = QuicClient::new_insecure_for_local_dev().unwrap();
@@ -2601,7 +3969,10 @@ mod tests {
                 device_name: "peer".into(),
                 roles: vec![ClientRole::MotionSource],
                 features: vec![Feature::Motion],
-                advertised_attributes: vec!["pose_pos".into()],
+                advertised_attributes: vec![AttributeDescriptor {
+                    path: "pose_pos".into(),
+                    value_type: AttributeKind::Vec3f,
+                }],
             }))
             .await
             .unwrap();
@@ -2661,7 +4032,7 @@ mod tests {
             )
             .await
             .unwrap();
-        server.set_mode(Mode::Live).await.unwrap();
+        server.set_data_flow(DataFlowState::Live).await.unwrap();
 
         server
             .ingest_motion_datagram(MotionDatagram {
@@ -2755,5 +4126,209 @@ mod tests {
             recording.frames[0].attributes[0].value,
             AttributeValue::Vec3f([11.0, 22.0, 33.0])
         );
+    }
+
+    #[tokio::test]
+    async fn stop_recording_registers_take_in_catalog() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+
+        let takes = server.list_takes(None).await;
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].take_id, manifest.recording_id);
+        assert_eq!(takes[0].scene_id, scene_id);
+        assert_eq!(takes[0].frame_count, 1);
+        assert!(takes[0].selected);
+    }
+
+    #[tokio::test]
+    async fn playback_mode_blocks_ingest_and_supports_bake_cursor() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+
+        let _ = server
+            .playback_play(manifest.recording_id, false)
+            .await
+            .unwrap();
+        assert_eq!(server.mode().await, Mode::PLAYBACK);
+
+        let before = server.runtime_snapshot().await;
+        let before_value = before
+            .scenes
+            .get(&scene_id)
+            .and_then(|scene| scene.objects.get(&object_id))
+            .and_then(|object| object.attributes.get("position"))
+            .map(|attr| attr.current_value.clone())
+            .unwrap();
+
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([9.0, 9.0, 9.0]),
+                }],
+                200,
+            )
+            .await
+            .unwrap();
+        let after = server.runtime_snapshot().await;
+        let after_value = after
+            .scenes
+            .get(&scene_id)
+            .and_then(|scene| scene.objects.get(&object_id))
+            .and_then(|object| object.attributes.get("position"))
+            .map(|attr| attr.current_value.clone())
+            .unwrap();
+        assert_eq!(before_value, after_value);
+
+        let (cursor_id, total_frames) = server
+            .open_take_bake_cursor(manifest.recording_id, SamplingMode::Captured)
+            .await
+            .unwrap();
+        assert!(total_frames >= 1);
+        let first = server.read_take_bake_frame(cursor_id).await.unwrap();
+        assert!(first.is_some());
+        server.close_take_bake_cursor(cursor_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_take_purges_recording_file_and_catalog_entry() {
+        let temp = tempdir().unwrap();
+        let recording_path = temp.path().join("take-001.cmtrk");
+        let catalog_path = temp.path().join("takes.json");
+
+        let mut config = ServerConfig::default();
+        config.take_catalog_path = catalog_path;
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        server.load_scene(scene).await;
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        server.start_recording(&recording_path, 101).await.unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([1.0, 2.0, 3.0]),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        let manifest = server.stop_recording().await.unwrap();
+        assert!(recording_path.exists());
+
+        server.delete_take(manifest.recording_id).await.unwrap();
+        assert!(!recording_path.exists());
+        assert!(server.list_takes(None).await.is_empty());
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 serde.workspace = true
+bytes.workspace = true
 motionstage-media.workspace = true
 webrtc.workspace = true
 

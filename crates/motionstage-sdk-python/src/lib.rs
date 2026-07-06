@@ -1,40 +1,96 @@
+#![allow(
+    clippy::useless_conversion,
+    clippy::type_complexity,
+    clippy::needless_borrow
+)]
+
 use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject};
-use motionstage_protocol::{ClientRole, Feature, Mode};
+use motionstage_protocol::{
+    BakeAttributeValue, ClientRole, DataFlowState, Feature, Mode, PlaybackRuntimeState,
+    RecordingState, SamplingMode,
+};
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyDeprecationWarning, PyRuntimeError, PyValueError},
     prelude::*,
     types::{PyAny, PyDict},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// Set `MOTIONSTAGE_DEBUG_H264=1` to dump H.264 to the default path, or
+/// `MOTIONSTAGE_DEBUG_H264=/path/to/file.h264` for a custom path (supports FIFOs).
+const DEBUG_H264_DEFAULT_PATH: &str = "/tmp/motionstage_debug.h264";
 
 #[pyclass(name = "MotionStageServer")]
 pub struct PyMotionStageServer {
     server: ServerHandle,
     rt: tokio::runtime::Runtime,
+    encoder: Arc<std::sync::Mutex<Option<motionstage_media::encoder::H264Encoder>>>,
+    video_fps: std::sync::atomic::AtomicU32,
+    // Single-flight gate for the off-thread video encode+push pipeline.
+    video_encode_inflight: Arc<AtomicBool>,
+    debug_h264_path: Option<String>,
+    // Companion UI listener, lazily started on first request and held alive here.
+    companion_ui: std::sync::Mutex<Option<motionstage_server::companion_ui::CompanionUiHandle>>,
 }
 
 #[pymethods]
 impl PyMotionStageServer {
     #[new]
-    #[pyo3(signature = (name=None))]
-    pub fn new(name: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (name=None, discoverable=true, bind_addr=None))]
+    pub fn new(
+        name: Option<String>,
+        discoverable: bool,
+        bind_addr: Option<String>,
+    ) -> PyResult<Self> {
         let mut config = ServerConfig::default();
         if let Some(name) = name {
             config.name = name;
         }
-        config.quic_bind_addr = "127.0.0.1:0".parse().expect("static address parses");
-        config.enable_discovery = false;
+        let addr = bind_addr.as_deref().unwrap_or("0.0.0.0:0");
+        config.quic_bind_addr = addr.parse().map_err(|err| {
+            PyValueError::new_err(format!("invalid bind address `{addr}`: {err}"))
+        })?;
+        config.enable_discovery = discoverable;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
+        let debug_h264_path = std::env::var("MOTIONSTAGE_DEBUG_H264").ok().and_then(|v| {
+            if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") {
+                return None;
+            }
+            let path = if v == "1" || v.eq_ignore_ascii_case("true") {
+                DEBUG_H264_DEFAULT_PATH.to_string()
+            } else {
+                v
+            };
+            // Only truncate regular files (not FIFOs/pipes)
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.file_type().is_file() {
+                    let _ = std::fs::write(&path, b"");
+                }
+            } else {
+                // File doesn't exist — create it
+                let _ = std::fs::write(&path, b"");
+            }
+            eprintln!("MOTIONSTAGE_DEBUG_H264: streaming to {path}");
+            Some(path)
+        });
+
         Ok(Self {
             server: ServerHandle::new(config),
             rt,
+            encoder: Arc::new(std::sync::Mutex::new(None)),
+            video_fps: std::sync::atomic::AtomicU32::new(24),
+            video_encode_inflight: Arc::new(AtomicBool::new(false)),
+            debug_h264_path,
+            companion_ui: std::sync::Mutex::new(None),
         })
     }
 
@@ -50,6 +106,108 @@ impl PyMotionStageServer {
         self.rt
             .block_on(self.server.stop())
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    /// Start the companion-UI listener (idempotent) and return its bound port.
+    ///
+    /// Lazily spawns one axum HTTP+WebSocket listener on this server's Tokio
+    /// runtime, holding a clone of the `ServerHandle`. Repeated calls return the
+    /// already-bound port without binding twice.
+    pub fn start_companion_ui(&self) -> PyResult<u16> {
+        let mut slot = self
+            .companion_ui
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        if let Some(handle) = slot.as_ref() {
+            return Ok(handle.port());
+        }
+        let token = Some(Uuid::new_v4().to_string());
+        let handle = self
+            .rt
+            .block_on(motionstage_server::companion_ui::serve_companion_ui(
+                self.server.clone(),
+                token,
+            ))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let port = handle.port();
+        *slot = Some(handle);
+        Ok(port)
+    }
+
+    /// The auth token required on the companion-UI `/ws` upgrade (carried in the
+    /// launch URL). Returns `None` if the UI has not been started.
+    pub fn companion_ui_token(&self) -> PyResult<Option<String>> {
+        let slot = self
+            .companion_ui
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(slot.as_ref().and_then(|h| h.auth_token.clone()))
+    }
+
+    /// Gracefully stop the companion-UI listener if running.
+    pub fn stop_companion_ui(&self) -> PyResult<()> {
+        let handle = {
+            let mut slot = self
+                .companion_ui
+                .lock()
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            slot.take()
+        };
+        if let Some(handle) = handle {
+            self.rt
+                .block_on(handle.shutdown())
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Drain DCC-side actions the companion UI requested, for the plugin to execute
+    /// on its main thread. Returns a list of dicts, each with a `kind` discriminator.
+    pub fn drain_host_requests<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        use motionstage_server::HostRequest;
+        let requests = self.rt.block_on(self.server.drain_host_requests());
+        let mut out = Vec::with_capacity(requests.len());
+        for req in requests {
+            let d = PyDict::new_bound(py);
+            match req {
+                HostRequest::ResyncScene => {
+                    d.set_item("kind", "resync_scene")?;
+                }
+                HostRequest::StartVideo {
+                    width,
+                    height,
+                    fps,
+                    source,
+                } => {
+                    d.set_item("kind", "start_video")?;
+                    d.set_item("width", width)?;
+                    d.set_item("height", height)?;
+                    d.set_item("fps", fps)?;
+                    d.set_item("source", source)?;
+                }
+                HostRequest::StopVideo => {
+                    d.set_item("kind", "stop_video")?;
+                }
+                HostRequest::BakeTake {
+                    take_id,
+                    fps,
+                    start_frame,
+                } => {
+                    d.set_item("kind", "bake_take")?;
+                    d.set_item("take_id", take_id.to_string())?;
+                    d.set_item("fps", fps)?;
+                    d.set_item("start_frame", start_frame)?;
+                }
+            }
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Report the object names selected in the host DCC, for companion-UI highlight.
+    pub fn set_host_selection(&self, names: Vec<String>) -> PyResult<()> {
+        self.rt.block_on(self.server.set_host_selection(names));
+        Ok(())
     }
 
     pub fn upsert_scene(&self, spec: &Bound<'_, PyDict>) -> PyResult<String> {
@@ -68,13 +226,13 @@ impl PyMotionStageServer {
 
     pub fn set_live_mode(&self) -> PyResult<()> {
         self.rt
-            .block_on(self.server.set_mode(Mode::Live))
+            .block_on(self.server.set_mode(Mode::LIVE))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
     pub fn set_stopped_mode(&self) -> PyResult<()> {
         self.rt
-            .block_on(self.server.set_mode(Mode::Idle))
+            .block_on(self.server.set_mode(Mode::IDLE))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
@@ -137,6 +295,194 @@ impl PyMotionStageServer {
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
+    #[pyo3(signature = (scene_id=None))]
+    pub fn list_takes(
+        &self,
+        scene_id: Option<String>,
+    ) -> PyResult<Vec<(String, String, String, String, u64, u64, bool, bool)>> {
+        let parsed_scene = parse_optional_uuid(scene_id)?;
+        let takes = self.rt.block_on(self.server.list_takes(parsed_scene));
+        Ok(takes
+            .into_iter()
+            .map(|take| {
+                (
+                    take.take_id.to_string(),
+                    take.scene_id.to_string(),
+                    take.name,
+                    take.path,
+                    take.created_ns,
+                    take.frame_count,
+                    take.selected,
+                    take.deleted,
+                )
+            })
+            .collect())
+    }
+
+    pub fn select_take(&self, take_id: String) -> PyResult<String> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let selected = self
+            .rt
+            .block_on(self.server.select_take(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(selected.take_id.to_string())
+    }
+
+    #[pyo3(signature = (take_id, looping=false))]
+    pub fn playback_play(&self, take_id: String, looping: bool) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_play(take_id, looping))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn playback_pause(&self, take_id: String) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) =
+            self.rt
+                .block_on(self.server.playback_pause(take_id))
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    #[pyo3(signature = (take_id, seek_ns, looping=false))]
+    pub fn playback_seek(
+        &self,
+        take_id: String,
+        seek_ns: u64,
+        looping: bool,
+    ) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_seek(take_id, seek_ns, looping))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn playback_stop(&self, take_id: String) -> PyResult<(String, u64, bool)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (state, playhead_ns, looping) = self
+            .rt
+            .block_on(self.server.playback_stop(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((
+            playback_state_to_str(state).to_owned(),
+            playhead_ns,
+            looping,
+        ))
+    }
+
+    pub fn delete_take(&self, take_id: String) -> PyResult<()> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.rt
+            .block_on(self.server.delete_take(take_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    #[pyo3(signature = (take_id, sampling_mode=None))]
+    pub fn open_take_bake_cursor(
+        &self,
+        take_id: String,
+        sampling_mode: Option<String>,
+    ) -> PyResult<(String, u64)> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let sampling_mode = parse_sampling_mode(sampling_mode.as_deref().unwrap_or("captured"))?;
+        let (cursor_id, total_frames) = self
+            .rt
+            .block_on(self.server.open_take_bake_cursor(take_id, sampling_mode))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok((cursor_id.to_string(), total_frames))
+    }
+
+    pub fn read_take_bake_frame(
+        &self,
+        py: Python<'_>,
+        cursor_id: String,
+    ) -> PyResult<Option<(u64, u64, Vec<(String, String, PyObject)>)>> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let frame = self
+            .rt
+            .block_on(self.server.read_take_bake_frame(cursor_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(frame.map(|(frame_index, timestamp_ns, attributes)| {
+            (
+                frame_index,
+                timestamp_ns,
+                attributes
+                    .into_iter()
+                    .map(|attr| {
+                        (
+                            attr.object_id.to_string(),
+                            attr.attribute,
+                            bake_attribute_value_to_py(py, &attr.value),
+                        )
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    pub fn seek_take_bake_frame(
+        &self,
+        py: Python<'_>,
+        cursor_id: String,
+        frame_index: u64,
+    ) -> PyResult<Option<(u64, u64, Vec<(String, String, PyObject)>)>> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let frame = self
+            .rt
+            .block_on(self.server.seek_take_bake_frame(cursor_id, frame_index))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(frame.map(|(resolved_index, timestamp_ns, attributes)| {
+            (
+                resolved_index,
+                timestamp_ns,
+                attributes
+                    .into_iter()
+                    .map(|attr| {
+                        (
+                            attr.object_id.to_string(),
+                            attr.attribute,
+                            bake_attribute_value_to_py(py, &attr.value),
+                        )
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    pub fn close_take_bake_cursor(&self, cursor_id: String) -> PyResult<()> {
+        let cursor_id = Uuid::parse_str(cursor_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.rt
+            .block_on(self.server.close_take_bake_cursor(cursor_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
     pub fn sessions(
         &self,
     ) -> PyResult<
@@ -170,7 +516,11 @@ impl PyMotionStageServer {
                         .map(feature_to_str)
                         .map(str::to_owned)
                         .collect(),
-                    session.advertised_attributes,
+                    session
+                        .advertised_attributes
+                        .into_iter()
+                        .map(|ad| ad.path)
+                        .collect(),
                     format!("{:?}", session.state),
                 )
             })
@@ -178,9 +528,12 @@ impl PyMotionStageServer {
     }
 
     pub fn create_mapping(&self, request: &Bound<'_, PyDict>) -> PyResult<String> {
-        let source_device = parse_uuid_from_request_item(request, "source_device")?;
-        let source_output = extract_request_string(request, "source_output")?;
-        let target_attribute = extract_request_string(request, "target_attribute")?;
+        let source_device = parse_uuid_from_request_item(request, "source_device")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let source_output = extract_request_string(request, "source_output")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let target_attribute = extract_request_string(request, "target_attribute")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
         let component_mask = match request.get_item("component_mask") {
             Ok(Some(raw)) if !raw.is_none() => Some(
                 raw.extract::<Vec<usize>>()
@@ -201,7 +554,8 @@ impl PyMotionStageServer {
             .get(&target_scene)
             .ok_or_else(|| PyRuntimeError::new_err(format!("scene not found: {target_scene}")))?;
 
-        let target_object = parse_uuid_from_request_item(request, "target_object_id")?;
+        let target_object = parse_uuid_from_request_item(request, "target_object_id")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
         if !scene.objects.contains_key(&target_object) {
             return Err(PyRuntimeError::new_err(format!(
                 "target object id not found in scene: {target_object}"
@@ -288,6 +642,166 @@ impl PyMotionStageServer {
         }
         Ok(rows)
     }
+
+    // --- Video ---
+
+    pub fn set_master_video_descriptor(&self, width: u32, height: u32, fps: u32) -> PyResult<()> {
+        use motionstage_media::{
+            ColorPrimaries, DynamicRange, TransferFunction, VideoCodec, VideoStreamDescriptor,
+        };
+
+        let descriptor = VideoStreamDescriptor {
+            width,
+            height,
+            fps,
+            dynamic_range: DynamicRange::Sdr,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            bit_depth: 8,
+            codec: VideoCodec::H264,
+        };
+
+        self.rt
+            .block_on(self.server.set_master_video_descriptor(descriptor))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        // (Re)create the encoder to match the descriptor
+        // Scale bitrate by pixel-rate to avoid heavy macroblocking at higher resolutions.
+        // ~0.08 bits/pixel at target fps, clamped to a practical realtime range.
+        let target_bitrate_bps = ((width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(fps as u64)
+            .saturating_mul(8)
+            / 100)
+            .clamp(1_500_000, 12_000_000) as u32;
+
+        let encoder = motionstage_media::encoder::H264Encoder::new(
+            width,
+            height,
+            fps as f32,
+            target_bitrate_bps,
+        )
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+        *self
+            .encoder
+            .lock()
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))? = Some(encoder);
+
+        self.video_fps
+            .store(fps, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Accept raw RGBA bytes from Python and stream them to all WebRTC peers.
+    ///
+    /// Returns immediately. The CPU-bound H.264 encode and the network push run
+    /// on the Tokio runtime, NOT on the calling thread. In Blender this call
+    /// happens on the main draw thread, so doing encode+push inline used to
+    /// freeze the viewport and hold the GIL (starving the SDK event poller).
+    /// Frames that arrive while an encode+push is still in flight are dropped
+    /// (conflation: live feedback wants the freshest frame, never a backlog).
+    pub fn push_video_frame(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
+        self.enqueue_video_frame(data, timestamp_ns, false)
+    }
+
+    /// Accept raw BGRA bytes from Python and stream them to all WebRTC peers.
+    /// Same off-thread, single-flight behavior as [`Self::push_video_frame`].
+    pub fn push_video_frame_bgra(&self, data: &[u8], timestamp_ns: u64) -> PyResult<()> {
+        self.enqueue_video_frame(data, timestamp_ns, true)
+    }
+
+    pub fn video_peer_count(&self) -> PyResult<u32> {
+        Ok(self.rt.block_on(self.server.video_peer_count()))
+    }
+}
+
+impl PyMotionStageServer {
+    /// Hand a captured frame to the Tokio runtime for encode + WebRTC push,
+    /// returning immediately so the caller's thread (Blender's main draw thread)
+    /// is never blocked on encoding or network I/O.
+    fn enqueue_video_frame(&self, data: &[u8], _timestamp_ns: u64, bgra: bool) -> PyResult<()> {
+        // Single-flight gate: if an encode+push is still running, drop this
+        // frame rather than queueing. Live feedback wants the newest frame, and
+        // an unbounded queue would grow memory and add latency under backpressure.
+        if self
+            .video_encode_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        // Copy the borrowed pixel buffer so the spawned task can own it.
+        let frame = data.to_vec();
+        let fps = self.video_fps.load(Ordering::Relaxed).max(1);
+        let duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+
+        let server = self.server.clone();
+        let encoder = Arc::clone(&self.encoder);
+        let inflight = Arc::clone(&self.video_encode_inflight);
+        let debug_path = self.debug_h264_path.clone();
+
+        self.rt.spawn(async move {
+            // Release the single-flight gate however this task exits.
+            struct InflightGuard(Arc<AtomicBool>);
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _gate = InflightGuard(inflight);
+
+            // Force an IDR for any newly-joined peer so it can start decoding.
+            let needs_keyframe = server.take_keyframe_needed().await;
+
+            let encoded = {
+                let mut guard = match encoder.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let encoder = match guard.as_mut() {
+                    Some(encoder) => encoder,
+                    None => return, // set_master_video_descriptor not called yet
+                };
+                if needs_keyframe {
+                    encoder.force_keyframe();
+                }
+                let result = if bgra {
+                    encoder.encode_bgra(&frame)
+                } else {
+                    encoder.encode_rgba(&frame)
+                };
+                match result {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        eprintln!("motionstage: video encode failed: {err}");
+                        return;
+                    }
+                }
+                // encoder lock released here, before the network push
+            };
+
+            if let Some(path) = debug_path.as_deref() {
+                dump_h264_to(path, &encoded);
+            }
+
+            if let Err(err) = server.push_video_frame(encoded, duration).await {
+                eprintln!("motionstage: video push failed: {err}");
+            }
+        });
+
+        Ok(())
+    }
+}
+
+/// Append encoded H.264 bytes to the debug dump file/pipe (if enabled).
+fn dump_h264_to(path: &str, encoded: &[u8]) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = f.write_all(encoded);
+    }
 }
 
 #[pymodule]
@@ -305,11 +819,12 @@ fn now_ns() -> u64 {
 
 fn parse_mode(value: &str) -> PyResult<Mode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "idle" | "stopped" | "stop" => Ok(Mode::Idle),
-        "live" => Ok(Mode::Live),
-        "recording" | "record" => Ok(Mode::Recording),
+        "idle" | "stopped" | "stop" => Ok(Mode::IDLE),
+        "live" => Ok(Mode::LIVE),
+        "recording" | "record" => Ok(Mode::RECORDING),
+        "playback" | "play" => Ok(Mode::PLAYBACK),
         other => Err(PyValueError::new_err(format!(
-            "unsupported mode `{other}` (expected idle/live/recording)"
+            "unsupported mode `{other}` (expected idle/live/recording/playback)"
         ))),
     }
 }
@@ -331,10 +846,14 @@ fn parse_optional_uuid(value: Option<String>) -> PyResult<Option<Uuid>> {
 }
 
 fn mode_to_str(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Idle => "idle",
-        Mode::Live => "live",
-        Mode::Recording => "recording",
+    use DataFlowState::*;
+    use RecordingState::*;
+    match (mode.data_flow, mode.recording) {
+        (Idle, Inactive) => "idle",
+        (Live, Inactive) => "live",
+        (Live, Recording) => "recording",
+        (Live, Playback) => "playback",
+        _ => "unknown",
     }
 }
 
@@ -358,8 +877,35 @@ fn feature_to_str(feature: Feature) -> &'static str {
     }
 }
 
+fn playback_state_to_str(state: PlaybackRuntimeState) -> &'static str {
+    match state {
+        PlaybackRuntimeState::Stopped => "stopped",
+        PlaybackRuntimeState::Playing => "playing",
+        PlaybackRuntimeState::Paused => "paused",
+    }
+}
+
+fn parse_sampling_mode(value: &str) -> PyResult<SamplingMode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "captured" {
+        return Ok(SamplingMode::Captured);
+    }
+    if let Some(raw) = normalized.strip_prefix("fixed:") {
+        let fps: u32 = raw
+            .parse()
+            .map_err(|err| PyValueError::new_err(format!("invalid fixed fps `{raw}`: {err}")))?;
+        if fps == 0 {
+            return Err(PyValueError::new_err("fixed fps must be > 0"));
+        }
+        return Ok(SamplingMode::FixedFps { fps });
+    }
+    Err(PyValueError::new_err(format!(
+        "unsupported sampling mode `{value}` (expected captured or fixed:<fps>)"
+    )))
+}
+
 fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "scene spec")?;
     let mut scene = Scene::new(name);
 
     if let Some(raw) = spec
@@ -374,7 +920,9 @@ fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
     let raw_objects = spec
         .get_item("objects")
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err("missing required field `objects`"))?;
+        .ok_or_else(|| {
+            PyValueError::new_err("scene spec: missing required list field 'objects'")
+        })?;
     let objects = raw_objects
         .iter()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -390,7 +938,7 @@ fn parse_scene_spec(spec: &Bound<'_, PyDict>) -> PyResult<Scene> {
 }
 
 fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "object spec")?;
     let mut object = SceneObject::new(name);
 
     if let Some(raw) = spec
@@ -405,7 +953,9 @@ fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
     let raw_attributes = spec
         .get_item("attributes")
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err("missing required field `attributes`"))?;
+        .ok_or_else(|| {
+            PyValueError::new_err("object spec: missing required list field 'attributes'")
+        })?;
     let attributes = raw_attributes
         .iter()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -422,9 +972,14 @@ fn parse_scene_object_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneObject> {
 }
 
 fn parse_scene_attribute_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneAttribute> {
-    let name = extract_spec_string(spec, "name")?;
+    let name = extract_spec_string(spec, "name", "attribute spec")?;
     let default_value = extract_spec_attribute_value(spec, "default_value")
-        .or_else(|_| extract_spec_attribute_value(spec, "value"))?;
+        .or_else(|_| extract_spec_attribute_value(spec, "value"))
+        .map_err(|_| {
+            PyValueError::new_err(
+                "attribute spec: missing required 'default_value' or 'value' field",
+            )
+        })?;
     let current_value =
         extract_spec_attribute_value(spec, "value").unwrap_or(default_value.clone());
 
@@ -455,11 +1010,13 @@ fn parse_scene_attribute_spec(spec: &Bound<'_, PyDict>) -> PyResult<SceneAttribu
     Ok(attr)
 }
 
-fn extract_spec_string(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+fn extract_spec_string(spec: &Bound<'_, PyDict>, key: &str, context: &str) -> PyResult<String> {
     let raw = spec
         .get_item(key)
         .map_err(|err| PyValueError::new_err(err.to_string()))?
-        .ok_or_else(|| PyValueError::new_err(format!("missing required field `{key}`")))?;
+        .ok_or_else(|| {
+            PyValueError::new_err(format!("{context}: missing required string field '{key}'"))
+        })?;
     if let Ok(value) = raw.extract::<String>() {
         return Ok(value);
     }
@@ -533,12 +1090,23 @@ fn parse_attribute_value_typed(
         "quatf" => Ok(AttributeValue::Quatf(extract_vec_f32::<4>(value)?)),
         "mat4f" => Ok(AttributeValue::Mat4f(extract_mat4f(value)?)),
         other => Err(PyValueError::new_err(format!(
-            "unsupported attribute type `{other}`"
+            "attribute spec: unknown type '{other}'; valid types: bool, trigger, int32, float32, float64, vec2f, vec3f, vec4f, quatf, mat4f"
         ))),
     }
 }
 
 fn parse_attribute_value_inferred(value: &Bound<'_, PyAny>) -> PyResult<AttributeValue> {
+    let py = value.py();
+    py.import_bound("warnings")?.call_method1(
+        "warn",
+        (
+            "Attribute value type was inferred without an explicit 'type' field. \
+             Add {\"type\": \"float32\"} (or float64, int32, vec3f, etc.) to suppress this warning. \
+             Inference will be removed in a future release.",
+            py.get_type_bound::<PyDeprecationWarning>(),
+            1i32,
+        ),
+    )?;
     if let Ok(v) = value.extract::<bool>() {
         return Ok(AttributeValue::Bool(v));
     }
@@ -646,14 +1214,33 @@ fn attribute_value_to_py(py: Python<'_>, value: &AttributeValue) -> PyObject {
     }
 }
 
+fn bake_attribute_value_to_py(py: Python<'_>, value: &BakeAttributeValue) -> PyObject {
+    match value {
+        BakeAttributeValue::Bool(v) | BakeAttributeValue::Trigger(v) => v.into_py(py),
+        BakeAttributeValue::Int32(v) => v.into_py(py),
+        BakeAttributeValue::Float32(v) => f64::from(*v).into_py(py),
+        BakeAttributeValue::Float64(v) => v.into_py(py),
+        BakeAttributeValue::Vec2f(v) => vec![v[0], v[1]].into_py(py),
+        BakeAttributeValue::Vec3f(v) => vec![v[0], v[1], v[2]].into_py(py),
+        BakeAttributeValue::Vec4f(v) | BakeAttributeValue::Quatf(v) => {
+            vec![v[0], v[1], v[2], v[3]].into_py(py)
+        }
+        BakeAttributeValue::Mat4f(v) => v
+            .iter()
+            .map(|row| vec![row[0], row[1], row[2], row[3]])
+            .collect::<Vec<_>>()
+            .into_py(py),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PyMotionStageServer;
 
     #[test]
     fn rust_binding_constructs_server() {
-        let server =
-            PyMotionStageServer::new(Some("py-test".into())).expect("py server should build");
+        let server = PyMotionStageServer::new(Some("py-test".into()), false, None)
+            .expect("py server should build");
         let _ = server.start().expect("start should succeed");
         server.stop().expect("stop should succeed");
     }

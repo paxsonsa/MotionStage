@@ -78,6 +78,16 @@ pub enum RecordingMarker {
         mapping_id: MappingId,
         lock: bool,
     },
+    ClientJoined {
+        timestamp_ns: u64,
+        device_id: Uuid,
+        device_name: String,
+    },
+    ClientLeft {
+        timestamp_ns: u64,
+        device_id: Uuid,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -295,12 +305,12 @@ mod tests {
         let mut writer = RecordingWriter::start(scene_id, 100);
         writer.push_marker(RecordingMarker::ModeTransition {
             timestamp_ns: 100,
-            from: Mode::Live,
-            to: Mode::Recording,
+            from: Mode::LIVE,
+            to: Mode::RECORDING,
         });
         writer.push_frame(RecordedFrame {
             timestamp_ns: 100,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![RecordedAttribute {
                 object_id,
                 attribute: "position".into(),
@@ -333,7 +343,7 @@ mod tests {
             RecordingWriter::start_with_format(scene_id, 100, RecordingFormatVersion::V1);
         writer.push_frame(RecordedFrame {
             timestamp_ns: 100,
-            mode: Mode::Recording,
+            mode: Mode::RECORDING,
             attributes: vec![RecordedAttribute {
                 object_id,
                 attribute: "position".into(),

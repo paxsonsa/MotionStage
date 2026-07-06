@@ -34,19 +34,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
 parking_lot = "0.12"
-bevy_ecs = "0.17"
 bincode = "1.3"
 futures = "0.3"
 async-trait = "0.1"
 indexmap = { version = "2.7", features = ["serde"] }
+axum = { version = "0.8", features = ["ws"] }
+rust-embed = "8"
+mime_guess = "2"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.10"
 rcgen = "0.13"
+sha2 = "0.10"
 mdns-sd = "0.13"
 flume = "0.11"
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
 webrtc = "0.11"
+openh264 = "0.9"
 motionstage-protocol = { path = "crates/motionstage-protocol" }
 motionstage-core = { path = "crates/motionstage-core" }
 motionstage-server = { path = "crates/motionstage-server" }

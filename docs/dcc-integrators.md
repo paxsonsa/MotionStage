@@ -7,6 +7,7 @@ DCC integrators consume MotionStage recordings or runtime callbacks and map them
 This repo provides two integration surfaces:
 - Offline export surface (USD/CHAN from `.cmtrk`)
 - Live callback surface (Python SDK delegate API, with Blender reference adapter)
+- Take bake cursor surface (frame-by-frame pull for DCC-side key baking)
 
 ## Quickest Path to First DCC Result
 
@@ -48,7 +49,11 @@ Use `motionstage-recording::read_recording(path)` to load a `.cmtrk` file.
 
 ### USD export
 
-`motionstage-export-usd::export(&recording)` returns deterministic USD text (`#usda 1.0`) for the input recording.
+`motionstage-export-usd::export(&recording, &UsdExportConfig::default())` returns deterministic USD text (`#usda 1.0`) with typed time-sampled properties and Xform hierarchy.
+
+`UsdExportConfig` fields:
+- `fps: f64` — frames per second (default: 24.0)
+- `up_axis: UpAxis` — `Y` (default) or `Z`
 
 ### CHAN export
 
@@ -64,7 +69,7 @@ use motionstage_recording::read_recording;
 
 fn export_both(path: &str) -> (String, String) {
     let recording = read_recording(path).expect("recording should load");
-    let usd = motionstage_export_usd::export(&recording);
+    let usd = motionstage_export_usd::export(&recording, &motionstage_export_usd::UsdExportConfig::default());
     let chan = motionstage_export_chan::export(&recording);
     (usd, chan)
 }
@@ -98,6 +103,23 @@ Strict runtime API notes:
 - Remote mode control requires `Operator` role.
 - Runtime attribute batches contain server-resolved values (relative baseline composition already applied).
 - Baseline controls are explicit: `reset_scene_to_baseline`, `commit_scene_baseline`, `commit_object_baseline`.
+- Take workflows are explicit: `list_takes`, `select_take`, `playback_*`, and bake cursor APIs.
+
+## Take Bake Cursor Integrators
+
+Python package exposes pull-based bake primitives:
+
+- `open_take_bake_cursor(take_id, sampling_mode="captured")`
+- `read_take_bake_frame(cursor_id)`
+- `seek_take_bake_frame(cursor_id, frame_index)`
+- `close_take_bake_cursor(cursor_id)`
+
+`read/seek` responses contain:
+- `frame_index`
+- `timestamp_ns`
+- `attributes[]` with `object_id`, `attribute`, `value`
+
+This is intended for DCC-native baking loops where the host creates keys and render caches.
 
 ## Blender Reference Adapter
 

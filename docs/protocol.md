@@ -23,7 +23,7 @@
 
 Control and motion payloads are sent in versioned wire envelopes (`protocol_major`, `protocol_minor`) so minor-version gates are enforced at transport decode time.
 
-## Control messages (v1.3)
+## Control messages (v1.4)
 
 - `VideoSignal(SignalMessage)` routes SDP/ICE between active devices or to the server-owned WebRTC peer.
 - `DrainSignals` requests queued signaling messages for the active device.
@@ -34,6 +34,21 @@ Control and motion payloads are sent in versioned wire envelopes (`protocol_majo
 - `CommitSceneBaseline { scene_id }` copies scene attribute `current_value` into `default_value`.
 - `CommitObjectBaseline { scene_id, object_id }` copies one object's attribute `current_value` into `default_value`.
 - `BaselineActionApplied { action, changed_attributes }` acknowledges baseline actions with deterministic change counts.
+- `ListTakes { scene_id }` requests available takes for one scene or all scenes.
+- `TakeList { takes }` returns take metadata catalog rows.
+- `SelectTake { take_id }` marks a take as selected for its scene.
+- `TakeSelected { take_id }` acknowledges take selection.
+- `PlaybackControl { take_id, action, seek_ns, looping }` controls dedicated take playback mode (`Play`, `Pause`, `Seek`, `Stop`).
+- `PlaybackState { take_id, state, playhead_ns, looping }` reports playback runtime state.
+- `DeleteTake { take_id }` requests take deletion.
+- `TakeDeleted { take_id }` acknowledges take deletion.
+- `OpenTakeBakeCursor { take_id, sampling_mode }` opens a bake cursor for frame-by-frame pull.
+- `TakeBakeCursorOpened { cursor_id, total_frames }` returns bake cursor metadata.
+- `ReadTakeBakeFrame { cursor_id }` reads the next bake frame.
+- `SeekTakeBakeFrame { cursor_id, frame_index }` seeks and reads a bake frame.
+- `TakeBakeFrame { cursor_id, frame_index, timestamp_ns, attributes }` returns one bake frame payload.
+- `CloseTakeBakeCursor { cursor_id }` closes an active bake cursor.
+- `TakeBakeCursorClosed { cursor_id }` acknowledges bake cursor close.
 - `Error { code, reason }` provides explicit protocol-level errors instead of silently ignoring unsupported messages.
 
 ## Mapping and motion
@@ -41,6 +56,7 @@ Control and motion payloads are sent in versioned wire envelopes (`protocol_majo
 - Motion-source clients advertise output attributes during `ClientHello`.
 - Motion samples are only accepted for explicitly registered mappings.
 - Mapping modifications are denied in `Recording` mode.
+- Runtime ingest is suspended in `Playback` mode.
 - Lease and heartbeat policy govern reclaim behavior when a device disconnects.
 - Relative composition is server-authoritative for transform-capable targets:
   - scalar/vec: `output = baseline + delta`
@@ -64,3 +80,4 @@ Control and motion payloads are sent in versioned wire envelopes (`protocol_majo
 
 - `CMTRK2` is the canonical format and includes marker events (`ModeTransition`, mapping graph markers) plus frame data.
 - `CMTRK1` remains readable for backward compatibility.
+- Take management persists a server-side catalog index that references `.cmtrk` files by `take_id`.

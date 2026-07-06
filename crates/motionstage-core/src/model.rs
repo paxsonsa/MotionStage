@@ -159,6 +159,9 @@ pub struct LeaseConfig {
     pub heartbeat_interval_ns: u64,
     pub timeout_ns: u64,
     pub reclaim_grace_ns: u64,
+    /// Sessions idle beyond this duration are evicted by the server tick loop.
+    /// 0 = disabled. Default: 30 seconds.
+    pub session_idle_timeout_ns: u64,
 }
 
 impl Default for LeaseConfig {
@@ -167,6 +170,10 @@ impl Default for LeaseConfig {
             heartbeat_interval_ns: 500_000_000,
             timeout_ns: 2_000_000_000,
             reclaim_grace_ns: 5_000_000_000,
+            // A live client touches activity constantly (datagrams + 0.5s heartbeats),
+            // so 8s of silence means it's genuinely gone. Kept short so a crashed
+            // client clears from the operator UI quickly.
+            session_idle_timeout_ns: 8_000_000_000, // 8s
         }
     }
 }

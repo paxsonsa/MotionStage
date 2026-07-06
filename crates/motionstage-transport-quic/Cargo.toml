@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+insecure = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
@@ -16,6 +20,7 @@ quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
+sha2.workspace = true
 motionstage-protocol.workspace = true
 motionstage-core.workspace = true
 

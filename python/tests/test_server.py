@@ -134,6 +134,8 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
         server_module.UUID("00000000-0000-0000-0000-000000000999")
     ]
     metrics = server.metrics()
+    assert isinstance(metrics, server_module.ServerMetrics)
+    assert metrics.accepted_sessions == 1
     recording_id = server.start_recording("/tmp/demo.cmtrk")
     assert str(recording_id) == "00000000-0000-0000-0000-000000000333"
     server.stop_recording()
@@ -163,8 +165,8 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
         == 4
     )
     rows = server.runtime_attribute_values()
-    assert rows[0]["object_id"] == "00000000-0000-0000-0000-000000000222"
-    assert rows[0]["object"] == "Camera"
+    assert rows[0].object_id == "00000000-0000-0000-0000-000000000222"
+    assert rows[0].object_name == "Camera"
 
     server.emit_scene_snapshot({"name": "shot"})
     server.emit_attribute_batch([{"object": "camera", "attribute": "position", "value": [1, 2, 3]}])
@@ -176,7 +178,7 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
 
     assert ":" in endpoint
     assert str(scene_id)
-    assert len(metrics) == 7
+    assert isinstance(metrics, server_module.ServerMetrics)
     for expected in ("scene", "attr", "mapping", "mode", "client", "record"):
         assert expected in delegate.calls
 
@@ -392,10 +394,153 @@ def test_runtime_attribute_values_accepts_legacy_row_shape(monkeypatch):
     server = server_module.MotionStageServer(name="unit")
     rows = server.runtime_attribute_values()
     assert rows == [
-        {
-            "object_id": "",
-            "object": "Camera",
-            "attribute": "position",
-            "value": [1.0, 2.0, 3.0],
-        }
+        server_module.BakeAttributeValue(
+            object_id="",
+            object_name="Camera",
+            attribute_name="position",
+            value=[1.0, 2.0, 3.0],
+        )
     ]
+
+
+def test_take_and_bake_controls_are_exposed(monkeypatch):
+    class _Native:
+        def __init__(self, name: str | None = None):
+            self._name = name or "motionstage"
+
+        def start(self) -> str:
+            return "127.0.0.1:9999"
+
+        def stop(self) -> None:
+            return None
+
+        def upsert_scene(self, scene: dict[str, object]) -> str:
+            return "00000000-0000-0000-0000-000000000000"
+
+        def set_active_scene(self, scene_id: str) -> None:
+            return None
+
+        def set_mode(self, mode: str) -> str:
+            return mode
+
+        def mode(self) -> str:
+            return "idle"
+
+        def set_mode_control_allowlist(self, ids: list[str]) -> None:
+            return None
+
+        def mode_control_allowlist(self) -> list[str]:
+            return []
+
+        def metrics(self) -> tuple[int, int, int, int, int, int, int]:
+            return (0, 0, 0, 0, 0, 0, 0)
+
+        def start_recording(self, path: str) -> str:
+            return "00000000-0000-0000-0000-000000000001"
+
+        def stop_recording(self) -> None:
+            return None
+
+        def sessions(self):
+            return []
+
+        def create_mapping(self, request: dict[str, object]) -> str:
+            return "00000000-0000-0000-0000-000000000010"
+
+        def remove_mapping(self, mapping_id: str) -> None:
+            return None
+
+        def runtime_attribute_values(self):
+            return []
+
+        def list_takes(self, scene_id: str | None):
+            assert scene_id in {None, "00000000-0000-0000-0000-000000000000"}
+            return [
+                (
+                    "00000000-0000-0000-0000-000000000111",
+                    "00000000-0000-0000-0000-000000000000",
+                    "Take 001",
+                    "/tmp/take-001.cmtrk",
+                    100,
+                    20,
+                    True,
+                    False,
+                )
+            ]
+
+        def select_take(self, take_id: str) -> str:
+            assert take_id == "00000000-0000-0000-0000-000000000111"
+            return take_id
+
+        def playback_play(self, take_id: str, looping: bool):
+            assert take_id == "00000000-0000-0000-0000-000000000111"
+            assert looping is True
+            return ("playing", 0, True)
+
+        def playback_pause(self, take_id: str):
+            return ("paused", 10, True)
+
+        def playback_seek(self, take_id: str, seek_ns: int, looping: bool):
+            assert seek_ns == 999
+            return ("paused", seek_ns, looping)
+
+        def playback_stop(self, take_id: str):
+            return ("stopped", 999, False)
+
+        def delete_take(self, take_id: str) -> None:
+            assert take_id == "00000000-0000-0000-0000-000000000111"
+
+        def open_take_bake_cursor(self, take_id: str, sampling_mode: str):
+            assert sampling_mode == "captured"
+            return ("00000000-0000-0000-0000-000000000222", 20)
+
+        def read_take_bake_frame(self, cursor_id: str):
+            assert cursor_id == "00000000-0000-0000-0000-000000000222"
+            return (
+                0,
+                100,
+                [
+                    (
+                        "00000000-0000-0000-0000-000000000333",
+                        "position",
+                        [1.0, 2.0, 3.0],
+                    )
+                ],
+            )
+
+        def seek_take_bake_frame(self, cursor_id: str, frame_index: int):
+            assert frame_index == 1
+            return (
+                1,
+                200,
+                [
+                    (
+                        "00000000-0000-0000-0000-000000000333",
+                        "position",
+                        [2.0, 3.0, 4.0],
+                    )
+                ],
+            )
+
+        def close_take_bake_cursor(self, cursor_id: str) -> None:
+            assert cursor_id == "00000000-0000-0000-0000-000000000222"
+
+    monkeypatch.setattr(server_module, "_NativeMotionStageServer", _Native)
+    server = server_module.MotionStageServer(name="unit")
+    take_id = server_module.UUID("00000000-0000-0000-0000-000000000111")
+    cursor_id = server_module.UUID("00000000-0000-0000-0000-000000000222")
+
+    takes = server.list_takes()
+    assert takes[0].take_id == str(take_id)
+    assert server.select_take(take_id) == take_id
+    assert server.playback_play(take_id, looping=True).state == "playing"
+    assert server.playback_pause(take_id).state == "paused"
+    assert server.playback_seek(take_id, 999, looping=False).playhead_ns == 999
+    assert server.playback_stop(take_id).state == "stopped"
+    server.delete_take(take_id)
+
+    opened = server.open_take_bake_cursor(take_id)
+    assert opened.cursor_id == str(cursor_id)
+    assert server.read_take_bake_frame(cursor_id).frame_index == 0
+    assert server.seek_take_bake_frame(cursor_id, 1).frame_index == 1
+    server.close_take_bake_cursor(cursor_id)
