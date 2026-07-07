@@ -126,6 +126,38 @@ typedef void (*MotionStageConnectCallback)(int32_t status, const char *error, vo
 typedef void (*MotionStageConnectionEventCallback)(
     int32_t event, uint32_t attempt, const char *message, void *context);
 
+/**
+ * State-event stream callback (operator plane, protocol 2.1).
+ *
+ * message_json: NUL-terminated UTF-8 JSON owned by the SDK for the duration of
+ * the call. Do NOT free it; copy the string if you need it afterwards.
+ * Invoked from a background SDK thread. Two message shapes are delivered:
+ *
+ * 1. Replicated state event (ControlMessage::StateEventMsg):
+ *    {"kind":"state_event",
+ *     "seq":7,                          // strictly monotonic mutation order
+ *     "origin_session":"<uuid>"|null,   // session that caused the mutation;
+ *                                       // your own ops echo back with your
+ *                                       // session id (no echo suppression)
+ *     "timestamp_ns":123,
+ *     "event":{"type":"<Variant>","data":{...}}}
+ *
+ *    "type" is the protocol StateEvent variant name — one of: ModeChanged,
+ *    SceneLoaded, SceneActivated, MappingCreated, MappingUpdated,
+ *    MappingRemoved, MappingLockChanged, MappingReleased, BaselineApplied,
+ *    SessionJoined, SessionLeft, RecordingStarted, RecordingStopped,
+ *    TakeRegistered, TakeSelected, TakeDeleted, PlaybackChanged.
+ *    "data" carries the variant's fields with their wire names, e.g.
+ *    {"type":"ModeChanged","data":{"mode":{"data_flow":"Live","recording":"Inactive"}}}
+ *    {"type":"MappingCreated","data":{"mapping":{"mapping_id":"<uuid>", ...}}}
+ *
+ * 2. Unsolicited world snapshot (handshake / resync / lag recovery):
+ *    {"kind":"scene_snapshot","snapshot":{...SceneSnapshotPayload...}}
+ *    with fields scenes, mappings, mode, active_scene, sessions, takes,
+ *    playback and seq (events with seq <= snapshot.seq are already folded in).
+ */
+typedef void (*MotionStageStateEventCallback)(const char *message_json, void *context);
+
 /* Runtime (2.3) */
 
 /**
@@ -380,6 +412,128 @@ int32_t motionstage_swift_client_video_send_ice(
  *  - {"kind":"ice","from_device":"...","to_device":"...","candidate":"...","sdp_mid":"...|null","sdp_mline_index":0|null}
  */
 char *motionstage_swift_client_video_next_signal_json(void *client);
+
+/* Operator plane (protocol 2.1) */
+
+/**
+ * Register a callback for the server->client state-event stream
+ * (StateEventMsg envelopes plus unsolicited SceneSnapshots) delivered as JSON
+ * (see MotionStageStateEventCallback for the schema). The first registration
+ * spawns a background pump thread that lives until motionstage_swift_client_free.
+ *
+ * Set callback to NULL to unsubscribe. NULL reliably quiesces delivery: the
+ * call blocks until any in-flight dispatch batch finishes, so on return the
+ * previous `context` pointer is guaranteed no longer in use and is safe to
+ * free. While unsubscribed the SDK DROPS incoming state-stream messages instead
+ * of queueing them (an unsubscribed client never accumulates an unbounded
+ * backlog); re-subscribing recovers full state via the normal lag->SceneSnapshot
+ * resync. The callback runs on a background thread and MUST NOT reentrantly call
+ * this function or motionstage_swift_client_free.
+ */
+int32_t motionstage_swift_client_set_state_event_callback(
+    void *client,
+    MotionStageStateEventCallback callback,  /* NULL = unsubscribe */
+    void *context
+);
+
+/**
+ * Create a mapping (operator plane).
+ * source_device: UUID string, or NULL = this session's own device.
+ * target_scene:  UUID string, or NULL = the active scene.
+ * component_mask: NULL = all components; otherwise component_mask_len indices.
+ * On MOTIONSTAGE_SWIFT_STATUS_OK, *out_result_json receives an owned JSON
+ * string — {"ok":{MappingSummary}} on success or
+ * {"err":{"code":"<RejectCode>","reason":"..."}} on a typed server rejection
+ * (RejectCode is e.g. "RoleDenied" or "ServerBusy"). Free the string with
+ * motionstage_swift_string_free(). MappingSummary fields: mapping_id,
+ * source_device, source_output, target_scene, target_object,
+ * target_attribute, component_mask (array|null), lock (bool).
+ * Non-OK statuses signal transport/argument failures (see last_error).
+ */
+int32_t motionstage_swift_client_create_mapping(
+    void *client,
+    const char *source_device,   /* NULL = own device */
+    const char *source_output,
+    const char *target_scene,    /* NULL = active scene */
+    const char *target_object,
+    const char *target_attribute,
+    const uint32_t *component_mask,  /* NULL = all components */
+    uint32_t component_mask_len,
+    char **out_result_json
+);
+
+/**
+ * Replace a mapping's full definition (operator plane). Argument semantics
+ * and result JSON are identical to motionstage_swift_client_create_mapping.
+ */
+int32_t motionstage_swift_client_update_mapping(
+    void *client,
+    const char *mapping_id,
+    const char *source_device,   /* NULL = own device */
+    const char *source_output,
+    const char *target_scene,    /* NULL = active scene */
+    const char *target_object,
+    const char *target_attribute,
+    const uint32_t *component_mask,  /* NULL = all components */
+    uint32_t component_mask_len,
+    char **out_result_json
+);
+
+/**
+ * Remove a mapping (operator plane). On MOTIONSTAGE_SWIFT_STATUS_OK,
+ * *out_result_json receives {"ok":null} or {"err":{...}}; free with
+ * motionstage_swift_string_free().
+ */
+int32_t motionstage_swift_client_remove_mapping(
+    void *client,
+    const char *mapping_id,
+    char **out_result_json
+);
+
+/**
+ * Lock or unlock a mapping (operator plane). lock: 0 = unlock, else lock.
+ * Result JSON as for motionstage_swift_client_remove_mapping.
+ */
+int32_t motionstage_swift_client_set_mapping_lock(
+    void *client,
+    const char *mapping_id,
+    int32_t lock,
+    char **out_result_json
+);
+
+/**
+ * Start recording a take (Operator role required; take id and path are
+ * server-assigned). On MOTIONSTAGE_SWIFT_STATUS_OK, *out_result_json receives
+ * {"ok":"<take-uuid>"} or {"err":{...}}; free with
+ * motionstage_swift_string_free().
+ */
+int32_t motionstage_swift_client_start_take(
+    void *client,
+    char **out_result_json
+);
+
+/**
+ * Stop the active recording and register the take (Operator role required).
+ * On MOTIONSTAGE_SWIFT_STATUS_OK, *out_result_json receives {"ok":{TakeInfo}}
+ * or {"err":{...}}; free with motionstage_swift_string_free(). TakeInfo
+ * fields: take_id, scene_id, name, path, created_ns, frame_count, selected,
+ * deleted.
+ */
+int32_t motionstage_swift_client_stop_take(
+    void *client,
+    char **out_result_json
+);
+
+/**
+ * Request an on-demand full world snapshot. On MOTIONSTAGE_SWIFT_STATUS_OK,
+ * *out_snapshot_json receives the SceneSnapshotPayload as JSON (no {"ok":...}
+ * envelope — the request has no typed wire error); free with
+ * motionstage_swift_string_free().
+ */
+int32_t motionstage_swift_client_get_scene_snapshot(
+    void *client,
+    char **out_snapshot_json
+);
 
 /* Reconnection (4.2) */
 

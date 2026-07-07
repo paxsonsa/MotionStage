@@ -96,8 +96,14 @@ class MappingManager:
     def create_mapping(self, request: dict[str, Any]) -> UUID:
         return self._owner.create_mapping(request)
 
+    def update_mapping(self, mapping_id: UUID, request: dict[str, Any]) -> None:
+        self._owner.update_mapping(mapping_id, request)
+
     def remove_mapping(self, mapping_id: UUID) -> None:
         self._owner.remove_mapping(mapping_id)
+
+    def set_mapping_lock(self, mapping_id: UUID, lock: bool) -> None:
+        self._owner.set_mapping_lock(mapping_id, lock)
 
 
 @dataclass
@@ -240,11 +246,17 @@ class MotionStageServer:
     def mode(self) -> str:
         return str(self._native.mode())
 
-    def set_mode_control_allowlist(self, device_ids: list[UUID]) -> None:
-        self._native.set_mode_control_allowlist([str(device_id) for device_id in device_ids])
+    def set_data_flow(self, live: bool) -> str:
+        """Set the data-flow axis. Composite-mode-aware: disabling data flow
+        first stops any active recording/playback. Returns the resulting
+        composite mode string."""
+        return str(self._native.set_data_flow(bool(live)))
 
-    def mode_control_allowlist(self) -> list[UUID]:
-        return [UUID(str(device_id)) for device_id in self._native.mode_control_allowlist()]
+    def set_recording(self, recording: bool) -> str:
+        """Set the recording axis. Composite-mode-aware: enabling recording
+        auto-enables data flow first; disabling leaves data flow untouched.
+        Returns the resulting composite mode string."""
+        return str(self._native.set_recording(bool(recording)))
 
     def metrics(self) -> ServerMetrics:
         raw = self._native.metrics()
@@ -407,17 +419,30 @@ class MotionStageServer:
             )
         return sessions
 
-    def create_mapping(self, request: dict[str, Any]) -> UUID:
+    @staticmethod
+    def _normalize_mapping_request(request: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(request)
         normalized["source_device"] = str(normalized["source_device"])
         normalized["target_object_id"] = str(normalized["target_object_id"])
         if normalized.get("target_scene") is not None:
             normalized["target_scene"] = str(normalized["target_scene"])
-        mapping_id = self._native.create_mapping(normalized)
+        return normalized
+
+    def create_mapping(self, request: dict[str, Any]) -> UUID:
+        mapping_id = self._native.create_mapping(self._normalize_mapping_request(request))
         return UUID(str(mapping_id))
+
+    def update_mapping(self, mapping_id: UUID, request: dict[str, Any]) -> None:
+        """Replace a mapping's full definition. ``request`` has the same shape
+        as :meth:`create_mapping`'s request dict."""
+        self._native.update_mapping(str(mapping_id), self._normalize_mapping_request(request))
 
     def remove_mapping(self, mapping_id: UUID) -> None:
         self._native.remove_mapping(str(mapping_id))
+
+    def set_mapping_lock(self, mapping_id: UUID, lock: bool) -> None:
+        """Lock (True) or unlock (False) a mapping against reclaim/update."""
+        self._native.set_mapping_lock(str(mapping_id), bool(lock))
 
     def reset_scene_to_baseline(self, scene_id: UUID | None = None) -> int:
         raw_scene_id = str(scene_id) if scene_id is not None else None

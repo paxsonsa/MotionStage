@@ -3,7 +3,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -229,6 +229,9 @@ pub struct ServerHello {
 pub struct VersionNegotiation {
     pub server: ProtocolVersion,
     pub client: ProtocolVersion,
+    /// The version the server actually speaks: always the **server's own**
+    /// major/minor. The server does not downgrade its wire behaviour for a
+    /// lesser client (see [`negotiate_version`]).
     pub selected: ProtocolVersion,
 }
 
@@ -253,6 +256,14 @@ pub struct RegisterRequest {
 pub struct RegisterAccepted {
     pub session_id: Uuid,
     pub negotiated_features: Vec<Feature>,
+    /// The protocol minor the server speaks to this session. The server
+    /// speaks **exactly its own minor** ([`PROTOCOL_MINOR`]); it does not
+    /// downgrade behaviour for a lesser client. A client whose minor is
+    /// *greater* than the server's is rejected at the hello exchange (it may
+    /// depend on features the server lacks); a client whose minor is
+    /// *lesser-or-equal* is accepted without behaviour change and told the
+    /// server's minor here. See [`negotiate_version`].
+    pub negotiated_protocol_minor: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +310,16 @@ pub struct VideoStreamStatus {
     pub descriptor_set: bool,
     pub peer_count: u32,
     pub last_frame_age_ms: Option<u64>,
+}
+
+/// Typed failure payload carried inside operator-plane result messages
+/// ([`ControlMessage::MappingCreateResult`], [`ControlMessage::MappingOpResult`],
+/// [`ControlMessage::TakeStartResult`], [`ControlMessage::TakeStopResult`]).
+/// A failed operation mutates nothing and emits no [`StateEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireError {
+    pub code: RejectCode,
+    pub reason: String,
 }
 
 /// Compact wire summary of a mapping. Used by the mapping [`StateEvent`]s and
@@ -545,8 +566,22 @@ pub enum ControlMessage {
     ClientGoodbye {
         reason: Option<String>,
     },
+    /// Client → server: set the data-flow axis (Operator-gated).
+    ///
+    /// Success has **no direct reply**: the caller observes its own
+    /// [`ControlMessage::StateEventMsg`] echo carrying
+    /// [`StateEvent::ModeChanged`] (like every other session). Failure is
+    /// answered with [`ControlMessage::Error`].
     SetDataFlow(DataFlowState),
+    /// Client → server: set the recording axis (Operator-gated). Reply
+    /// semantics are identical to [`ControlMessage::SetDataFlow`]: event echo
+    /// on success, [`ControlMessage::Error`] on failure.
     SetRecording(RecordingState),
+    /// Server → client: composite mode probe. Sent **only** as part of the
+    /// [`ControlMessage::Ping`] heartbeat reply (`Pong` + `ModeState`), as a
+    /// cheap liveness+state probe. It is no longer a direct acknowledgement
+    /// of `SetDataFlow`/`SetRecording` — mode changes replicate via
+    /// [`StateEvent::ModeChanged`].
     ModeState(Mode),
     ResetSceneToBaseline {
         scene_id: Option<Uuid>,
@@ -558,6 +593,14 @@ pub enum ControlMessage {
         scene_id: Option<Uuid>,
         object_id: Uuid,
     },
+    /// RETIRED — the server never sends this message (protocol 2.1). The
+    /// single acknowledgement of a baseline action is the caller's own
+    /// [`ControlMessage::StateEventMsg`] echo carrying
+    /// [`StateEvent::BaselineApplied`], which includes the same
+    /// `changed_attributes` count. Failures are answered with
+    /// [`ControlMessage::Error`]. The variant is kept only so downstream
+    /// SDKs keep compiling during the migration; it will be deleted next
+    /// protocol bump.
     BaselineActionApplied {
         action: BaselineAction,
         changed_attributes: u32,
@@ -572,6 +615,81 @@ pub enum ControlMessage {
     /// when they are still buffered, otherwise with a fresh
     /// [`ControlMessage::SceneSnapshot`].
     ResyncRequest { last_seq: u64 },
+    /// Client → server: create a mapping (operator plane).
+    ///
+    /// `source_device: None` resolves to the requesting session's own device
+    /// id; `target_scene: None` resolves to the active scene. Permission: a
+    /// session may create mappings whose resolved `source_device` is its own
+    /// device; a session holding [`ClientRole::Operator`] may create any.
+    /// Replies [`ControlMessage::MappingCreateResult`]. Success additionally
+    /// replicates as [`StateEvent::MappingCreated`] to every session.
+    CreateMapping {
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<Uuid>,
+        target_object: Uuid,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+    },
+    /// Server → client: direct reply to [`ControlMessage::CreateMapping`] and
+    /// [`ControlMessage::UpdateMapping`]. `Ok` carries the resulting mapping
+    /// summary (post-default-resolution).
+    MappingCreateResult {
+        result: Result<MappingSummary, WireError>,
+    },
+    /// Client → server: replace a mapping's full definition (operator plane;
+    /// mirrors the host API's `update_mapping`). `source_device`/`target_scene`
+    /// default as in [`ControlMessage::CreateMapping`]. Permission: non-operator
+    /// sessions may update only mappings whose current **and** requested
+    /// `source_device` is their own device. Replies
+    /// [`ControlMessage::MappingCreateResult`] carrying the updated summary;
+    /// success replicates as [`StateEvent::MappingUpdated`].
+    UpdateMapping {
+        mapping_id: Uuid,
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<Uuid>,
+        target_object: Uuid,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+    },
+    /// Client → server: remove a mapping (operator plane). Permission: own
+    /// `source_device` or Operator. Replies [`ControlMessage::MappingOpResult`];
+    /// success replicates as [`StateEvent::MappingRemoved`].
+    RemoveMapping { mapping_id: Uuid },
+    /// Client → server: lock/unlock a mapping (operator plane). Permission:
+    /// own `source_device` or Operator. Replies
+    /// [`ControlMessage::MappingOpResult`]; success replicates as
+    /// [`StateEvent::MappingLockChanged`].
+    SetMappingLock { mapping_id: Uuid, lock: bool },
+    /// Server → client: direct reply to [`ControlMessage::RemoveMapping`] and
+    /// [`ControlMessage::SetMappingLock`].
+    MappingOpResult {
+        mapping_id: Uuid,
+        result: Result<(), WireError>,
+    },
+    /// Client → server: start recording a take (Operator-gated). Take
+    /// identity is server-assigned: the server generates the recording path
+    /// inside the take-catalog directory — callers never supply paths.
+    /// Replies [`ControlMessage::TakeStartResult`]; success replicates as
+    /// [`StateEvent::RecordingStarted`] (plus [`StateEvent::ModeChanged`]
+    /// when the mode moved).
+    StartTake,
+    /// Server → client: direct reply to [`ControlMessage::StartTake`]. `Ok`
+    /// carries the server-assigned take id.
+    TakeStartResult { result: Result<Uuid, WireError> },
+    /// Client → server: stop the active recording and register the take
+    /// (Operator-gated). Replies [`ControlMessage::TakeStopResult`]; success
+    /// replicates as [`StateEvent::RecordingStopped`] +
+    /// [`StateEvent::TakeRegistered`] + [`StateEvent::ModeChanged`].
+    StopTake,
+    /// Server → client: direct reply to [`ControlMessage::StopTake`]. `Ok`
+    /// carries the registered take's catalog entry.
+    TakeStopResult { result: Result<TakeInfo, WireError> },
+    /// Client → server: request an on-demand full world snapshot. The server
+    /// replies with [`ControlMessage::SceneSnapshot`]. Devices use this to
+    /// populate target pickers without reconnecting.
+    GetSceneSnapshot,
 }
 
 #[derive(Debug, Error)]
@@ -593,6 +711,20 @@ pub enum ProtocolError {
     },
 }
 
+/// Negotiate the wire version at the hello exchange. The contract is
+/// truth-in-docs, not a compatibility shim (there are no old clients — wire
+/// compat is a clean break):
+///
+/// - The **major** must match the server's exactly; any other major is
+///   rejected with [`ProtocolError::UnsupportedMajor`]. The server never
+///   speaks a foreign major.
+/// - A client **minor** *greater* than the server's is rejected with
+///   [`ProtocolError::ClientTooNew`] — it may rely on features the server
+///   does not implement.
+/// - A client minor *lesser-or-equal* is accepted, and the server speaks
+///   **exactly its own minor** (`selected.minor == server.minor`). It does
+///   not downgrade behaviour, so the negotiated/echoed minor honestly
+///   reflects what the server speaks, not a fictional per-client dialect.
 pub fn negotiate_version(
     server: ProtocolVersion,
     client: ProtocolVersion,
@@ -607,7 +739,9 @@ pub fn negotiate_version(
     Ok(VersionNegotiation {
         server,
         client,
-        selected: ProtocolVersion::new(server.major, client.minor),
+        // The server speaks its own minor; it does not downgrade for a
+        // lesser client. Truth-in-docs: the selected minor is the server's.
+        selected: ProtocolVersion::new(server.major, server.minor),
     })
 }
 
@@ -632,6 +766,15 @@ mod tests {
         let result = negotiate_version(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 0))
             .expect("compatible versions should negotiate");
         assert_eq!(result.selected, ProtocolVersion::new(2, 0));
+    }
+
+    #[test]
+    fn version_negotiation_speaks_server_minor_for_lesser_client() {
+        // A lesser-minor client is accepted, but the server speaks its own
+        // minor (no behaviour downgrade): selected.minor == server.minor.
+        let result = negotiate_version(ProtocolVersion::new(2, 7), ProtocolVersion::new(2, 3))
+            .expect("lesser-or-equal minor should negotiate");
+        assert_eq!(result.selected, ProtocolVersion::new(2, 7));
     }
 
     #[test]
@@ -756,6 +899,101 @@ mod tests {
             },
         }));
         round_trip(&ControlMessage::ResyncRequest { last_seq: 42 });
+    }
+
+    #[test]
+    fn control_message_supports_operator_plane_mapping_ops() {
+        round_trip(&ControlMessage::CreateMapping {
+            source_device: None,
+            source_output: "pose_pos".into(),
+            target_scene: None,
+            target_object: Uuid::now_v7(),
+            target_attribute: "position".into(),
+            component_mask: Some(vec![0, 2]),
+        });
+        round_trip(&ControlMessage::MappingCreateResult {
+            result: Ok(MappingSummary {
+                mapping_id: Uuid::now_v7(),
+                source_device: Uuid::now_v7(),
+                source_output: "pose_pos".into(),
+                target_scene: Uuid::now_v7(),
+                target_object: Uuid::now_v7(),
+                target_attribute: "position".into(),
+                component_mask: None,
+                lock: false,
+            }),
+        });
+        round_trip(&ControlMessage::MappingCreateResult {
+            result: Err(WireError {
+                code: RejectCode::RoleDenied,
+                reason: "not your mapping".into(),
+            }),
+        });
+        round_trip(&ControlMessage::UpdateMapping {
+            mapping_id: Uuid::now_v7(),
+            source_device: Some(Uuid::now_v7()),
+            source_output: "pose_rot".into(),
+            target_scene: Some(Uuid::now_v7()),
+            target_object: Uuid::now_v7(),
+            target_attribute: "rotation".into(),
+            component_mask: None,
+        });
+        round_trip(&ControlMessage::RemoveMapping {
+            mapping_id: Uuid::now_v7(),
+        });
+        round_trip(&ControlMessage::SetMappingLock {
+            mapping_id: Uuid::now_v7(),
+            lock: true,
+        });
+        round_trip(&ControlMessage::MappingOpResult {
+            mapping_id: Uuid::now_v7(),
+            result: Ok(()),
+        });
+        round_trip(&ControlMessage::MappingOpResult {
+            mapping_id: Uuid::now_v7(),
+            result: Err(WireError {
+                code: RejectCode::ServerBusy,
+                reason: "mapping not found".into(),
+            }),
+        });
+    }
+
+    #[test]
+    fn control_message_supports_take_control_and_snapshot_request() {
+        round_trip(&ControlMessage::StartTake);
+        round_trip(&ControlMessage::TakeStartResult {
+            result: Ok(Uuid::now_v7()),
+        });
+        round_trip(&ControlMessage::TakeStartResult {
+            result: Err(WireError {
+                code: RejectCode::RoleDenied,
+                reason: "operator role is required".into(),
+            }),
+        });
+        round_trip(&ControlMessage::StopTake);
+        round_trip(&ControlMessage::TakeStopResult {
+            result: Ok(TakeInfo {
+                take_id: Uuid::now_v7(),
+                scene_id: Uuid::now_v7(),
+                name: "Take 001".into(),
+                path: "/tmp/take-001.cmtrk".into(),
+                created_ns: 1,
+                frame_count: 2,
+                selected: true,
+                deleted: false,
+            }),
+        });
+        round_trip(&ControlMessage::GetSceneSnapshot);
+    }
+
+    #[test]
+    fn register_accepted_round_trips_negotiated_minor() {
+        let message = ControlMessage::RegisterAccepted(RegisterAccepted {
+            session_id: Uuid::now_v7(),
+            negotiated_features: vec![Feature::Motion],
+            negotiated_protocol_minor: 0,
+        });
+        round_trip(&message);
     }
 
     #[test]

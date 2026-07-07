@@ -17,17 +17,18 @@ use std::{
 
 use motionstage_protocol::{
     AttributeDescriptor, AttributeKind, BaselineAction, ClientHello, ClientRole, ControlMessage,
-    DataFlowState, Feature, IceCandidate, Mode, RecordingState, RegisterRequest, SdpMessage,
-    SdpType, SignalMessage, SignalPayload, VideoStreamStatus, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    DataFlowState, Feature, IceCandidate, MappingSummary, Mode, RecordingState, RegisterRequest,
+    SceneSnapshotPayload, SdpMessage, SdpType, SignalMessage, SignalPayload, StateEvent,
+    StateEventEnvelope, TakeInfo, VideoStreamStatus, WireError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_transport_quic::{
     hex_decode_fingerprint, AttributeUpdateFrame, AttributeValueFrame, ControlChannel, QuicClient,
     QuicPeer,
 };
+use serde::Serialize;
 use tokio::runtime::Runtime;
 use tokio::time::{timeout, Instant};
 use uuid::Uuid;
-use serde::Serialize;
 
 pub const MOTIONSTAGE_SWIFT_STATUS_OK: i32 = 0;
 pub const MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -193,6 +194,22 @@ pub type MotionStageConnectCallback =
 pub type MotionStageConnectionEventCallback =
     unsafe extern "C" fn(event: i32, attempt: u32, message: *const c_char, context: *mut c_void);
 
+/// State-event stream callback.
+///
+/// `message_json` is a NUL-terminated UTF-8 JSON document owned by the SDK for
+/// the duration of the call — do NOT free it and do NOT retain the pointer
+/// past the callback (copy the string if needed). Invoked from a background
+/// SDK thread. Two message shapes are delivered (see the header for the full
+/// schema):
+///
+/// ```json
+/// {"kind":"state_event","seq":7,"origin_session":"<uuid>|null",
+///  "timestamp_ns":123,"event":{"type":"ModeChanged","data":{...}}}
+/// {"kind":"scene_snapshot","snapshot":{...SceneSnapshotPayload...}}
+/// ```
+pub type MotionStageStateEventCallback =
+    unsafe extern "C" fn(message_json: *const c_char, context: *mut c_void);
+
 // ---------------------------------------------------------------------------
 // Reconnect policy (4.2)
 // ---------------------------------------------------------------------------
@@ -256,6 +273,22 @@ pub struct MotionStageSwiftClient {
     connect_params: Mutex<Option<ConnectParams>>,
     /// Connection event callback and context.
     event_callback: Mutex<Option<(MotionStageConnectionEventCallback, usize)>>,
+    /// State-event stream callback and context (see `MotionStageStateEventCallback`).
+    state_event_callback: Mutex<Option<(MotionStageStateEventCallback, usize)>>,
+    /// True while a state-event callback is registered. Shared with the inner
+    /// so incoming state-stream messages are not queued when no one is
+    /// subscribed (finding: unsubscribed clients must not accumulate).
+    state_event_subscribed: Arc<AtomicBool>,
+    /// Bumped on every `set_state_event_callback` call. The pump snapshots it
+    /// before a dispatch batch and re-checks it before each invocation, so a
+    /// NULL/swap mid-batch halts further calls with the stale context. Combined
+    /// with holding the callback lock across the batch, this makes a NULL
+    /// callback reliably quiesce delivery before it returns.
+    state_event_epoch: Arc<AtomicU64>,
+    /// Signal to stop the state-event pump thread.
+    state_event_shutdown: Arc<AtomicBool>,
+    /// Join handle for the state-event pump thread (spawned on first subscribe).
+    state_event_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct MotionStageSwiftClientInner {
@@ -274,6 +307,30 @@ struct MotionStageSwiftClientInner {
     pending_video_offers: VecDeque<SdpMessage>,
     pending_video_signals: VecDeque<SignalMessage>,
     pending_video_statuses: VecDeque<VideoStreamStatus>,
+    /// StateEventMsg envelopes and unsolicited SceneSnapshots awaiting delivery
+    /// to the state-event callback, in a **single arrival-ordered queue**. The
+    /// wire ordering between a lag-recovery `SceneSnapshot` and the events that
+    /// follow it is load-bearing (the `seq <= snapshot.seq` folding rule), so
+    /// the two kinds must not be split into separate queues and reordered.
+    pending_state_stream: VecDeque<StateStreamItem>,
+    /// Shared with the owning client's `set_state_event_callback`: true while a
+    /// state-event callback is registered. When false, incoming state-stream
+    /// messages are dropped instead of queued (an unsubscribed client must not
+    /// accumulate an unbounded backlog); a later subscriber recovers via the
+    /// normal lag→snapshot resync path.
+    state_event_subscribed: Arc<AtomicBool>,
+    /// Count of state-stream messages dropped while unsubscribed, for the
+    /// periodic drop warning.
+    dropped_unsubscribed_events: u64,
+}
+
+/// One item in the ordered state-event stream queue: either a replication
+/// event or a full-world snapshot. Kept in one queue so arrival order between
+/// the two is preserved (finding: a snapshot followed by its events must be
+/// delivered in that order).
+enum StateStreamItem {
+    Event(StateEventEnvelope),
+    Snapshot(SceneSnapshotPayload),
 }
 
 struct ConnectedSession {
@@ -298,7 +355,51 @@ impl MotionStageSwiftClientInner {
             ControlMessage::VideoStreamStatus(status) => {
                 self.pending_video_statuses.push_back(status);
             }
+            ControlMessage::StateEventMsg(envelope) => {
+                self.queue_state_event(envelope);
+            }
+            ControlMessage::SceneSnapshot(payload) => {
+                self.queue_snapshot(payload);
+            }
             _ => {}
+        }
+    }
+
+    /// Queue a replication event for the state-event callback, preserving
+    /// arrival order relative to snapshots. Dropped (not queued) when no
+    /// callback is registered, so an unsubscribed client never accumulates.
+    fn queue_state_event(&mut self, envelope: StateEventEnvelope) {
+        if self.state_event_subscribed.load(Ordering::Relaxed) {
+            self.pending_state_stream
+                .push_back(StateStreamItem::Event(envelope));
+        } else {
+            self.note_dropped_unsubscribed_event();
+        }
+    }
+
+    /// Queue an unsolicited snapshot for the state-event callback, preserving
+    /// arrival order relative to events. Dropped when no callback is
+    /// registered.
+    fn queue_snapshot(&mut self, payload: SceneSnapshotPayload) {
+        if self.state_event_subscribed.load(Ordering::Relaxed) {
+            self.pending_state_stream
+                .push_back(StateStreamItem::Snapshot(payload));
+        } else {
+            self.note_dropped_unsubscribed_event();
+        }
+    }
+
+    /// Record and periodically warn about state-stream messages dropped
+    /// because no callback is registered.
+    fn note_dropped_unsubscribed_event(&mut self) {
+        self.dropped_unsubscribed_events += 1;
+        if self.dropped_unsubscribed_events.is_power_of_two() {
+            eprintln!(
+                "motionstage: dropped {} state-stream message(s) with no state-event \
+                 callback registered; subscribe to receive replication (a fresh \
+                 snapshot resyncs on subscribe)",
+                self.dropped_unsubscribed_events
+            );
         }
     }
 
@@ -328,7 +429,10 @@ impl MotionStageSwiftClientInner {
         Ok(())
     }
 
-    fn recv_control_with_timeout(&mut self, timeout_dur: Duration) -> Result<ControlMessage, String> {
+    fn recv_control_with_timeout(
+        &mut self,
+        timeout_dur: Duration,
+    ) -> Result<ControlMessage, String> {
         let session = self
             .session
             .as_mut()
@@ -366,7 +470,11 @@ impl MotionStageSwiftClientInner {
         }
     }
 
-    fn create_video_offer(&mut self, stream_id: &str, track_id: &str) -> Result<SdpMessage, String> {
+    fn create_video_offer(
+        &mut self,
+        stream_id: &str,
+        track_id: &str,
+    ) -> Result<SdpMessage, String> {
         self.drain_control_backlog()?;
         let session = self
             .session
@@ -393,7 +501,9 @@ impl MotionStageSwiftClientInner {
             match self.recv_control_with_timeout(remaining)? {
                 ControlMessage::VideoOffer(offer) => return Ok(offer),
                 ControlMessage::Error { code, reason } => {
-                    return Err(format!("video offer request rejected: code={code:?} reason={reason}"));
+                    return Err(format!(
+                        "video offer request rejected: code={code:?} reason={reason}"
+                    ));
                 }
                 ControlMessage::Pong => continue,
                 other => self.stash_control_message(other),
@@ -430,11 +540,15 @@ impl MotionStageSwiftClientInner {
             .ok_or_else(|| "client is not connected".to_owned())?;
 
         get_runtime()
-            .block_on(session.control.send(&ControlMessage::VideoSignal(SignalMessage {
-                from_device: self.device_id,
-                to_device: self.device_id,
-                payload,
-            })))
+            .block_on(
+                session
+                    .control
+                    .send(&ControlMessage::VideoSignal(SignalMessage {
+                        from_device: self.device_id,
+                        to_device: self.device_id,
+                        payload,
+                    })),
+            )
             .map_err(|err| format!("failed to send video signal: {err}"))
     }
 
@@ -460,7 +574,9 @@ impl MotionStageSwiftClientInner {
                     return Ok(());
                 }
                 ControlMessage::Error { code, reason } => {
-                    return Err(format!("drain signals rejected: code={code:?} reason={reason}"));
+                    return Err(format!(
+                        "drain signals rejected: code={code:?} reason={reason}"
+                    ));
                 }
                 ControlMessage::Pong => continue,
                 other => self.stash_control_message(other),
@@ -687,7 +803,7 @@ impl MotionStageSwiftClientInner {
 
     fn reset_scene(&mut self) -> Result<(), String> {
         self.drain_control_backlog()?;
-        {
+        let session_id = {
             let session = self
                 .session
                 .as_mut()
@@ -700,8 +816,13 @@ impl MotionStageSwiftClientInner {
                         .send(&ControlMessage::ResetSceneToBaseline { scene_id: None }),
                 )
                 .map_err(|err| format!("failed to send ResetSceneToBaseline: {err}"))?;
-        }
+            session.session_id
+        };
 
+        // Protocol 2.1: success has no direct reply. The acknowledgement is our
+        // own StateEventMsg echo carrying BaselineApplied{action: ResetScene};
+        // failure arrives as ControlMessage::Error. The retired
+        // BaselineActionApplied direct ack is still accepted for older servers.
         let deadline = Instant::now() + self.reset_scene_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -714,6 +835,22 @@ impl MotionStageSwiftClientInner {
                     action: BaselineAction::ResetScene,
                     ..
                 } => return Ok(()),
+                ControlMessage::StateEventMsg(envelope) => {
+                    let matched = envelope.origin_session == Some(session_id)
+                        && matches!(
+                            envelope.event,
+                            StateEvent::BaselineApplied {
+                                action: BaselineAction::ResetScene,
+                                ..
+                            }
+                        );
+                    // Keep the echo visible to state-event subscribers, in
+                    // arrival order (dropped if none is registered).
+                    self.queue_state_event(envelope);
+                    if matched {
+                        return Ok(());
+                    }
+                }
                 ControlMessage::Error { code, reason } => {
                     return Err(format!(
                         "reset scene rejected: code={code:?} reason={reason}"
@@ -755,8 +892,13 @@ impl MotionStageSwiftClientInner {
         self.wait_for_mode_state_matching(|mode| mode.recording == state)
     }
 
-    /// Wait for a `ModeState` response that satisfies `accept` and return
-    /// `(data_flow_i32, recording_i32)`.
+    /// Wait for confirmation that the composite mode satisfies `accept` and
+    /// return `(data_flow_i32, recording_i32)`.
+    ///
+    /// Protocol 2.1: a successful `SetDataFlow`/`SetRecording` has no direct
+    /// reply — the acknowledgement is our own `StateEventMsg` echo carrying
+    /// `ModeChanged`. Failures arrive as `ControlMessage::Error`. `ModeState`
+    /// is still accepted (heartbeat probe / older servers).
     fn wait_for_mode_state_matching<F>(&mut self, accept: F) -> Result<(i32, i32), String>
     where
         F: Fn(&Mode) -> bool,
@@ -765,6 +907,11 @@ impl MotionStageSwiftClientInner {
             return Ok(mode);
         }
 
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.session_id)
+            .ok_or_else(|| "client is not connected".to_owned())?;
         let mode_reply_timeout = self.mode_reply_timeout;
         let deadline = Instant::now() + mode_reply_timeout;
         loop {
@@ -780,6 +927,22 @@ impl MotionStageSwiftClientInner {
                     }
                     self.pending_mode_states.push_back(mode);
                 }
+                ControlMessage::StateEventMsg(envelope) => {
+                    let matched_mode = match &envelope.event {
+                        StateEvent::ModeChanged { mode }
+                            if envelope.origin_session == Some(session_id) && accept(mode) =>
+                        {
+                            Some(*mode)
+                        }
+                        _ => None,
+                    };
+                    // Keep the echo visible to state-event subscribers, in
+                    // arrival order (dropped if none is registered).
+                    self.queue_state_event(envelope);
+                    if let Some(mode) = matched_mode {
+                        return Ok((mode_to_data_flow_i32(&mode), mode_to_recording_i32(&mode)));
+                    }
+                }
                 ControlMessage::Error { code, reason } => {
                     return Err(format!(
                         "mode request rejected: code={code:?} reason={reason}"
@@ -792,6 +955,180 @@ impl MotionStageSwiftClientInner {
             }
         }
     }
+
+    // -- Operator plane (protocol 2.1) --------------------------------------
+
+    /// Send `request` and wait for the message `matcher` recognises as the
+    /// direct reply. Unrelated messages (state-event echoes, video signals,
+    /// heartbeat probes) are stashed for their own consumers — direct replies
+    /// and event echoes may interleave in any order, so we match on message
+    /// type, never on position.
+    fn wire_request<T>(
+        &mut self,
+        request: ControlMessage,
+        mut matcher: impl FnMut(ControlMessage) -> WireReply<T>,
+    ) -> Result<T, String> {
+        self.drain_control_backlog()?;
+        {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| "client is not connected".to_owned())?;
+            get_runtime()
+                .block_on(session.control.send(&request))
+                .map_err(|err| format!("failed to send control request: {err}"))?;
+        }
+
+        let deadline = Instant::now() + self.mode_reply_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for control response".to_owned());
+            }
+            match matcher(self.recv_control_with_timeout(remaining)?) {
+                WireReply::Done(result) => return result,
+                WireReply::Other(ControlMessage::Pong) => continue,
+                WireReply::Other(other) => self.stash_control_message(other),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wire_create_mapping(
+        &mut self,
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<Uuid>,
+        target_object: Uuid,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+    ) -> Result<Result<MappingSummary, WireError>, String> {
+        self.wire_request(
+            ControlMessage::CreateMapping {
+                source_device,
+                source_output,
+                target_scene,
+                target_object,
+                target_attribute,
+                component_mask,
+            },
+            |message| match message {
+                ControlMessage::MappingCreateResult { result } => WireReply::Done(Ok(result)),
+                ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                    "mapping request rejected: code={code:?} reason={reason}"
+                ))),
+                other => WireReply::Other(other),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wire_update_mapping(
+        &mut self,
+        mapping_id: Uuid,
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<Uuid>,
+        target_object: Uuid,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+    ) -> Result<Result<MappingSummary, WireError>, String> {
+        self.wire_request(
+            ControlMessage::UpdateMapping {
+                mapping_id,
+                source_device,
+                source_output,
+                target_scene,
+                target_object,
+                target_attribute,
+                component_mask,
+            },
+            |message| match message {
+                ControlMessage::MappingCreateResult { result } => WireReply::Done(Ok(result)),
+                ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                    "mapping request rejected: code={code:?} reason={reason}"
+                ))),
+                other => WireReply::Other(other),
+            },
+        )
+    }
+
+    fn wire_remove_mapping(&mut self, mapping_id: Uuid) -> Result<Result<(), WireError>, String> {
+        self.wire_request(
+            ControlMessage::RemoveMapping { mapping_id },
+            move |message| match message {
+                ControlMessage::MappingOpResult {
+                    mapping_id: reply_id,
+                    result,
+                } if reply_id == mapping_id => WireReply::Done(Ok(result)),
+                ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                    "mapping request rejected: code={code:?} reason={reason}"
+                ))),
+                other => WireReply::Other(other),
+            },
+        )
+    }
+
+    fn wire_set_mapping_lock(
+        &mut self,
+        mapping_id: Uuid,
+        lock: bool,
+    ) -> Result<Result<(), WireError>, String> {
+        self.wire_request(
+            ControlMessage::SetMappingLock { mapping_id, lock },
+            move |message| match message {
+                ControlMessage::MappingOpResult {
+                    mapping_id: reply_id,
+                    result,
+                } if reply_id == mapping_id => WireReply::Done(Ok(result)),
+                ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                    "mapping request rejected: code={code:?} reason={reason}"
+                ))),
+                other => WireReply::Other(other),
+            },
+        )
+    }
+
+    fn wire_start_take(&mut self) -> Result<Result<Uuid, WireError>, String> {
+        self.wire_request(ControlMessage::StartTake, |message| match message {
+            ControlMessage::TakeStartResult { result } => WireReply::Done(Ok(result)),
+            ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                "take request rejected: code={code:?} reason={reason}"
+            ))),
+            other => WireReply::Other(other),
+        })
+    }
+
+    fn wire_stop_take(&mut self) -> Result<Result<TakeInfo, WireError>, String> {
+        self.wire_request(ControlMessage::StopTake, |message| match message {
+            ControlMessage::TakeStopResult { result } => WireReply::Done(Ok(result)),
+            ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                "take request rejected: code={code:?} reason={reason}"
+            ))),
+            other => WireReply::Other(other),
+        })
+    }
+
+    /// Request an on-demand full world snapshot. The direct reply is returned
+    /// to the caller only — it is not forwarded to the state-event stream
+    /// (unsolicited snapshots, e.g. handshake or lag recovery, are).
+    fn wire_get_scene_snapshot(&mut self) -> Result<SceneSnapshotPayload, String> {
+        self.wire_request(ControlMessage::GetSceneSnapshot, |message| match message {
+            ControlMessage::SceneSnapshot(payload) => WireReply::Done(Ok(payload)),
+            ControlMessage::Error { code, reason } => WireReply::Done(Err(format!(
+                "snapshot request rejected: code={code:?} reason={reason}"
+            ))),
+            other => WireReply::Other(other),
+        })
+    }
+}
+
+/// Outcome of inspecting one control message while waiting for a direct reply.
+enum WireReply<T> {
+    /// The message was the direct reply (or a fatal error) — stop waiting.
+    Done(Result<T, String>),
+    /// Unrelated message — stash it for its own consumer and keep waiting.
+    Other(ControlMessage),
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +1238,13 @@ async fn connect_with_endpoint(
             return Err(format!(
                 "registration rejected: code={:?} reason={}",
                 rejected.code, rejected.reason
+            ));
+        }
+        // Protocol 2.1: version-mismatch / out-of-order handshake failures are
+        // typed `Error` messages flushed before the server drops us.
+        ControlMessage::Error { code, reason } => {
+            return Err(format!(
+                "registration rejected: code={code:?} reason={reason}"
             ));
         }
         other => {
@@ -1066,11 +1410,45 @@ fn make_client_inner(
         mode_reply_timeout,
         reset_scene_timeout,
         last_send_ns,
+        state_event_subscribed: Arc::new(AtomicBool::new(false)),
+        dropped_unsubscribed_events: 0,
         pending_mode_states: VecDeque::new(),
         pending_video_offers: VecDeque::new(),
         pending_video_signals: VecDeque::new(),
         pending_video_statuses: VecDeque::new(),
+        pending_state_stream: VecDeque::new(),
     })
+}
+
+/// Box a fully-initialized client and hand ownership to the caller as an
+/// opaque pointer (shared tail of every `motionstage_swift_client_new*`).
+fn into_client_ptr(
+    inner: MotionStageSwiftClientInner,
+    last_send_ns: Arc<AtomicU64>,
+) -> *mut c_void {
+    // Share the subscription flag with the client so
+    // `set_state_event_callback` can flip it and `stash_control_message` can
+    // read it without taking the inner lock.
+    let state_event_subscribed = Arc::clone(&inner.state_event_subscribed);
+    let client = MotionStageSwiftClient {
+        inner: Mutex::new(inner),
+        last_send_ns,
+        ping_shutdown: Arc::new(AtomicBool::new(false)),
+        ping_thread: Mutex::new(None),
+        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
+            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
+        )),
+        reconnect_policy: Mutex::new(None),
+        connect_params: Mutex::new(None),
+        event_callback: Mutex::new(None),
+        state_event_callback: Mutex::new(None),
+        state_event_subscribed,
+        state_event_epoch: Arc::new(AtomicU64::new(0)),
+        state_event_shutdown: Arc::new(AtomicBool::new(false)),
+        state_event_thread: Mutex::new(None),
+    };
+
+    Box::into_raw(Box::new(client)).cast::<c_void>()
 }
 
 unsafe fn read_required_cstr(input: *const c_char, field: &str) -> Result<String, String> {
@@ -1102,6 +1480,20 @@ unsafe fn read_optional_cstr(input: *const c_char, field: &str) -> Result<Option
         Ok(None)
     } else {
         Ok(Some(value.to_owned()))
+    }
+}
+
+unsafe fn read_required_uuid(input: *const c_char, field: &str) -> Result<Uuid, String> {
+    let value = unsafe { read_required_cstr(input, field) }?;
+    Uuid::parse_str(value.trim()).map_err(|err| format!("{field} must be a UUID: {err}"))
+}
+
+unsafe fn read_optional_uuid(input: *const c_char, field: &str) -> Result<Option<Uuid>, String> {
+    match unsafe { read_optional_cstr(input, field) }? {
+        Some(value) => Uuid::parse_str(value.trim())
+            .map(Some)
+            .map_err(|err| format!("{field} must be a UUID: {err}")),
+        None => Ok(None),
     }
 }
 
@@ -1349,6 +1741,148 @@ fn fire_event(
 }
 
 // ---------------------------------------------------------------------------
+// State-event JSON encoding + pump thread (operator plane, protocol 2.1)
+// ---------------------------------------------------------------------------
+
+/// Re-tag serde's externally-tagged enum JSON (`{"Variant":{...}}` or
+/// `"Variant"`) as `{"type":"Variant","data":{...}}` so FFI consumers switch
+/// on a stable `type` field.
+fn tagged_event_value(event: &StateEvent) -> Result<serde_json::Value, String> {
+    let value = serde_json::to_value(event)
+        .map_err(|err| format!("failed to serialize state event: {err}"))?;
+    Ok(match value {
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            let (variant, data) = map
+                .into_iter()
+                .next()
+                .expect("single-entry map has an entry");
+            serde_json::json!({ "type": variant, "data": data })
+        }
+        serde_json::Value::String(variant) => serde_json::json!({ "type": variant }),
+        other => other,
+    })
+}
+
+/// Encode one `StateEventMsg` envelope for the state-event callback.
+/// Shape: `{"kind":"state_event","seq":u64,"origin_session":"<uuid>"|null,
+/// "timestamp_ns":u64,"event":{"type":"<Variant>","data":{...}}}`.
+fn state_event_to_json(envelope: &StateEventEnvelope) -> Result<String, String> {
+    let event = tagged_event_value(&envelope.event)?;
+    serde_json::to_string(&serde_json::json!({
+        "kind": "state_event",
+        "seq": envelope.seq,
+        "origin_session": envelope.origin_session,
+        "timestamp_ns": envelope.timestamp_ns,
+        "event": event,
+    }))
+    .map_err(|err| format!("failed to serialize state event envelope: {err}"))
+}
+
+/// Encode a scene snapshot for the state-event callback.
+/// Shape: `{"kind":"scene_snapshot","snapshot":{...SceneSnapshotPayload...}}`.
+fn snapshot_to_json(payload: &SceneSnapshotPayload) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "scene_snapshot",
+        "snapshot": payload,
+    }))
+    .map_err(|err| format!("failed to serialize scene snapshot: {err}"))
+}
+
+/// Encode an operator-op result for FFI: `{"ok":<T-as-JSON>}` on success
+/// (`{"ok":null}` for unit results) or
+/// `{"err":{"code":"<RejectCode>","reason":"..."}}` on a typed wire error.
+fn wire_result_json<T: Serialize>(result: &Result<T, WireError>) -> Result<String, String> {
+    let value = match result {
+        Ok(payload) => {
+            let payload = serde_json::to_value(payload)
+                .map_err(|err| format!("failed to serialize wire result: {err}"))?;
+            serde_json::json!({ "ok": payload })
+        }
+        Err(error) => serde_json::json!({
+            "err": { "code": format!("{:?}", error.code), "reason": error.reason }
+        }),
+    };
+    serde_json::to_string(&value).map_err(|err| format!("failed to serialize wire result: {err}"))
+}
+
+const STATE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Background pump: periodically drains the control-stream backlog and
+/// delivers queued `StateEventMsg`s / unsolicited `SceneSnapshot`s to the
+/// registered state-event callback as JSON. Spawned on first subscription and
+/// parked (joined) by `motionstage_swift_client_free`.
+fn start_state_event_pump(
+    client_ptr: usize,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("motionstage-state-events".into())
+        .spawn(move || loop {
+            std::thread::sleep(STATE_EVENT_POLL_INTERVAL);
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let client_ref = unsafe { &*(client_ptr as *const MotionStageSwiftClient) };
+
+            // Hold the callback lock for the whole dispatch batch. This is the
+            // fix for the unregister/dispatch race: `set_state_event_callback`
+            // takes the same lock, so a NULL/swap cannot land while a delivery
+            // with the old context is in flight — NULL reliably quiesces
+            // delivery before it returns. We also snapshot the epoch and
+            // re-check it (and shutdown) before each invocation as defence in
+            // depth. NOTE (Swift side): a callback must not reentrantly call
+            // `set_state_event_callback` (it would deadlock on this lock).
+            let callback_guard = client_ref
+                .state_event_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch_epoch = client_ref.state_event_epoch.load(Ordering::Acquire);
+            let Some((callback, ctx)) = *callback_guard else {
+                continue;
+            };
+
+            // Drain the single arrival-ordered queue and serialize each item in
+            // order: a lag-recovery snapshot is delivered before the events that
+            // followed it on the wire (preserving the seq<=snapshot.seq rule).
+            let mut messages: Vec<String> = Vec::new();
+            {
+                let mut inner = client_ref
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if inner.session.is_some() {
+                    // Transport errors surface via the connection monitor;
+                    // the pump just retries on the next tick.
+                    let _ = inner.drain_control_backlog();
+                }
+                while let Some(item) = inner.pending_state_stream.pop_front() {
+                    let json = match &item {
+                        StateStreamItem::Event(envelope) => state_event_to_json(envelope),
+                        StateStreamItem::Snapshot(payload) => snapshot_to_json(payload),
+                    };
+                    if let Ok(json) = json {
+                        messages.push(json);
+                    }
+                }
+            }
+
+            for json in messages {
+                if shutdown.load(Ordering::Relaxed)
+                    || client_ref.state_event_epoch.load(Ordering::Acquire) != batch_epoch
+                {
+                    break;
+                }
+                if let Ok(c_json) = CString::new(json) {
+                    unsafe { callback(c_json.as_ptr(), ctx as *mut c_void) };
+                }
+            }
+            drop(callback_guard);
+        })
+        .expect("failed to spawn state-event pump thread")
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Runtime (2.3)
 // ---------------------------------------------------------------------------
 
@@ -1402,20 +1936,7 @@ pub extern "C" fn motionstage_swift_client_new(
         Err(_) => return ptr::null_mut(),
     };
 
-    let client = MotionStageSwiftClient {
-        inner: Mutex::new(inner),
-        last_send_ns,
-        ping_shutdown: Arc::new(AtomicBool::new(false)),
-        ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
-            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-        )),
-        reconnect_policy: Mutex::new(None),
-        connect_params: Mutex::new(None),
-        event_callback: Mutex::new(None),
-    };
-
-    Box::into_raw(Box::new(client)).cast::<c_void>()
+    into_client_ptr(inner, last_send_ns)
 }
 
 /// Deprecated: prefer `motionstage_swift_client_new_v2` which takes an explicit array.
@@ -1454,20 +1975,7 @@ pub extern "C" fn motionstage_swift_client_new_multi(
             Err(_) => return ptr::null_mut(),
         };
 
-    let client = MotionStageSwiftClient {
-        inner: Mutex::new(inner),
-        last_send_ns,
-        ping_shutdown: Arc::new(AtomicBool::new(false)),
-        ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
-            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-        )),
-        reconnect_policy: Mutex::new(None),
-        connect_params: Mutex::new(None),
-        event_callback: Mutex::new(None),
-    };
-
-    Box::into_raw(Box::new(client)).cast::<c_void>()
+    into_client_ptr(inner, last_send_ns)
 }
 
 #[no_mangle]
@@ -1516,20 +2024,7 @@ pub extern "C" fn motionstage_swift_client_new_multi_with_config(
         Err(_) => return ptr::null_mut(),
     };
 
-    let client = MotionStageSwiftClient {
-        inner: Mutex::new(inner),
-        last_send_ns,
-        ping_shutdown: Arc::new(AtomicBool::new(false)),
-        ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
-            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-        )),
-        reconnect_policy: Mutex::new(None),
-        connect_params: Mutex::new(None),
-        event_callback: Mutex::new(None),
-    };
-
-    Box::into_raw(Box::new(client)).cast::<c_void>()
+    into_client_ptr(inner, last_send_ns)
 }
 
 /// Array-based constructor (2.2). Prefer over `_new_multi`.
@@ -1567,20 +2062,7 @@ pub extern "C" fn motionstage_swift_client_new_v2(
             Err(_) => return ptr::null_mut(),
         };
 
-    let client = MotionStageSwiftClient {
-        inner: Mutex::new(inner),
-        last_send_ns,
-        ping_shutdown: Arc::new(AtomicBool::new(false)),
-        ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
-            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-        )),
-        reconnect_policy: Mutex::new(None),
-        connect_params: Mutex::new(None),
-        event_callback: Mutex::new(None),
-    };
-
-    Box::into_raw(Box::new(client)).cast::<c_void>()
+    into_client_ptr(inner, last_send_ns)
 }
 
 /// Typed descriptor constructor (3.0). Preferred over `_new_v2`.
@@ -1620,22 +2102,11 @@ pub extern "C" fn motionstage_swift_client_new_v3(
             Err(_) => return ptr::null_mut(),
         };
 
-    let client = MotionStageSwiftClient {
-        inner: Mutex::new(inner),
-        last_send_ns,
-        ping_shutdown: Arc::new(AtomicBool::new(false)),
-        ping_thread: Mutex::new(None),
-        connection_state: Arc::new(std::sync::atomic::AtomicI32::new(
-            MOTIONSTAGE_SWIFT_CONNECTION_DISCONNECTED,
-        )),
-        reconnect_policy: Mutex::new(None),
-        connect_params: Mutex::new(None),
-        event_callback: Mutex::new(None),
-    };
-
-    Box::into_raw(Box::new(client)).cast::<c_void>()
+    into_client_ptr(inner, last_send_ns)
 }
 
+/// Free a client. Must NOT be called from within one of the client's own
+/// callbacks (it joins the state-event pump thread before dropping).
 #[no_mangle]
 pub extern "C" fn motionstage_swift_client_free(client: *mut c_void) {
     if client.is_null() {
@@ -1645,6 +2116,17 @@ pub extern "C" fn motionstage_swift_client_free(client: *mut c_void) {
     let client = unsafe { Box::from_raw(client as *mut MotionStageSwiftClient) };
     // Signal ping thread to stop before dropping.
     client.ping_shutdown.store(true, Ordering::Relaxed);
+    // Stop the state-event pump and wait for it: it dereferences the client
+    // pointer on every tick, so it must be parked before the box drops.
+    client.state_event_shutdown.store(true, Ordering::Relaxed);
+    let pump = client
+        .state_event_thread
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(handle) = pump {
+        let _ = handle.join();
+    }
     drop(client);
 }
 
@@ -2902,7 +3384,9 @@ pub extern "C" fn motionstage_swift_client_video_send_ice(
 }
 
 #[no_mangle]
-pub extern "C" fn motionstage_swift_client_video_next_signal_json(client: *mut c_void) -> *mut c_char {
+pub extern "C" fn motionstage_swift_client_video_next_signal_json(
+    client: *mut c_void,
+) -> *mut c_char {
     let mut client = match lock_client(client) {
         Ok(client) => client,
         Err(_) => return ptr::null_mut(),
@@ -2937,6 +3421,357 @@ fn classify_mode_error(client: &mut MotionStageSwiftClientInner, err: String) ->
         client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err)
     } else {
         client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FFI: Operator plane (protocol 2.1)
+// ---------------------------------------------------------------------------
+
+/// Classify a transport-level error string from the operator-plane helpers
+/// into an FFI status code (typed wire errors travel inside the result JSON
+/// instead and report MOTIONSTAGE_SWIFT_STATUS_OK).
+fn classify_wire_transport_error(client: &mut MotionStageSwiftClientInner, err: String) -> i32 {
+    if err.contains("must be a UUID") || err.contains("must not be") || err.contains("invalid") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, err)
+    } else if err.contains("not connected") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED, err)
+    } else if err.contains("rejected") {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_PROTOCOL, err)
+    } else {
+        client.fail(MOTIONSTAGE_SWIFT_STATUS_TRANSPORT, err)
+    }
+}
+
+/// Shared tail of the operator-plane FFI ops: serialize the typed wire result
+/// into `*out_result_json` (owned; free with `motionstage_swift_string_free`)
+/// or classify the transport error.
+fn finish_wire_op<T: Serialize>(
+    client: &mut MotionStageSwiftClientInner,
+    result: Result<Result<T, WireError>, String>,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    match result {
+        Ok(wire_result) => match wire_result_json(&wire_result) {
+            Ok(json) => {
+                unsafe {
+                    *out_result_json = into_c_string_ptr(&json);
+                }
+                client.clear_error();
+                MOTIONSTAGE_SWIFT_STATUS_OK
+            }
+            Err(err) => client.fail(MOTIONSTAGE_SWIFT_STATUS_INTERNAL, err),
+        },
+        Err(err) => classify_wire_transport_error(client, err),
+    }
+}
+
+/// Convert an optional C mask array to the wire component mask.
+fn read_component_mask(mask: *const u32, mask_len: u32) -> Option<Vec<usize>> {
+    if mask.is_null() || mask_len == 0 {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(mask, mask_len as usize) };
+    Some(slice.iter().map(|&index| index as usize).collect())
+}
+
+/// Register a callback for the server->client state-event stream
+/// (StateEventMsg envelopes plus unsolicited SceneSnapshots), delivered as
+/// JSON (see `MotionStageStateEventCallback` for the schema). The first
+/// registration spawns a background pump thread that lives until
+/// `motionstage_swift_client_free`.
+///
+/// Set callback to NULL to unsubscribe. NULL reliably quiesces delivery: this
+/// call blocks until any in-flight dispatch batch finishes, so on return the
+/// old context pointer is guaranteed no longer in use and is safe to free.
+/// While unsubscribed the SDK **drops** incoming state-stream messages instead
+/// of queueing them (an unsubscribed client must not accumulate an unbounded
+/// backlog); a later re-subscription recovers full state via the normal
+/// lag→SceneSnapshot resync path. A callback must not reentrantly call this
+/// function.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_state_event_callback(
+    client: *mut c_void,
+    callback: Option<MotionStageStateEventCallback>,
+    context: *mut c_void,
+) -> i32 {
+    if client.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+
+    // Bump the epoch first so any in-flight pump batch that re-checks it stops
+    // calling the old context. Then swap the callback under the lock the pump
+    // holds across its dispatch batch: this call blocks until the batch
+    // finishes, so on return no delivery with the previous context is in
+    // flight (NULL reliably quiesces delivery).
+    client_ref
+        .state_event_epoch
+        .fetch_add(1, Ordering::AcqRel);
+    {
+        let mut guard = client_ref
+            .state_event_callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = callback.map(|cb| (cb, context as usize));
+        // Toggle the shared subscription flag while holding the callback lock
+        // so the flag and the stored callback change together.
+        client_ref
+            .state_event_subscribed
+            .store(callback.is_some(), Ordering::Release);
+    }
+
+    if callback.is_some() {
+        let mut thread_guard = client_ref
+            .state_event_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if thread_guard.is_none() {
+            *thread_guard = Some(start_state_event_pump(
+                client as usize,
+                Arc::clone(&client_ref.state_event_shutdown),
+            ));
+        }
+    }
+
+    MOTIONSTAGE_SWIFT_STATUS_OK
+}
+
+/// Create a mapping (operator plane).
+/// `source_device`: UUID string or NULL = this session's own device.
+/// `target_scene`: UUID string or NULL = the active scene.
+/// `component_mask`: NULL = all components; otherwise `component_mask_len`
+/// component indices.
+/// On MOTIONSTAGE_SWIFT_STATUS_OK, `*out_result_json` receives an owned JSON
+/// string — `{"ok":{MappingSummary}}` or `{"err":{"code":"<RejectCode>","reason":"..."}}`
+/// — free it with `motionstage_swift_string_free`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_create_mapping(
+    client: *mut c_void,
+    source_device: *const c_char,
+    source_output: *const c_char,
+    target_scene: *const c_char,
+    target_object: *const c_char,
+    target_attribute: *const c_char,
+    component_mask: *const u32,
+    component_mask_len: u32,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let parsed = (|| {
+        Ok::<_, String>((
+            unsafe { read_optional_uuid(source_device, "source_device") }?,
+            unsafe { read_required_cstr(source_output, "source_output") }?,
+            unsafe { read_optional_uuid(target_scene, "target_scene") }?,
+            unsafe { read_required_uuid(target_object, "target_object") }?,
+            unsafe { read_required_cstr(target_attribute, "target_attribute") }?,
+        ))
+    })();
+    let mask = read_component_mask(component_mask, component_mask_len);
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let (source_device, source_output, target_scene, target_object, target_attribute) = match parsed
+    {
+        Ok(values) => values,
+        Err(message) => return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message),
+    };
+
+    let result = client.wire_create_mapping(
+        source_device,
+        source_output,
+        target_scene,
+        target_object,
+        target_attribute,
+        mask,
+    );
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Replace a mapping's full definition (operator plane). Argument semantics
+/// and result JSON are identical to `motionstage_swift_client_create_mapping`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn motionstage_swift_client_update_mapping(
+    client: *mut c_void,
+    mapping_id: *const c_char,
+    source_device: *const c_char,
+    source_output: *const c_char,
+    target_scene: *const c_char,
+    target_object: *const c_char,
+    target_attribute: *const c_char,
+    component_mask: *const u32,
+    component_mask_len: u32,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+
+    let parsed = (|| {
+        Ok::<_, String>((
+            unsafe { read_required_uuid(mapping_id, "mapping_id") }?,
+            unsafe { read_optional_uuid(source_device, "source_device") }?,
+            unsafe { read_required_cstr(source_output, "source_output") }?,
+            unsafe { read_optional_uuid(target_scene, "target_scene") }?,
+            unsafe { read_required_uuid(target_object, "target_object") }?,
+            unsafe { read_required_cstr(target_attribute, "target_attribute") }?,
+        ))
+    })();
+    let mask = read_component_mask(component_mask, component_mask_len);
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let (mapping_id, source_device, source_output, target_scene, target_object, target_attribute) =
+        match parsed {
+            Ok(values) => values,
+            Err(message) => return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message),
+        };
+
+    let result = client.wire_update_mapping(
+        mapping_id,
+        source_device,
+        source_output,
+        target_scene,
+        target_object,
+        target_attribute,
+        mask,
+    );
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Remove a mapping (operator plane).
+/// On MOTIONSTAGE_SWIFT_STATUS_OK, `*out_result_json` receives `{"ok":null}`
+/// or `{"err":{...}}`; free with `motionstage_swift_string_free`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_remove_mapping(
+    client: *mut c_void,
+    mapping_id: *const c_char,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let parsed = unsafe { read_required_uuid(mapping_id, "mapping_id") };
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let mapping_id = match parsed {
+        Ok(value) => value,
+        Err(message) => return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message),
+    };
+
+    let result = client.wire_remove_mapping(mapping_id);
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Lock or unlock a mapping (operator plane). `lock`: 0 = unlock, else lock.
+/// Result JSON as for `motionstage_swift_client_remove_mapping`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_set_mapping_lock(
+    client: *mut c_void,
+    mapping_id: *const c_char,
+    lock: i32,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let parsed = unsafe { read_required_uuid(mapping_id, "mapping_id") };
+
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let mapping_id = match parsed {
+        Ok(value) => value,
+        Err(message) => return client.fail(MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT, message),
+    };
+
+    let result = client.wire_set_mapping_lock(mapping_id, lock != 0);
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Start recording a take (Operator role required; the server assigns the
+/// take id and path). On MOTIONSTAGE_SWIFT_STATUS_OK, `*out_result_json`
+/// receives `{"ok":"<take-uuid>"}` or `{"err":{...}}`; free with
+/// `motionstage_swift_string_free`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_start_take(
+    client: *mut c_void,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let result = client.wire_start_take();
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Stop the active recording and register the take (Operator role required).
+/// On MOTIONSTAGE_SWIFT_STATUS_OK, `*out_result_json` receives
+/// `{"ok":{TakeInfo}}` or `{"err":{...}}`; free with
+/// `motionstage_swift_string_free`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_stop_take(
+    client: *mut c_void,
+    out_result_json: *mut *mut c_char,
+) -> i32 {
+    if out_result_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    let result = client.wire_stop_take();
+    finish_wire_op(&mut client, result, out_result_json)
+}
+
+/// Request an on-demand full world snapshot. On MOTIONSTAGE_SWIFT_STATUS_OK,
+/// `*out_snapshot_json` receives the SceneSnapshotPayload as JSON (no
+/// `{"ok":...}` envelope — the request has no typed wire error); free with
+/// `motionstage_swift_string_free`.
+#[no_mangle]
+pub extern "C" fn motionstage_swift_client_get_scene_snapshot(
+    client: *mut c_void,
+    out_snapshot_json: *mut *mut c_char,
+) -> i32 {
+    if out_snapshot_json.is_null() {
+        return MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT;
+    }
+    let mut client = match lock_client(client) {
+        Ok(client) => client,
+        Err(status) => return status,
+    };
+    match client.wire_get_scene_snapshot() {
+        Ok(payload) => match serde_json::to_string(&payload) {
+            Ok(json) => {
+                unsafe {
+                    *out_snapshot_json = into_c_string_ptr(&json);
+                }
+                client.clear_error();
+                MOTIONSTAGE_SWIFT_STATUS_OK
+            }
+            Err(err) => client.fail(
+                MOTIONSTAGE_SWIFT_STATUS_INTERNAL,
+                format!("failed to serialize scene snapshot: {err}"),
+            ),
+        },
+        Err(err) => classify_wire_transport_error(&mut client, err),
     }
 }
 
@@ -3080,6 +3915,14 @@ mod tests {
     use super::*;
     use motionstage_server::{ServerConfig, ServerHandle};
 
+    fn test_server_config() -> ServerConfig {
+        ServerConfig {
+            quic_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_discovery: false,
+            ..ServerConfig::default()
+        }
+    }
+
     fn ptr_to_string_and_free(value: *mut c_char) -> Option<String> {
         if value.is_null() {
             return None;
@@ -3105,11 +3948,7 @@ mod tests {
     #[test]
     fn ffi_client_connects_and_sends_motion_to_server() {
         let rt = Runtime::new().expect("runtime builds");
-        let mut config = ServerConfig::default();
-        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.enable_discovery = false;
-
-        let server = ServerHandle::new(config);
+        let server = ServerHandle::new(test_server_config());
         rt.block_on(server.start()).expect("server starts");
         let server_addr = rt.block_on(server.quic_bind_addr()).to_string();
 
@@ -3161,11 +4000,7 @@ mod tests {
     #[test]
     fn ffi_multi_client_connects_and_sends_motion_frame() {
         let rt = Runtime::new().expect("runtime builds");
-        let mut config = ServerConfig::default();
-        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.enable_discovery = false;
-
-        let server = ServerHandle::new(config);
+        let server = ServerHandle::new(test_server_config());
         rt.block_on(server.start()).expect("server starts");
         let server_addr = rt.block_on(server.quic_bind_addr()).to_string();
 
@@ -3228,5 +4063,449 @@ mod tests {
         let client = motionstage_swift_client_new_v2(device_name.as_ptr(), 2, names.as_ptr());
         assert!(!client.is_null());
         motionstage_swift_client_free(client);
+    }
+
+    #[test]
+    fn wire_result_json_encodes_ok_err_and_unit() {
+        let summary = MappingSummary {
+            mapping_id: Uuid::nil(),
+            source_device: Uuid::nil(),
+            source_output: "camera.position".into(),
+            target_scene: Uuid::nil(),
+            target_object: Uuid::nil(),
+            target_attribute: "position".into(),
+            component_mask: Some(vec![0, 2]),
+            lock: false,
+        };
+        let ok: Result<MappingSummary, WireError> = Ok(summary);
+        let json: serde_json::Value =
+            serde_json::from_str(&wire_result_json(&ok).unwrap()).unwrap();
+        assert_eq!(json["ok"]["source_output"], "camera.position");
+        assert_eq!(json["ok"]["component_mask"][1], 2);
+        assert!(json.get("err").is_none());
+
+        let err: Result<(), WireError> = Err(WireError {
+            code: motionstage_protocol::RejectCode::RoleDenied,
+            reason: "operator role is required".into(),
+        });
+        let json: serde_json::Value =
+            serde_json::from_str(&wire_result_json(&err).unwrap()).unwrap();
+        assert_eq!(json["err"]["code"], "RoleDenied");
+        assert_eq!(json["err"]["reason"], "operator role is required");
+
+        let unit: Result<(), WireError> = Ok(());
+        let json: serde_json::Value =
+            serde_json::from_str(&wire_result_json(&unit).unwrap()).unwrap();
+        assert!(json["ok"].is_null());
+        assert!(json.get("err").is_none());
+    }
+
+    #[test]
+    fn state_event_json_uses_stable_type_data_tagging() {
+        let session = Uuid::now_v7();
+        let envelope = StateEventEnvelope {
+            seq: 7,
+            origin_session: Some(session),
+            timestamp_ns: 123,
+            event: StateEvent::ModeChanged { mode: Mode::LIVE },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&state_event_to_json(&envelope).unwrap()).unwrap();
+        assert_eq!(json["kind"], "state_event");
+        assert_eq!(json["seq"], 7);
+        assert_eq!(json["origin_session"], session.to_string().as_str());
+        assert_eq!(json["timestamp_ns"], 123);
+        assert_eq!(json["event"]["type"], "ModeChanged");
+        assert_eq!(json["event"]["data"]["mode"]["data_flow"], "Live");
+        assert_eq!(json["event"]["data"]["mode"]["recording"], "Inactive");
+
+        let envelope = StateEventEnvelope {
+            seq: 8,
+            origin_session: None,
+            timestamp_ns: 124,
+            event: StateEvent::MappingRemoved {
+                mapping_id: Uuid::nil(),
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&state_event_to_json(&envelope).unwrap()).unwrap();
+        assert!(json["origin_session"].is_null());
+        assert_eq!(json["event"]["type"], "MappingRemoved");
+        assert_eq!(
+            json["event"]["data"]["mapping_id"],
+            Uuid::nil().to_string().as_str()
+        );
+    }
+
+    /// Collects state-event JSON documents into a `Mutex<Vec<String>>` passed
+    /// as the context pointer.
+    unsafe extern "C" fn collect_state_events(json: *const c_char, ctx: *mut c_void) {
+        let store = unsafe { &*(ctx as *const Mutex<Vec<String>>) };
+        let value = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    }
+
+    fn wire_op_json(status: i32, out_json: *mut c_char, client: *mut c_void) -> serde_json::Value {
+        assert_eq!(
+            status,
+            MOTIONSTAGE_SWIFT_STATUS_OK,
+            "wire op failed: {}",
+            ptr_to_string_and_free(motionstage_swift_client_last_error(client))
+                .unwrap_or_else(|| "<no error>".to_owned())
+        );
+        let json = ptr_to_string_and_free(out_json).expect("wire op must produce JSON");
+        serde_json::from_str(&json).expect("wire op JSON parses")
+    }
+
+    #[test]
+    fn ffi_operator_ops_and_state_events_round_trip() {
+        use motionstage_core::{AttributeValue, Scene, SceneAttribute, SceneObject};
+
+        let rt = Runtime::new().expect("runtime builds");
+        let take_dir =
+            std::env::temp_dir().join(format!("motionstage-swift-test-{}", Uuid::now_v7()));
+        let mut config = test_server_config();
+        config.take_catalog_path = take_dir.join("takes_catalog.json");
+
+        let server = ServerHandle::new(config);
+        rt.block_on(server.start()).expect("server starts");
+
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        // First loaded scene becomes the active scene.
+        rt.block_on(server.load_scene(Scene::new("shot").with_object(object)));
+
+        let server_addr = rt.block_on(server.quic_bind_addr()).to_string();
+
+        let device_name = CString::new("operator-ipad").unwrap();
+        let attr = CString::new("camera.position").unwrap();
+        let client = motionstage_swift_client_new(device_name.as_ptr(), attr.as_ptr());
+        assert!(!client.is_null());
+
+        let events: Box<Mutex<Vec<String>>> = Box::new(Mutex::new(Vec::new()));
+        let events_ctx = &*events as *const Mutex<Vec<String>> as *mut c_void;
+        assert_eq!(
+            motionstage_swift_client_set_state_event_callback(
+                client,
+                Some(collect_state_events),
+                events_ctx,
+            ),
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        );
+
+        let server_addr_c = CString::new(server_addr).unwrap();
+        assert_eq!(
+            motionstage_swift_client_connect(
+                client,
+                server_addr_c.as_ptr(),
+                ptr::null(),
+                ptr::null()
+            ),
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        );
+        let device_id = ptr_to_string_and_free(motionstage_swift_client_device_id(client))
+            .expect("device id available");
+
+        let source_output = CString::new("camera.position").unwrap();
+        let target_object = CString::new(object_id.to_string()).unwrap();
+        let target_attribute = CString::new("position").unwrap();
+
+        // Create with defaults: NULL source_device = own device, NULL
+        // target_scene = active scene.
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status = motionstage_swift_client_create_mapping(
+            client,
+            ptr::null(),
+            source_output.as_ptr(),
+            ptr::null(),
+            target_object.as_ptr(),
+            target_attribute.as_ptr(),
+            ptr::null(),
+            0,
+            &mut out_json,
+        );
+        let created = wire_op_json(status, out_json, client);
+        assert_eq!(
+            created["ok"]["source_device"],
+            device_id.as_str(),
+            "own-device default must resolve to the caller's device"
+        );
+        assert!(created["ok"]["component_mask"].is_null());
+        let mapping_id = created["ok"]["mapping_id"]
+            .as_str()
+            .expect("mapping id present")
+            .to_owned();
+        let mapping_id_c = CString::new(mapping_id.clone()).unwrap();
+
+        // Full-replacement update adding a component mask.
+        let mask = [0u32, 2u32];
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status = motionstage_swift_client_update_mapping(
+            client,
+            mapping_id_c.as_ptr(),
+            ptr::null(),
+            source_output.as_ptr(),
+            ptr::null(),
+            target_object.as_ptr(),
+            target_attribute.as_ptr(),
+            mask.as_ptr(),
+            mask.len() as u32,
+            &mut out_json,
+        );
+        let updated = wire_op_json(status, out_json, client);
+        assert_eq!(updated["ok"]["mapping_id"], mapping_id.as_str());
+        assert_eq!(updated["ok"]["component_mask"][0], 0);
+        assert_eq!(updated["ok"]["component_mask"][1], 2);
+
+        // Lock, then unlock.
+        for lock in [1, 0] {
+            let mut out_json: *mut c_char = ptr::null_mut();
+            let status = motionstage_swift_client_set_mapping_lock(
+                client,
+                mapping_id_c.as_ptr(),
+                lock,
+                &mut out_json,
+            );
+            let result = wire_op_json(status, out_json, client);
+            assert!(result["ok"].is_null());
+            assert!(result.get("err").is_none());
+        }
+
+        // Take control (Operator role, server-assigned identity).
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status = motionstage_swift_client_start_take(client, &mut out_json);
+        let started = wire_op_json(status, out_json, client);
+        let take_id = started["ok"].as_str().expect("take id present").to_owned();
+        Uuid::parse_str(&take_id).expect("take id is a UUID");
+
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status = motionstage_swift_client_stop_take(client, &mut out_json);
+        let stopped = wire_op_json(status, out_json, client);
+        assert_eq!(stopped["ok"]["take_id"], take_id.as_str());
+        assert!(stopped["ok"]["name"].as_str().is_some());
+        assert!(stopped["ok"]["frame_count"].is_u64());
+
+        // Remove; a second removal reports the typed mapping-not-found error.
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status =
+            motionstage_swift_client_remove_mapping(client, mapping_id_c.as_ptr(), &mut out_json);
+        let removed = wire_op_json(status, out_json, client);
+        assert!(removed["ok"].is_null());
+
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status =
+            motionstage_swift_client_remove_mapping(client, mapping_id_c.as_ptr(), &mut out_json);
+        let missing = wire_op_json(status, out_json, client);
+        assert!(missing.get("ok").is_none());
+        assert_eq!(missing["err"]["code"], "ServerBusy");
+        assert!(missing["err"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("mapping not found"));
+
+        // On-demand snapshot.
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let status = motionstage_swift_client_get_scene_snapshot(client, &mut out_json);
+        assert_eq!(status, MOTIONSTAGE_SWIFT_STATUS_OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&ptr_to_string_and_free(out_json).unwrap()).unwrap();
+        assert_eq!(snapshot["scenes"][0]["name"], "shot");
+        assert!(snapshot["seq"].is_u64());
+        assert_eq!(snapshot["mappings"].as_array().map(Vec::len), Some(0));
+
+        // The pump must have delivered the handshake snapshot plus our own
+        // mutation echoes (no echo suppression) as JSON.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let expected = [
+            "\"kind\":\"scene_snapshot\"",
+            "MappingCreated",
+            "MappingUpdated",
+            "MappingLockChanged",
+            "MappingRemoved",
+            "RecordingStarted",
+            "TakeRegistered",
+        ];
+        loop {
+            let collected = events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let all_seen = expected
+                .iter()
+                .all(|needle| collected.iter().any(|msg| msg.contains(needle)));
+            if all_seen {
+                for msg in &collected {
+                    let value: serde_json::Value =
+                        serde_json::from_str(msg).expect("stream message is valid JSON");
+                    let kind = value["kind"].as_str().unwrap();
+                    assert!(kind == "state_event" || kind == "scene_snapshot");
+                    if kind == "state_event" {
+                        assert!(value["event"]["type"].is_string());
+                    }
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for state events; got: {collected:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            motionstage_swift_client_disconnect(client),
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        );
+        motionstage_swift_client_free(client);
+        rt.block_on(server.stop()).expect("server stops");
+        let _ = std::fs::remove_dir_all(take_dir);
+    }
+
+    fn test_inner() -> MotionStageSwiftClientInner {
+        make_client_inner(
+            "queue-test".to_owned(),
+            vec![AttributeDescriptor {
+                path: "camera.position".to_owned(),
+                value_type: AttributeKind::Vec3f,
+            }],
+            None,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .expect("inner builds")
+    }
+
+    fn sample_snapshot(seq: u64) -> SceneSnapshotPayload {
+        SceneSnapshotPayload {
+            scenes: Vec::new(),
+            mappings: Vec::new(),
+            mode: Mode::IDLE,
+            active_scene: None,
+            sessions: Vec::new(),
+            takes: Vec::new(),
+            playback: None,
+            seq,
+        }
+    }
+
+    fn sample_event(seq: u64) -> StateEventEnvelope {
+        StateEventEnvelope {
+            seq,
+            origin_session: None,
+            timestamp_ns: seq,
+            event: StateEvent::ModeChanged { mode: Mode::LIVE },
+        }
+    }
+
+    /// Finding: the state-event pump must not split events and snapshots into
+    /// separate queues and reorder them. A single arrival-ordered queue must
+    /// deliver a lag-recovery `SceneSnapshot` before the events that followed
+    /// it on the wire (the `seq <= snapshot.seq` folding rule).
+    #[test]
+    fn state_stream_preserves_wire_arrival_order_snapshot_then_events() {
+        let mut inner = test_inner();
+        inner.state_event_subscribed.store(true, Ordering::Relaxed);
+
+        // Wire arrival order: an event, then a lag-recovery snapshot, then two
+        // events that fold onto the snapshot.
+        inner.stash_control_message(ControlMessage::StateEventMsg(sample_event(1)));
+        inner.stash_control_message(ControlMessage::SceneSnapshot(sample_snapshot(5)));
+        inner.stash_control_message(ControlMessage::StateEventMsg(sample_event(6)));
+        inner.stash_control_message(ControlMessage::StateEventMsg(sample_event(7)));
+
+        // Drain exactly as the pump does and record the shape+seq in order.
+        let mut order: Vec<(&'static str, u64)> = Vec::new();
+        while let Some(item) = inner.pending_state_stream.pop_front() {
+            match item {
+                StateStreamItem::Event(envelope) => order.push(("event", envelope.seq)),
+                StateStreamItem::Snapshot(payload) => order.push(("snapshot", payload.seq)),
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                ("event", 1),
+                ("snapshot", 5),
+                ("event", 6),
+                ("event", 7),
+            ],
+            "state stream must preserve wire arrival order across both kinds"
+        );
+    }
+
+    /// Finding: a client that never subscribes must not accumulate state-stream
+    /// messages forever. With no callback registered they are dropped, not
+    /// queued.
+    #[test]
+    fn unsubscribed_client_drops_state_stream_instead_of_accumulating() {
+        let mut inner = test_inner();
+        assert!(!inner.state_event_subscribed.load(Ordering::Relaxed));
+
+        for seq in 0..10 {
+            inner.stash_control_message(ControlMessage::StateEventMsg(sample_event(seq)));
+            inner.stash_control_message(ControlMessage::SceneSnapshot(sample_snapshot(seq)));
+        }
+        assert!(
+            inner.pending_state_stream.is_empty(),
+            "unsubscribed client must not queue state-stream messages"
+        );
+        assert_eq!(inner.dropped_unsubscribed_events, 20);
+
+        // Once subscribed, subsequent messages queue normally.
+        inner.state_event_subscribed.store(true, Ordering::Relaxed);
+        inner.stash_control_message(ControlMessage::StateEventMsg(sample_event(11)));
+        assert_eq!(inner.pending_state_stream.len(), 1);
+    }
+
+    /// Finding: `set_state_event_callback(NULL)` must reliably quiesce delivery.
+    /// The plumbing that guarantees it: registering flips the shared
+    /// subscription flag and bumps the epoch the pump re-checks between
+    /// invocations; NULL clears the flag and bumps the epoch again so any
+    /// in-flight batch stops calling the stale context.
+    #[test]
+    fn set_state_event_callback_null_quiesces_subscription_and_epoch() {
+        let name = CString::new("quiesce-test").unwrap();
+        let attr = CString::new("camera.position").unwrap();
+        let client = motionstage_swift_client_new(name.as_ptr(), attr.as_ptr());
+        assert!(!client.is_null());
+        let client_ref = unsafe { &*(client as *const MotionStageSwiftClient) };
+
+        // Fresh client: no subscriber, epoch at zero.
+        assert!(!client_ref.state_event_subscribed.load(Ordering::Acquire));
+        assert_eq!(client_ref.state_event_epoch.load(Ordering::Acquire), 0);
+
+        let store: Box<Mutex<Vec<String>>> = Box::new(Mutex::new(Vec::new()));
+        let ctx = &*store as *const Mutex<Vec<String>> as *mut c_void;
+        assert_eq!(
+            motionstage_swift_client_set_state_event_callback(
+                client,
+                Some(collect_state_events),
+                ctx,
+            ),
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        );
+        assert!(client_ref.state_event_subscribed.load(Ordering::Acquire));
+        assert_eq!(client_ref.state_event_epoch.load(Ordering::Acquire), 1);
+
+        // NULL unsubscribes: flag cleared, epoch bumped so a stale-context
+        // batch is halted. This call also blocks on the pump's callback lock,
+        // so on return no delivery with the old context is in flight.
+        assert_eq!(
+            motionstage_swift_client_set_state_event_callback(client, None, ptr::null_mut()),
+            MOTIONSTAGE_SWIFT_STATUS_OK
+        );
+        assert!(!client_ref.state_event_subscribed.load(Ordering::Acquire));
+        assert_eq!(client_ref.state_event_epoch.load(Ordering::Acquire), 2);
+
+        // free joins the pump thread; the context box outlives it.
+        motionstage_swift_client_free(client);
+        drop(store);
     }
 }

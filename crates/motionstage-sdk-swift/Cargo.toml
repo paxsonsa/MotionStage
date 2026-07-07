@@ -18,3 +18,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 motionstage-server.workspace = true
+motionstage-core.workspace = true

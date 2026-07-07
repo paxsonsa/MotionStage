@@ -150,6 +150,8 @@ struct SimulatorState {
     selected_take: Option<Uuid>,
     playback_looping: bool,
     active_bake_cursor: Option<Uuid>,
+    /// Take started over the wire (`take start`); identity is server-assigned.
+    active_wire_take: Option<Uuid>,
 }
 
 impl SimulatorState {
@@ -167,6 +169,7 @@ impl SimulatorState {
             selected_take: None,
             playback_looping: false,
             active_bake_cursor: None,
+            active_wire_take: None,
         }
     }
 }
@@ -191,6 +194,15 @@ enum SimulationCommand {
     BakeNext,
     BakeSeek(u64),
     BakeClose,
+    MappingCreate {
+        object_id: Uuid,
+        attribute: String,
+        scene_id: Option<Uuid>,
+    },
+    MappingRemove(Uuid),
+    TakeStart,
+    TakeStop,
+    Snapshot,
     Mode(Mode),
     Amp(f32),
     Freq(f32),
@@ -960,6 +972,133 @@ async fn handle_command(
             state.active_bake_cursor = None;
             sim_logln!("bake cursor closed {cursor_id}");
         }
+        SimulationCommand::MappingCreate {
+            object_id,
+            attribute,
+            scene_id,
+        } => {
+            // Wire operator-plane op: works in both modes. `source_device:
+            // None` = this session's own device; `target_scene: None` = the
+            // active scene.
+            client
+                .control
+                .send(&ControlMessage::CreateMapping {
+                    source_device: None,
+                    source_output: route.source_output.clone(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: attribute,
+                    component_mask: None,
+                })
+                .await?;
+            let reply = wait_for_wire_reply(client, "mapping create", verbose, |msg| {
+                matches!(msg, ControlMessage::MappingCreateResult { .. })
+            })
+            .await?;
+            if let ControlMessage::MappingCreateResult { result } = reply {
+                match result {
+                    Ok(mapping) => sim_logln!(
+                        "mapping created {} ({} -> scene:{} object:{} attr:{})",
+                        mapping.mapping_id,
+                        mapping.source_output,
+                        mapping.target_scene,
+                        mapping.target_object,
+                        mapping.target_attribute
+                    ),
+                    Err(err) => sim_logln!(
+                        "mapping create rejected: code={:?} reason={}",
+                        err.code,
+                        err.reason
+                    ),
+                }
+            }
+        }
+        SimulationCommand::MappingRemove(mapping_id) => {
+            client
+                .control
+                .send(&ControlMessage::RemoveMapping { mapping_id })
+                .await?;
+            let reply = wait_for_wire_reply(client, "mapping remove", verbose, |msg| {
+                matches!(
+                    msg,
+                    ControlMessage::MappingOpResult { mapping_id: id, .. } if *id == mapping_id
+                )
+            })
+            .await?;
+            if let ControlMessage::MappingOpResult { result, .. } = reply {
+                match result {
+                    Ok(()) => sim_logln!("mapping removed {mapping_id}"),
+                    Err(err) => sim_logln!(
+                        "mapping remove rejected: code={:?} reason={}",
+                        err.code,
+                        err.reason
+                    ),
+                }
+            }
+        }
+        SimulationCommand::TakeStart => {
+            // Wire take control (Operator-gated): take identity and the
+            // recording path are server-assigned.
+            client.control.send(&ControlMessage::StartTake).await?;
+            let reply = wait_for_wire_reply(client, "take start", verbose, |msg| {
+                matches!(msg, ControlMessage::TakeStartResult { .. })
+            })
+            .await?;
+            if let ControlMessage::TakeStartResult { result } = reply {
+                match result {
+                    Ok(take_id) => {
+                        state.active_wire_take = Some(take_id);
+                        sim_logln!("take started (server-assigned id={take_id})");
+                    }
+                    Err(err) => sim_logln!(
+                        "take start rejected: code={:?} reason={}",
+                        err.code,
+                        err.reason
+                    ),
+                }
+            }
+        }
+        SimulationCommand::TakeStop => {
+            client.control.send(&ControlMessage::StopTake).await?;
+            let reply = wait_for_wire_reply(client, "take stop", verbose, |msg| {
+                matches!(msg, ControlMessage::TakeStopResult { .. })
+            })
+            .await?;
+            if let ControlMessage::TakeStopResult { result } = reply {
+                match result {
+                    Ok(take) => {
+                        state.active_wire_take = None;
+                        state.selected_take = Some(take.take_id);
+                        sim_logln!(
+                            "take stopped and registered (id={}, name=\"{}\", frames={}, path={})",
+                            take.take_id,
+                            take.name,
+                            take.frame_count,
+                            take.path
+                        );
+                    }
+                    Err(err) => sim_logln!(
+                        "take stop rejected: code={:?} reason={}",
+                        err.code,
+                        err.reason
+                    ),
+                }
+            }
+        }
+        SimulationCommand::Snapshot => {
+            client
+                .control
+                .send(&ControlMessage::GetSceneSnapshot)
+                .await?;
+            let reply = wait_for_wire_reply(client, "snapshot", verbose, |msg| {
+                matches!(msg, ControlMessage::SceneSnapshot(_))
+            })
+            .await?;
+            if let ControlMessage::SceneSnapshot(snapshot) = reply {
+                log_scene_snapshot(&snapshot);
+                print_snapshot_details(&snapshot);
+            }
+        }
         SimulationCommand::Amp(value) => {
             if value < 0.0 || !value.is_finite() {
                 sim_logln!("amplitude must be a finite number >= 0");
@@ -1098,6 +1237,50 @@ fn parse_command(line: &str) -> SimulationCommand {
                 _ => SimulationCommand::Unknown(trimmed.to_owned()),
             }
         }
+        "mapping" => {
+            let Some(op) = parts.next() else {
+                return SimulationCommand::Unknown(trimmed.to_owned());
+            };
+            match op {
+                "create" => {
+                    let Some(object_id) = parts.next().and_then(|raw| Uuid::parse_str(raw).ok())
+                    else {
+                        return SimulationCommand::Unknown(trimmed.to_owned());
+                    };
+                    let Some(attribute) = parts.next().map(str::to_owned) else {
+                        return SimulationCommand::Unknown(trimmed.to_owned());
+                    };
+                    let scene_id = match parts.next() {
+                        Some(raw) => match Uuid::parse_str(raw) {
+                            Ok(scene_id) => Some(scene_id),
+                            Err(_) => return SimulationCommand::Unknown(trimmed.to_owned()),
+                        },
+                        None => None,
+                    };
+                    SimulationCommand::MappingCreate {
+                        object_id,
+                        attribute,
+                        scene_id,
+                    }
+                }
+                "remove" => match parts.next().and_then(|raw| Uuid::parse_str(raw).ok()) {
+                    Some(mapping_id) => SimulationCommand::MappingRemove(mapping_id),
+                    None => SimulationCommand::Unknown(trimmed.to_owned()),
+                },
+                _ => SimulationCommand::Unknown(trimmed.to_owned()),
+            }
+        }
+        "take" => {
+            let Some(op) = parts.next() else {
+                return SimulationCommand::Unknown(trimmed.to_owned());
+            };
+            match op {
+                "start" => SimulationCommand::TakeStart,
+                "stop" => SimulationCommand::TakeStop,
+                _ => SimulationCommand::Unknown(trimmed.to_owned()),
+            }
+        }
+        "snapshot" => SimulationCommand::Snapshot,
         "amp" => match parts.next().and_then(|v| v.parse::<f32>().ok()) {
             Some(v) => SimulationCommand::Amp(v),
             None => SimulationCommand::Unknown(trimmed.to_owned()),
@@ -1234,6 +1417,14 @@ fn print_help(mode: SimulationMode) {
     sim_logln!("  bake next             read next bake frame");
     sim_logln!("  bake seek <index>     seek bake cursor frame index");
     sim_logln!("  bake close            close bake cursor");
+    sim_logln!("  mapping create <object_id> <attribute> [scene_id]");
+    sim_logln!(
+        "                        create wire mapping from this device (default: active scene)"
+    );
+    sim_logln!("  mapping remove <id>   remove wire mapping (own-source or Operator)");
+    sim_logln!("  take start            start wire take recording (server-assigned identity)");
+    sim_logln!("  take stop             stop wire take and register it in the catalog");
+    sim_logln!("  snapshot              request an on-demand scene snapshot");
     sim_logln!("  amp <value>           set sine amplitude");
     sim_logln!("  freq <value>          set sine frequency in Hz");
     sim_logln!("  mode <idle|live|recording|playback>  request runtime mode");
@@ -1242,6 +1433,7 @@ fn print_help(mode: SimulationMode) {
     sim_logln!("  quit                  exit simulator");
     if matches!(mode, SimulationMode::ClientOnly) {
         sim_logln!("note: `record`, `takes`, `playback`, and `bake` commands are unavailable in client-only mode");
+        sim_logln!("note: `mapping`, `take`, and `snapshot` are wire ops and work in both modes");
     }
 }
 
@@ -1276,6 +1468,13 @@ async fn print_status(
         "  active_bake_cursor: {}",
         state
             .active_bake_cursor
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
+    sim_logln!(
+        "  active_wire_take: {}",
+        state
+            .active_wire_take
             .map(|id| id.to_string())
             .unwrap_or_else(|| "<none>".into())
     );
@@ -1345,20 +1544,35 @@ async fn request_remote_mode(
             sim_logln!("debug: sending {msg:?}");
         }
         client.control.send(&msg).await?;
-        // Replicated state events (including our own echo) interleave with
-        // the direct ModeState reply on the control stream; log and skip
-        // them while waiting for the reply.
+        // Retired ack (protocol 2.1): success has no direct reply — the
+        // acknowledgement is our own replicated ModeChanged echo; failure
+        // arrives as ControlMessage::Error. Other sessions' events (and any
+        // in-flight Pong/ModeState heartbeat reply) interleave on the control
+        // stream; log and skip them while waiting for the echo.
         loop {
-            match client.control.recv().await? {
+            match recv_control_with_timeout(client, "mode request").await? {
+                ControlMessage::StateEventMsg(envelope) => {
+                    let own_mode_echo = envelope.origin_session == Some(client.session_id)
+                        && matches!(envelope.event, StateEvent::ModeChanged { .. });
+                    log_state_event(&envelope);
+                    if let (true, StateEvent::ModeChanged { mode }) =
+                        (own_mode_echo, envelope.event)
+                    {
+                        last_mode = mode;
+                        break;
+                    }
+                }
+                ControlMessage::SceneSnapshot(snapshot) => log_scene_snapshot(&snapshot),
                 ControlMessage::ModeState(active_mode) => {
                     if verbose {
                         sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
                     }
-                    last_mode = active_mode;
-                    break;
                 }
-                ControlMessage::StateEventMsg(envelope) => log_state_event(&envelope),
-                ControlMessage::SceneSnapshot(snapshot) => log_scene_snapshot(&snapshot),
+                ControlMessage::Pong => {
+                    if verbose {
+                        sim_logln!("debug: received ControlMessage::Pong");
+                    }
+                }
                 ControlMessage::Error { code, reason } => {
                     return Err(anyhow!(
                         "remote mode request rejected: code={code:?} reason={reason}"
@@ -1373,6 +1587,58 @@ async fn request_remote_mode(
         }
     }
     Ok(last_mode)
+}
+
+/// Bound on every reply wait so a lost message fails the command loudly
+/// instead of hanging the interactive prompt.
+const WIRE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn recv_control_with_timeout(
+    client: &mut SimulatedClient,
+    op: &str,
+) -> Result<ControlMessage> {
+    timeout(WIRE_REPLY_TIMEOUT, client.control.recv())
+        .await
+        .map_err(|_| anyhow!("timed out waiting for {op} reply"))?
+        .map_err(|err| anyhow!("control channel receive failed: {err}"))
+}
+
+/// Wait for a direct operator-plane reply matched by `is_reply`, logging the
+/// replicated state events that may interleave with it on the control stream
+/// (direct replies and event echoes arrive in any order — match on message
+/// type, not position).
+async fn wait_for_wire_reply(
+    client: &mut SimulatedClient,
+    op: &str,
+    verbose: bool,
+    is_reply: impl Fn(&ControlMessage) -> bool,
+) -> Result<ControlMessage> {
+    loop {
+        let message = recv_control_with_timeout(client, op).await?;
+        if is_reply(&message) {
+            return Ok(message);
+        }
+        match message {
+            ControlMessage::StateEventMsg(envelope) => log_state_event(&envelope),
+            ControlMessage::SceneSnapshot(snapshot) => log_scene_snapshot(&snapshot),
+            ControlMessage::ModeState(active_mode) => {
+                if verbose {
+                    sim_logln!("debug: received ControlMessage::ModeState({active_mode:?})");
+                }
+            }
+            ControlMessage::Pong => {
+                if verbose {
+                    sim_logln!("debug: received ControlMessage::Pong");
+                }
+            }
+            ControlMessage::Error { code, reason } => {
+                return Err(anyhow!("{op} rejected: code={code:?} reason={reason}"));
+            }
+            other => {
+                return Err(anyhow!("unexpected control reply to {op}: {other:?}"));
+            }
+        }
+    }
 }
 
 /// Render a replicated state event as a one-line interactive log entry.
@@ -1435,9 +1701,9 @@ fn describe_state_event(event: &StateEvent) -> String {
             take_id,
             playhead_ns,
             looping,
-        } => format!(
-            "playback {state:?} take={take_id} playhead_ns={playhead_ns} looping={looping}"
-        ),
+        } => {
+            format!("playback {state:?} take={take_id} playhead_ns={playhead_ns} looping={looping}")
+        }
     }
 }
 
@@ -1472,6 +1738,52 @@ fn log_scene_snapshot(snapshot: &SceneSnapshotPayload) {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "<none>".into())
     );
+}
+
+/// Expand a snapshot into pickable targets: scene/object ids plus attribute
+/// names (for `mapping create`), current mappings, and the take catalog.
+fn print_snapshot_details(snapshot: &SceneSnapshotPayload) {
+    for scene in &snapshot.scenes {
+        let active = if snapshot.active_scene == Some(scene.scene_id) {
+            " (active)"
+        } else {
+            ""
+        };
+        sim_logln!("  scene {} \"{}\"{}", scene.scene_id, scene.name, active);
+        for object in &scene.objects {
+            let attributes = object
+                .attributes
+                .iter()
+                .map(|attribute| attribute.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sim_logln!(
+                "    object {} \"{}\" attrs: [{}]",
+                object.object_id,
+                object.name,
+                attributes
+            );
+        }
+    }
+    for mapping in &snapshot.mappings {
+        sim_logln!(
+            "  mapping {} {} -> {}.{} lock={}",
+            mapping.mapping_id,
+            mapping.source_output,
+            mapping.target_object,
+            mapping.target_attribute,
+            mapping.lock
+        );
+    }
+    for take in &snapshot.takes {
+        sim_logln!(
+            "  take {} \"{}\" frames={} selected={}",
+            take.take_id,
+            take.name,
+            take.frame_count,
+            take.selected
+        );
+    }
 }
 
 fn sine_vec3(amplitude: f32, frequency_hz: f32, seconds: f32) -> [f32; 3] {
@@ -1709,6 +2021,46 @@ mod tests {
         assert_eq!(parse_command("bake next"), SimulationCommand::BakeNext);
         assert_eq!(parse_command("bake seek 5"), SimulationCommand::BakeSeek(5));
         assert_eq!(parse_command("bake close"), SimulationCommand::BakeClose);
+    }
+
+    #[test]
+    fn parse_wire_operator_commands() {
+        let object_id = Uuid::parse_str("00000000-0000-0000-0000-000000000123").unwrap();
+        let scene_id = Uuid::parse_str("00000000-0000-0000-0000-000000000456").unwrap();
+        assert_eq!(
+            parse_command("mapping create 00000000-0000-0000-0000-000000000123 position"),
+            SimulationCommand::MappingCreate {
+                object_id,
+                attribute: "position".to_owned(),
+                scene_id: None,
+            }
+        );
+        assert_eq!(
+            parse_command(
+                "mapping create 00000000-0000-0000-0000-000000000123 position \
+                 00000000-0000-0000-0000-000000000456"
+            ),
+            SimulationCommand::MappingCreate {
+                object_id,
+                attribute: "position".to_owned(),
+                scene_id: Some(scene_id),
+            }
+        );
+        assert_eq!(
+            parse_command("mapping remove 00000000-0000-0000-0000-000000000123"),
+            SimulationCommand::MappingRemove(object_id)
+        );
+        assert_eq!(parse_command("take start"), SimulationCommand::TakeStart);
+        assert_eq!(parse_command("take stop"), SimulationCommand::TakeStop);
+        assert_eq!(parse_command("snapshot"), SimulationCommand::Snapshot);
+        assert!(matches!(
+            parse_command("mapping create not-a-uuid position"),
+            SimulationCommand::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_command("take"),
+            SimulationCommand::Unknown(_)
+        ));
     }
 
     #[test]

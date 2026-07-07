@@ -26,7 +26,7 @@ use motionstage_protocol::{
     RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SamplingMode,
     SceneSnapshotPayload, SdpMessage, SdpType, ServerHello, SessionState, SessionSummary,
     SignalMessage, SignalPayload, SnapshotAttribute, SnapshotObject, SnapshotScene, StateEvent,
-    StateEventEnvelope, TakeBakeAttribute, TakeInfo, VideoStreamStatus, PROTOCOL_MAJOR,
+    StateEventEnvelope, TakeBakeAttribute, TakeInfo, VideoStreamStatus, WireError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
 use motionstage_recording::{
@@ -61,6 +61,40 @@ impl SecurityMode {
             SecurityMode::PairingRequired => "pairing_required",
             SecurityMode::ApiKey => "api_key",
             SecurityMode::ApiKeyPlusPairing => "api_key_plus_pairing",
+        }
+    }
+}
+
+/// Admission policy for the roles a session may hold. Roles are self-declared
+/// in the [`ClientHello`]; this is where the server decides which of them to
+/// actually grant, and records the basis ([`RoleGrant`]).
+///
+/// - `trusted_lan`: every peer that reaches the socket is trusted (the LAN is
+///   the security boundary), so all declared roles — including
+///   [`ClientRole::Operator`] — are granted. This is a deliberate, documented
+///   trust choice; run a credentialed mode if the LAN is not trusted.
+/// - credentialed modes: the shared credential authorized the connection.
+///   MotionStage does not yet carry a per-credential role map, so declared
+///   roles are still granted here — but this is the single choke point where a
+///   real ACL belongs.
+///
+/// TODO(security): thread a per-credential/identity role allow-list through
+/// [`ServerConfig`] and intersect it with the declared roles for credentialed
+/// modes, so Operator can be withheld from a device that only holds a
+/// motion-source credential.
+fn authorize_roles(
+    security_mode: SecurityMode,
+    declared_roles: Vec<ClientRole>,
+) -> (Vec<ClientRole>, RoleGrant) {
+    match security_mode {
+        SecurityMode::TrustedLan => (declared_roles, RoleGrant::LanTrust),
+        SecurityMode::PairingRequired
+        | SecurityMode::ApiKey
+        | SecurityMode::ApiKeyPlusPairing => {
+            // Future hook: intersect `declared_roles` with the credential's
+            // authorized roles. Until that config exists the credential that
+            // passed `ensure_auth` authorizes the declared roles.
+            (declared_roles, RoleGrant::Credential)
         }
     }
 }
@@ -107,17 +141,55 @@ impl Default for ServerConfig {
     }
 }
 
+/// How a session's roles were authorized at registration — the audit record
+/// behind the trust boundary. Roles (notably [`ClientRole::Operator`]) are
+/// *self-declared* in the [`ClientHello`]; this records the admission basis on
+/// which the server granted them, so the trust model is explicit and a future
+/// per-credential ACL has a place to hook in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleGrant {
+    /// `trusted_lan`: any declared role is granted on documented LAN trust —
+    /// every peer that can reach the socket is trusted (the LAN is the
+    /// security boundary).
+    LanTrust,
+    /// A credentialed mode (`pairing_required` / `api_key` /
+    /// `api_key_plus_pairing`): the shared credential authorized the
+    /// connection. Per-credential role authorization is not yet configurable,
+    /// so declared roles are granted, but the basis is recorded here.
+    Credential,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub device_id: Uuid,
     pub device_name: String,
     pub session_id: Option<Uuid>,
+    /// The session's **admitted** roles — the authoritative capability set for
+    /// this session. Established at register time from the declared
+    /// [`ClientHello`] roles filtered through the admission policy
+    /// ([`RoleGrant`]) and stored here. Operator-plane permission checks read
+    /// this field via the server session record; they never trust roles
+    /// re-sent on the wire per request.
     pub roles: Vec<ClientRole>,
     pub features: Vec<Feature>,
     pub advertised_attributes: Vec<AttributeDescriptor>,
     pub state: SessionState,
     /// Nanosecond timestamp of last activity (control message or motion datagram).
     pub last_activity_ns: u64,
+    /// Protocol minor selected by version negotiation at the hello exchange
+    /// (`None` before `hello_exchanged`). Echoed to the client in
+    /// [`RegisterAccepted::negotiated_protocol_minor`].
+    pub negotiated_protocol_minor: Option<u16>,
+    /// The admission basis on which [`Self::roles`] were granted (`None` until
+    /// registration). Recorded for the trust boundary / future per-credential
+    /// role gating.
+    pub role_grant: Option<RoleGrant>,
+    /// When this connection is superseding a still-admitted session for the
+    /// same `device_id`, the old session's id — its `SessionLeft` is deferred
+    /// until this connection is itself admitted (passes `register`), so a
+    /// pre-auth or failed-auth reconnect cannot evict a live session off the
+    /// event stream. `None` once emitted or when nothing is being superseded.
+    pub superseded_session_id: Option<Uuid>,
     /// True for the in-process host session (registered at server construction).
     /// The host is a real session — it appears in [`ServerHandle::sessions`],
     /// fires `SessionJoined`, and consumes the same event stream — but it is
@@ -401,6 +473,22 @@ pub enum HostRequest {
     },
 }
 
+/// Identity and capability of the session performing a wire operator-plane
+/// operation (mapping ops, take control). Built by the QUIC peer handler from
+/// the session's registered hello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireActor {
+    /// The requesting session's id — stamped as `origin_session` on every
+    /// event the operation emits.
+    pub session_id: Uuid,
+    /// The requesting session's device id — the ownership scope for
+    /// non-operator mapping management.
+    pub device_id: Uuid,
+    /// True when the session holds [`ClientRole::Operator`]; operators manage
+    /// any mapping and control takes.
+    pub is_operator: bool,
+}
+
 /// Snapshot of playback transport state for the companion UI.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlaybackStatus {
@@ -485,6 +573,9 @@ impl ServerHandle {
                 advertised_attributes: Vec::new(),
                 state: SessionState::Active,
                 last_activity_ns: now_ns(),
+                negotiated_protocol_minor: Some(PROTOCOL_MINOR),
+                role_grant: Some(RoleGrant::LanTrust),
+                superseded_session_id: None,
                 is_host: true,
             },
         );
@@ -960,23 +1051,26 @@ impl ServerHandle {
         if !state.sessions.contains_key(&device_id) {
             state.enforce_capacity()?;
         }
-        // Reconnect racing a half-open previous connection: replacing a
-        // still-registered record must emit its terminal SessionLeft first,
-        // or event-stream consumers keep a session that no longer exists.
-        if let Some(old) = state.sessions.get(&device_id) {
+        // Reconnect racing a still-admitted previous connection: the old
+        // session's terminal SessionLeft is DEFERRED until this new connection
+        // is itself admitted (passes `register`). A pre-auth reconnect — or
+        // one that later fails admission — must not be a free takeover of a
+        // live session on the event stream. We stash the old session id here
+        // and `register` emits its SessionLeft only after admission succeeds.
+        //
+        // Trust-boundary caveat: sessions are keyed by the self-claimed
+        // `device_id`, so this new record overwrites the old one's mutable
+        // handshake fields immediately. Deferring the SessionLeft is what
+        // makes admission (not mere reconnection) the gate for evicting a live
+        // session from the replicated stream. See the Security Model in
+        // docs/design-architecture.md.
+        let superseded_session_id = state.sessions.get(&device_id).and_then(|old| {
             if old.state != SessionState::Closed {
-                if let Some(old_session_id) = old.session_id {
-                    self.emit_event(
-                        &mut state,
-                        Some(old_session_id),
-                        StateEvent::SessionLeft {
-                            session_id: old_session_id,
-                            reason: Some("superseded by reconnect".into()),
-                        },
-                    );
-                }
+                old.session_id
+            } else {
+                None
             }
-        }
+        });
         state.sessions.insert(
             device_id,
             SessionInfo {
@@ -988,6 +1082,9 @@ impl ServerHandle {
                 advertised_attributes: Vec::new(),
                 state: SessionState::Discovered,
                 last_activity_ns: now_ns(),
+                negotiated_protocol_minor: None,
+                role_grant: None,
+                superseded_session_id,
                 is_host: false,
             },
         );
@@ -1018,13 +1115,29 @@ impl ServerHandle {
 
     pub async fn hello_exchanged(&self, hello: ClientHello) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
-        let version_result = negotiate_version(
+        // The server REQUIRES its own major and speaks exactly its own minor
+        // (see `negotiate_version`). A foreign major or a client that is newer
+        // than us is rejected with a typed `RegisterRejected` before the drop
+        // so the peer learns why, rather than a bare disconnect.
+        let negotiated = match negotiate_version(
             ProtocolVersion::new(PROTOCOL_MAJOR, PROTOCOL_MINOR),
             ProtocolVersion::new(hello.protocol_major, hello.protocol_minor),
-        );
-        if let Err(err) = version_result {
-            return Err(ServerError::Protocol(err));
-        }
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(err @ ProtocolError::UnsupportedMajor { .. }) => {
+                return Err(ServerError::RegisterRejected(RegisterRejected {
+                    code: RejectCode::UnsupportedProtocol,
+                    reason: err.to_string(),
+                }));
+            }
+            Err(err @ ProtocolError::ClientTooNew { .. }) => {
+                return Err(ServerError::RegisterRejected(RegisterRejected {
+                    code: RejectCode::VersionMismatch,
+                    reason: err.to_string(),
+                }));
+            }
+            Err(err) => return Err(ServerError::Protocol(err)),
+        };
         if hello.features.is_empty() {
             return Err(ServerError::RegisterRejected(RegisterRejected {
                 code: RejectCode::NoCommonFeature,
@@ -1052,6 +1165,7 @@ impl ServerHandle {
         session.roles = hello.roles;
         session.features = hello.features;
         session.advertised_attributes = hello.advertised_attributes;
+        session.negotiated_protocol_minor = Some(negotiated.selected.minor);
         state.change_session_state(hello.device_id, SessionState::HelloExchanged)
     }
 
@@ -1087,6 +1201,7 @@ impl ServerHandle {
             return Err(err);
         }
 
+        let security_mode = state.config.security_mode;
         let session = state
             .sessions
             .get_mut(&device_id)
@@ -1108,15 +1223,48 @@ impl ServerHandle {
             }));
         }
 
+        // Admission gates the roles. Under `trusted_lan` any declared role is
+        // granted on documented LAN trust; under credentialed modes the
+        // credential authorized the connection (per-credential role ACLs are
+        // the future hook — see `authorize_roles`). The GRANTED roles are the
+        // ones stored on the session record and read by every permission
+        // check, so a client cannot escalate by re-declaring Operator on the
+        // wire after registration.
+        let (granted_roles, role_grant) =
+            authorize_roles(security_mode, std::mem::take(&mut session.roles));
+        session.roles = granted_roles;
+        session.role_grant = Some(role_grant);
+
         let session_id = Uuid::new_v4();
         session.session_id = Some(session_id);
+        let negotiated_protocol_minor = session
+            .negotiated_protocol_minor
+            .unwrap_or(PROTOCOL_MINOR);
+        // The reconnect this connection is superseding (if any): now that the
+        // new connection is admitted, retire the old session on the event
+        // stream. Deferring to here is the fix for the "superseded by
+        // reconnect" free-takeover — a connection that never reached admission
+        // never fires this.
+        let superseded_session_id = session.superseded_session_id.take();
         state.change_session_state(device_id, SessionState::Registered)?;
         state.metrics.accepted_sessions += 1;
-        debug!(%device_id, %session_id, "registration accepted");
+        debug!(%device_id, %session_id, ?role_grant, "registration accepted");
+
+        if let Some(old_session_id) = superseded_session_id {
+            self.emit_event(
+                &mut state,
+                Some(old_session_id),
+                StateEvent::SessionLeft {
+                    session_id: old_session_id,
+                    reason: Some("superseded by reconnect".into()),
+                },
+            );
+        }
 
         Ok(RegisterAccepted {
             session_id,
             negotiated_features,
+            negotiated_protocol_minor,
         })
     }
 
@@ -1349,7 +1497,7 @@ impl ServerHandle {
         Ok(())
     }
 
-    fn resolve_scene_for_baseline(
+    fn resolve_scene_or_active(
         state: &ServerState,
         requested_scene: Option<SceneId>,
     ) -> Result<SceneId, ServerError> {
@@ -1377,7 +1525,7 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
-        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        let resolved = Self::resolve_scene_or_active(&state, scene_id)?;
         let changed = state
             .runtime
             .reset_scene_to_baseline(resolved)
@@ -1407,7 +1555,7 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
-        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        let resolved = Self::resolve_scene_or_active(&state, scene_id)?;
         let changed = state
             .runtime
             .commit_scene_baseline(resolved)
@@ -1439,7 +1587,7 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<u32, ServerError> {
         let mut state = self.state.write().await;
-        let resolved = Self::resolve_scene_for_baseline(&state, scene_id)?;
+        let resolved = Self::resolve_scene_or_active(&state, scene_id)?;
         let changed = state
             .runtime
             .commit_object_baseline(resolved, object_id)
@@ -1453,18 +1601,6 @@ impl ServerHandle {
             },
         );
         Ok(changed)
-    }
-
-    pub async fn set_mode_control_allowlist(&self, _device_ids: Vec<Uuid>) {
-        // Role-based mode control is authoritative; allowlists are intentionally ignored.
-    }
-
-    pub async fn mode_control_allowlist(&self) -> Vec<Uuid> {
-        Vec::new()
-    }
-
-    pub async fn mode_control_allowed(&self, _device_id: Uuid) -> bool {
-        true
     }
 
     pub async fn mode(&self) -> Mode {
@@ -1493,35 +1629,53 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<MappingId, ServerError> {
         let mut state = self.state.write().await;
+        self.create_mapping_locked(&mut state, req, now_ns, origin)
+            .map(|summary| summary.mapping_id)
+    }
+
+    /// Create a mapping while the state write lock is held: mutate, write the
+    /// recording marker, and emit exactly one [`StateEvent::MappingCreated`].
+    fn create_mapping_locked(
+        &self,
+        state: &mut ServerState,
+        req: MappingRequest,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<MappingSummary, ServerError> {
         let mapping_id = state
             .runtime
             .create_mapping(req, now_ns)
             .map_err(ServerError::Core)?;
-        let mapping = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
-        if let Some(mapping) = mapping {
-            if let Some(recording) = state.active_recording.as_mut() {
-                recording
-                    .writer
-                    .push_marker(RecordingMarker::MappingCreated {
-                        timestamp_ns: now_ns,
-                        mapping_id,
-                        source_device: mapping.source_device,
-                        source_output: mapping.source_output.clone(),
-                        target_scene: mapping.target_scene,
-                        target_object: mapping.target_object,
-                        target_attribute: mapping.target_attribute.clone(),
-                        component_mask: mapping.component_mask.clone(),
-                    });
-            }
-            self.emit_event(
-                &mut state,
-                origin,
-                StateEvent::MappingCreated {
-                    mapping: mapping_to_summary(&mapping),
-                },
-            );
+        let mapping = state
+            .runtime
+            .snapshot()
+            .mappings
+            .get(&mapping_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Runtime("created mapping missing from runtime".into()))?;
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording
+                .writer
+                .push_marker(RecordingMarker::MappingCreated {
+                    timestamp_ns: now_ns,
+                    mapping_id,
+                    source_device: mapping.source_device,
+                    source_output: mapping.source_output.clone(),
+                    target_scene: mapping.target_scene,
+                    target_object: mapping.target_object,
+                    target_attribute: mapping.target_attribute.clone(),
+                    component_mask: mapping.component_mask.clone(),
+                });
         }
-        Ok(mapping_id)
+        let summary = mapping_to_summary(&mapping);
+        self.emit_event(
+            state,
+            origin,
+            StateEvent::MappingCreated {
+                mapping: summary.clone(),
+            },
+        );
+        Ok(summary)
     }
 
     pub async fn update_mapping(
@@ -1542,35 +1696,54 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
+        self.update_mapping_locked(&mut state, mapping_id, req, now_ns, origin)
+            .map(|_| ())
+    }
+
+    /// Update a mapping while the state write lock is held: mutate, write the
+    /// recording marker, and emit exactly one [`StateEvent::MappingUpdated`].
+    fn update_mapping_locked(
+        &self,
+        state: &mut ServerState,
+        mapping_id: MappingId,
+        req: MappingRequest,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<MappingSummary, ServerError> {
         state
             .runtime
             .update_mapping(mapping_id, req, now_ns)
             .map_err(ServerError::Core)?;
-        let mapping = state.runtime.snapshot().mappings.get(&mapping_id).cloned();
-        if let Some(mapping) = mapping {
-            if let Some(recording) = state.active_recording.as_mut() {
-                recording
-                    .writer
-                    .push_marker(RecordingMarker::MappingUpdated {
-                        timestamp_ns: now_ns,
-                        mapping_id,
-                        source_device: mapping.source_device,
-                        source_output: mapping.source_output.clone(),
-                        target_scene: mapping.target_scene,
-                        target_object: mapping.target_object,
-                        target_attribute: mapping.target_attribute.clone(),
-                        component_mask: mapping.component_mask.clone(),
-                    });
-            }
-            self.emit_event(
-                &mut state,
-                origin,
-                StateEvent::MappingUpdated {
-                    mapping: mapping_to_summary(&mapping),
-                },
-            );
+        let mapping = state
+            .runtime
+            .snapshot()
+            .mappings
+            .get(&mapping_id)
+            .cloned()
+            .ok_or_else(|| ServerError::Runtime("updated mapping missing from runtime".into()))?;
+        if let Some(recording) = state.active_recording.as_mut() {
+            recording
+                .writer
+                .push_marker(RecordingMarker::MappingUpdated {
+                    timestamp_ns: now_ns,
+                    mapping_id,
+                    source_device: mapping.source_device,
+                    source_output: mapping.source_output.clone(),
+                    target_scene: mapping.target_scene,
+                    target_object: mapping.target_object,
+                    target_attribute: mapping.target_attribute.clone(),
+                    component_mask: mapping.component_mask.clone(),
+                });
         }
-        Ok(())
+        let summary = mapping_to_summary(&mapping);
+        self.emit_event(
+            state,
+            origin,
+            StateEvent::MappingUpdated {
+                mapping: summary.clone(),
+            },
+        );
+        Ok(summary)
     }
 
     pub async fn remove_mapping(&self, mapping_id: MappingId) -> Result<(), ServerError> {
@@ -1584,6 +1757,17 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
+        self.remove_mapping_locked(&mut state, mapping_id, origin)
+    }
+
+    /// Remove a mapping while the state write lock is held: mutate, write the
+    /// recording marker, and emit exactly one [`StateEvent::MappingRemoved`].
+    fn remove_mapping_locked(
+        &self,
+        state: &mut ServerState,
+        mapping_id: MappingId,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         state
             .runtime
             .remove_mapping(mapping_id)
@@ -1596,7 +1780,7 @@ impl ServerHandle {
                     mapping_id,
                 });
         }
-        self.emit_event(&mut state, origin, StateEvent::MappingRemoved { mapping_id });
+        self.emit_event(state, origin, StateEvent::MappingRemoved { mapping_id });
         Ok(())
     }
 
@@ -1616,6 +1800,19 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<(), ServerError> {
         let mut state = self.state.write().await;
+        self.set_mapping_lock_locked(&mut state, mapping_id, lock, origin)
+    }
+
+    /// Set a mapping's lock while the state write lock is held: mutate, write
+    /// the recording marker, and emit exactly one
+    /// [`StateEvent::MappingLockChanged`].
+    fn set_mapping_lock_locked(
+        &self,
+        state: &mut ServerState,
+        mapping_id: MappingId,
+        lock: bool,
+        origin: Option<Uuid>,
+    ) -> Result<(), ServerError> {
         state
             .runtime
             .set_mapping_lock(mapping_id, lock)
@@ -1630,11 +1827,154 @@ impl ServerHandle {
                 });
         }
         self.emit_event(
-            &mut state,
+            state,
             origin,
             StateEvent::MappingLockChanged { mapping_id, lock },
         );
         Ok(())
+    }
+
+    /// Wire operator-plane mapping create: resolve defaults (`source_device`
+    /// = the actor's own device, `target_scene` = the active scene), enforce
+    /// the ownership rule (own-source or Operator), then create under one
+    /// lock acquisition. A denied or failed call mutates nothing and emits
+    /// nothing; the lease model inside the runtime stays the arbiter of
+    /// target-attribute contention.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wire_create_mapping(
+        &self,
+        actor: WireActor,
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<SceneId>,
+        target_object: ObjectId,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+        now_ns: u64,
+    ) -> Result<MappingSummary, ServerError> {
+        let mut state = self.state.write().await;
+        let source_device = source_device.unwrap_or(actor.device_id);
+        if !actor.is_operator && source_device != actor.device_id {
+            return Err(ServerError::Denied(
+                "a session may only create mappings sourced from its own device \
+                 (Operator role manages any mapping)"
+                    .into(),
+            ));
+        }
+        let target_scene = Self::resolve_scene_or_active(&state, target_scene)?;
+        self.create_mapping_locked(
+            &mut state,
+            MappingRequest {
+                source_device,
+                source_output,
+                target_scene,
+                target_object,
+                target_attribute,
+                component_mask,
+            },
+            now_ns,
+            Some(actor.session_id),
+        )
+    }
+
+    /// Wire operator-plane mapping update (full replacement, mirroring the
+    /// host API's [`ServerHandle::update_mapping`]). Non-operators may only
+    /// update mappings whose current **and** requested `source_device` is
+    /// their own device.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wire_update_mapping(
+        &self,
+        actor: WireActor,
+        mapping_id: MappingId,
+        source_device: Option<Uuid>,
+        source_output: String,
+        target_scene: Option<SceneId>,
+        target_object: ObjectId,
+        target_attribute: String,
+        component_mask: Option<Vec<usize>>,
+        now_ns: u64,
+    ) -> Result<MappingSummary, ServerError> {
+        let mut state = self.state.write().await;
+        let existing_source = Self::mapping_source_device(&state, mapping_id)?;
+        let source_device = source_device.unwrap_or(actor.device_id);
+        if !actor.is_operator
+            && (existing_source != actor.device_id || source_device != actor.device_id)
+        {
+            return Err(ServerError::Denied(
+                "a session may only update mappings sourced from its own device \
+                 (Operator role manages any mapping)"
+                    .into(),
+            ));
+        }
+        let target_scene = Self::resolve_scene_or_active(&state, target_scene)?;
+        self.update_mapping_locked(
+            &mut state,
+            mapping_id,
+            MappingRequest {
+                source_device,
+                source_output,
+                target_scene,
+                target_object,
+                target_attribute,
+                component_mask,
+            },
+            now_ns,
+            Some(actor.session_id),
+        )
+    }
+
+    /// Wire operator-plane mapping removal: own-source or Operator.
+    pub async fn wire_remove_mapping(
+        &self,
+        actor: WireActor,
+        mapping_id: MappingId,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let existing_source = Self::mapping_source_device(&state, mapping_id)?;
+        if !actor.is_operator && existing_source != actor.device_id {
+            return Err(ServerError::Denied(
+                "a session may only remove mappings sourced from its own device \
+                 (Operator role manages any mapping)"
+                    .into(),
+            ));
+        }
+        self.remove_mapping_locked(&mut state, mapping_id, Some(actor.session_id))
+    }
+
+    /// Wire operator-plane mapping lock toggle: own-source or Operator.
+    pub async fn wire_set_mapping_lock(
+        &self,
+        actor: WireActor,
+        mapping_id: MappingId,
+        lock: bool,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let existing_source = Self::mapping_source_device(&state, mapping_id)?;
+        if !actor.is_operator && existing_source != actor.device_id {
+            return Err(ServerError::Denied(
+                "a session may only lock mappings sourced from its own device \
+                 (Operator role manages any mapping)"
+                    .into(),
+            ));
+        }
+        self.set_mapping_lock_locked(&mut state, mapping_id, lock, Some(actor.session_id))
+    }
+
+    fn mapping_source_device(
+        state: &ServerState,
+        mapping_id: MappingId,
+    ) -> Result<Uuid, ServerError> {
+        state
+            .runtime
+            .snapshot()
+            .mappings
+            .get(&mapping_id)
+            .map(|mapping| mapping.source_device)
+            .ok_or_else(|| {
+                ServerError::Core(CoreError::MappingDenied(format!(
+                    "mapping not found: {mapping_id}"
+                )))
+            })
     }
 
     pub async fn ingest_motion_samples(
@@ -1746,6 +2086,35 @@ impl ServerHandle {
             .await
     }
 
+    /// Wire take control: start recording a take with **server-assigned
+    /// identity**. The recording path is generated inside the take-catalog
+    /// directory — wire callers never supply paths. Routes through the same
+    /// recording pipeline as the host API's `start_recording(path)`. Returns
+    /// the take id (the recording id the catalog will register on stop).
+    pub async fn start_take_from(
+        &self,
+        now_ns: u64,
+        origin: Option<Uuid>,
+    ) -> Result<Uuid, ServerError> {
+        let take_dir = {
+            let state = self.state.read().await;
+            match state.config.take_catalog_path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            }
+        };
+        fs::create_dir_all(&take_dir).map_err(|err| ServerError::Recording(err.to_string()))?;
+        let path = take_dir.join(format!("take-{}.cmtrk", Uuid::now_v7()));
+        self.start_recording_from(path, now_ns, origin).await
+    }
+
+    /// Wire take control: stop the active recording and register it in the
+    /// take catalog (the same flow as `stop_recording`), returning the
+    /// registered take's catalog entry.
+    pub async fn stop_take_from(&self, origin: Option<Uuid>) -> Result<TakeInfo, ServerError> {
+        self.stop_recording_inner(origin).await.map(|(_, take)| take)
+    }
+
     pub async fn start_recording_from(
         &self,
         path: impl AsRef<Path>,
@@ -1755,6 +2124,14 @@ impl ServerHandle {
         let mut state = self.state.write().await;
         // Validate every precondition before mutating anything: an error
         // return must leave runtime state untouched and emit no events.
+        //
+        // A recording already being active is a hard reject, not a silent
+        // replace: overwriting `active_recording` would drop the in-progress
+        // take's writer unflushed and destroy it. A retry or a second
+        // operator's StartTake gets the typed error and changes nothing.
+        if state.active_recording.is_some() {
+            return Err(ServerError::AlreadyRecording);
+        }
         let active_scene = state
             .runtime
             .snapshot()
@@ -1853,6 +2230,19 @@ impl ServerHandle {
         &self,
         origin: Option<Uuid>,
     ) -> Result<RecordingManifest, ServerError> {
+        self.stop_recording_inner(origin)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// Shared stop-recording flow: finish the writer, register the take in
+    /// the catalog, and emit `RecordingStopped` + `TakeRegistered` +
+    /// `ModeChanged`. Returns both the manifest (host API) and the registered
+    /// take (wire take control).
+    async fn stop_recording_inner(
+        &self,
+        origin: Option<Uuid>,
+    ) -> Result<(RecordingManifest, TakeInfo), ServerError> {
         let mut state = self.state.write().await;
         let Some(mut recording) = state.active_recording.take() else {
             return Err(ServerError::Recording("no active recording".into()));
@@ -1882,6 +2272,7 @@ impl ServerHandle {
                 manifest.frame_count,
             )
             .map_err(ServerError::Take)?;
+        let take_info = entry.to_take_info();
 
         self.emit_event(
             &mut state,
@@ -1895,7 +2286,7 @@ impl ServerHandle {
             &mut state,
             origin,
             StateEvent::TakeRegistered {
-                take: entry.to_take_info(),
+                take: take_info.clone(),
             },
         );
 
@@ -1906,7 +2297,7 @@ impl ServerHandle {
         let mode = state.runtime.mode();
         self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
 
-        Ok(manifest)
+        Ok((manifest, take_info))
     }
 
     pub async fn list_takes(&self, scene_id: Option<SceneId>) -> Vec<TakeInfo> {
@@ -2512,6 +2903,46 @@ impl ServerHandle {
         state.sessions.get(&device_id).cloned()
     }
 
+    /// Resolve the authoritative operator-plane actor for a live session from
+    /// the **server's own session record** — never from identity re-sent on
+    /// the wire per request. `device_id` here is the connection's registered
+    /// device; the returned [`WireActor`]'s `device_id` and `is_operator` are
+    /// read from the stored [`SessionInfo`], whose roles were fixed by the
+    /// admission policy at registration. This is the security boundary for
+    /// findings like a peer re-declaring `roles:[Operator]` or naming a
+    /// victim's `device_id` in a request: permission checks must consult this,
+    /// not per-message-supplied fields. See the Security Model in
+    /// docs/design-architecture.md.
+    pub async fn resolve_wire_actor(&self, device_id: Uuid) -> Result<WireActor, ServerError> {
+        let state = self.state.read().await;
+        let session = state
+            .sessions
+            .get(&device_id)
+            .filter(|session| session.state != SessionState::Closed)
+            .ok_or(ServerError::SessionNotFound(device_id))?;
+        let session_id = session
+            .session_id
+            .ok_or(ServerError::SessionNotFound(device_id))?;
+        Ok(WireActor {
+            session_id,
+            device_id: session.device_id,
+            is_operator: session.roles.contains(&ClientRole::Operator),
+        })
+    }
+
+    /// Whether the live session for `device_id` holds [`ClientRole::Operator`]
+    /// per the **server session record** (admitted roles), not per any
+    /// role list re-sent on the wire.
+    pub async fn session_is_operator(&self, device_id: Uuid) -> bool {
+        let state = self.state.read().await;
+        state
+            .sessions
+            .get(&device_id)
+            .filter(|session| session.state != SessionState::Closed)
+            .map(|session| session.roles.contains(&ClientRole::Operator))
+            .unwrap_or(false)
+    }
+
     pub async fn sessions(&self) -> Vec<SessionInfo> {
         let state = self.state.read().await;
         state.sessions.values().cloned().collect()
@@ -2622,7 +3053,8 @@ async fn handle_set_data_flow(
     session_id: Uuid,
     state: DataFlowState,
 ) -> Result<HandlerOutcome, ServerError> {
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(
             control,
             RejectCode::RoleDenied,
@@ -2636,22 +3068,15 @@ async fn handle_set_data_flow(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    match server.set_data_flow_from(state, Some(session_id)).await {
-        Ok(()) => {
-            let active_mode = server.mode().await;
-            control
-                .send(&ControlMessage::ModeState(active_mode))
-                .await
-                .map_err(|err| ServerError::Runtime(err.to_string()))?;
-        }
-        Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
-                .await
-                .is_err()
-            {
-                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                return Ok(ControlFlow::Break(()));
-            }
+    // Success has no direct reply: the caller observes its own
+    // StateEventMsg(ModeChanged) echo like every other session.
+    if let Err(err) = server.set_data_flow_from(state, Some(session_id)).await {
+        if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
         }
     }
     Ok(ControlFlow::Continue(()))
@@ -2664,7 +3089,8 @@ async fn handle_set_recording(
     session_id: Uuid,
     state: RecordingState,
 ) -> Result<HandlerOutcome, ServerError> {
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(
             control,
             RejectCode::RoleDenied,
@@ -2678,22 +3104,15 @@ async fn handle_set_recording(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    match server.set_recording_from(state, Some(session_id)).await {
-        Ok(()) => {
-            let active_mode = server.mode().await;
-            control
-                .send(&ControlMessage::ModeState(active_mode))
-                .await
-                .map_err(|err| ServerError::Runtime(err.to_string()))?;
-        }
-        Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
-                .await
-                .is_err()
-            {
-                let _ = server.close_session(client_hello.device_id, now_ns()).await;
-                return Ok(ControlFlow::Break(()));
-            }
+    // Success has no direct reply: the caller observes its own
+    // StateEventMsg(ModeChanged) echo like every other session.
+    if let Err(err) = server.set_recording_from(state, Some(session_id)).await {
+        if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
         }
     }
     Ok(ControlFlow::Continue(()))
@@ -2718,7 +3137,8 @@ async fn handle_baseline_control(
         }
         _ => unreachable!(),
     };
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
             .await
             .is_err()
@@ -2728,43 +3148,207 @@ async fn handle_baseline_control(
         }
         return Ok(ControlFlow::Continue(()));
     }
-    let result: Result<(BaselineAction, u32), ServerError> = match msg {
-        ControlMessage::ResetSceneToBaseline { scene_id } => server
-            .reset_scene_to_baseline_from(scene_id, Some(session_id))
-            .await
-            .map(|n| (BaselineAction::ResetScene, n)),
-        ControlMessage::CommitSceneBaseline { scene_id } => server
-            .commit_scene_baseline_from(scene_id, Some(session_id))
-            .await
-            .map(|n| (BaselineAction::CommitScene, n)),
+    // Success has no direct reply (BaselineActionApplied is retired): the
+    // caller observes its own StateEventMsg(BaselineApplied) echo, which
+    // carries the same changed_attributes count.
+    let result: Result<u32, ServerError> = match msg {
+        ControlMessage::ResetSceneToBaseline { scene_id } => {
+            server
+                .reset_scene_to_baseline_from(scene_id, Some(session_id))
+                .await
+        }
+        ControlMessage::CommitSceneBaseline { scene_id } => {
+            server
+                .commit_scene_baseline_from(scene_id, Some(session_id))
+                .await
+        }
         ControlMessage::CommitObjectBaseline {
             scene_id,
             object_id,
-        } => server
-            .commit_object_baseline_from(scene_id, object_id, Some(session_id))
-            .await
-            .map(|n| (BaselineAction::CommitObject, n)),
+        } => {
+            server
+                .commit_object_baseline_from(scene_id, object_id, Some(session_id))
+                .await
+        }
         _ => unreachable!(),
     };
-    match result {
-        Ok((action, changed_attributes)) => {
-            control
-                .send(&ControlMessage::BaselineActionApplied {
-                    action,
-                    changed_attributes,
-                })
-                .await
-                .map_err(|err| ServerError::Runtime(err.to_string()))?;
+    if let Err(err) = result {
+        if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
+            .await
+            .is_err()
+        {
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
+            return Ok(ControlFlow::Break(()));
         }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Convert a server error into the typed wire error carried inside
+/// operator-plane result messages.
+fn wire_error_from(err: &ServerError) -> WireError {
+    WireError {
+        code: map_server_error_to_reject(err),
+        reason: err.to_string(),
+    }
+}
+
+/// Operator-plane mapping ops (`CreateMapping` / `UpdateMapping` /
+/// `RemoveMapping` / `SetMappingLock`). Permission enforcement (own-source or
+/// Operator) happens inside the `wire_*` server methods under one lock, so a
+/// denial mutates nothing and emits nothing; this handler only shapes the
+/// typed result reply.
+async fn handle_mapping_ops(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    session_id: Uuid,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    // Identity is taken from the server's session record, NOT from the
+    // per-connection ClientHello (which carries self-declared roles/device).
+    // `session_id` and `client_hello.device_id` are the connection's registered
+    // identity; resolve the authoritative actor (device + admitted roles) from
+    // the stored SessionInfo so a peer cannot escalate by re-declaring roles.
+    let actor = match server.resolve_wire_actor(client_hello.device_id).await {
+        Ok(actor) => actor,
         Err(err) => {
-            if send_protocol_error(control, map_server_error_to_reject(&err), err.to_string())
-                .await
-                .is_err()
-            {
+            let wire = wire_error_from(&err);
+            let reply = match msg {
+                ControlMessage::RemoveMapping { mapping_id }
+                | ControlMessage::SetMappingLock { mapping_id, .. } => {
+                    ControlMessage::MappingOpResult {
+                        mapping_id,
+                        result: Err(wire),
+                    }
+                }
+                _ => ControlMessage::MappingCreateResult { result: Err(wire) },
+            };
+            if control.send(&reply).await.is_err() {
                 let _ = server.close_session(client_hello.device_id, now_ns()).await;
                 return Ok(ControlFlow::Break(()));
             }
+            return Ok(ControlFlow::Continue(()));
         }
+    };
+    debug_assert_eq!(actor.session_id, session_id);
+    let reply = match msg {
+        ControlMessage::CreateMapping {
+            source_device,
+            source_output,
+            target_scene,
+            target_object,
+            target_attribute,
+            component_mask,
+        } => {
+            let result = server
+                .wire_create_mapping(
+                    actor,
+                    source_device,
+                    source_output,
+                    target_scene,
+                    target_object,
+                    target_attribute,
+                    component_mask,
+                    now_ns(),
+                )
+                .await;
+            ControlMessage::MappingCreateResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        ControlMessage::UpdateMapping {
+            mapping_id,
+            source_device,
+            source_output,
+            target_scene,
+            target_object,
+            target_attribute,
+            component_mask,
+        } => {
+            let result = server
+                .wire_update_mapping(
+                    actor,
+                    mapping_id,
+                    source_device,
+                    source_output,
+                    target_scene,
+                    target_object,
+                    target_attribute,
+                    component_mask,
+                    now_ns(),
+                )
+                .await;
+            ControlMessage::MappingCreateResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        ControlMessage::RemoveMapping { mapping_id } => {
+            let result = server.wire_remove_mapping(actor, mapping_id).await;
+            ControlMessage::MappingOpResult {
+                mapping_id,
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        ControlMessage::SetMappingLock { mapping_id, lock } => {
+            let result = server.wire_set_mapping_lock(actor, mapping_id, lock).await;
+            ControlMessage::MappingOpResult {
+                mapping_id,
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        _ => unreachable!(),
+    };
+    if control.send(&reply).await.is_err() {
+        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+        return Ok(ControlFlow::Break(()));
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Wire take control (`StartTake` / `StopTake`), Operator-gated. Take
+/// identity is server-assigned; the reply carries the take id (start) or the
+/// registered catalog entry (stop).
+async fn handle_take_control(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    server: &ServerHandle,
+    client_hello: &ClientHello,
+    session_id: Uuid,
+    msg: ControlMessage,
+) -> Result<HandlerOutcome, ServerError> {
+    // Operator gate reads the admitted roles from the server session record,
+    // not the self-declared ClientHello roles.
+    let is_operator = server.session_is_operator(client_hello.device_id).await;
+    let reply = match msg {
+        ControlMessage::StartTake => {
+            let result = if is_operator {
+                server.start_take_from(now_ns(), Some(session_id)).await
+            } else {
+                Err(ServerError::Denied(
+                    "operator role is required to start a take".into(),
+                ))
+            };
+            ControlMessage::TakeStartResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        ControlMessage::StopTake => {
+            let result = if is_operator {
+                server.stop_take_from(Some(session_id)).await
+            } else {
+                Err(ServerError::Denied(
+                    "operator role is required to stop a take".into(),
+                ))
+            };
+            ControlMessage::TakeStopResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        _ => unreachable!(),
+    };
+    if control.send(&reply).await.is_err() {
+        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+        return Ok(ControlFlow::Break(()));
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -2782,7 +3366,8 @@ async fn handle_take_management(
         ControlMessage::DeleteTake { .. } => "operator role is required to delete takes",
         _ => unreachable!(),
     };
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
             .await
             .is_err()
@@ -2858,7 +3443,8 @@ async fn handle_playback_control(
     seek_ns: Option<u64>,
     looping: bool,
 ) -> Result<HandlerOutcome, ServerError> {
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(
             control,
             RejectCode::RoleDenied,
@@ -2926,7 +3512,8 @@ async fn handle_bake_cursor(
         }
         _ => unreachable!(),
     };
-    if !client_hello.roles.contains(&ClientRole::Operator) {
+    // Operator gate from the server session record, not self-declared roles.
+    if !server.session_is_operator(client_hello.device_id).await {
         if send_protocol_error(control, RejectCode::RoleDenied, reject_reason.into())
             .await
             .is_err()
@@ -3214,18 +3801,45 @@ async fn handle_quic_peer(
     {
         ControlMessage::ClientHello(hello) => hello,
         _ => {
+            // Typed error before every handshake drop: tell the peer why.
+            send_fatal_handshake_message(
+                &mut control,
+                ControlMessage::Error {
+                    code: RejectCode::UnsupportedProtocol,
+                    reason: "expected ClientHello as first control message".into(),
+                },
+            )
+            .await;
             return Err(ServerError::Runtime(
                 "expected ClientHello as first control message".into(),
             ));
         }
     };
 
-    server
+    // Every pre-registration failure sends a typed message (RegisterRejected
+    // for register-shaped failures, Error otherwise) before the drop.
+    if let Err(err) = server
         .discovered(client_hello.device_id, client_hello.device_name.clone())
-        .await?;
-    server.transport_connected(client_hello.device_id).await?;
-    server.hello_exchanged(client_hello.clone()).await?;
-    server.authenticate(client_hello.device_id).await?;
+        .await
+    {
+        send_handshake_failure(&mut control, &err).await;
+        return Err(err);
+    }
+    if let Err(err) = server.transport_connected(client_hello.device_id).await {
+        send_handshake_failure(&mut control, &err).await;
+        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+        return Err(err);
+    }
+    if let Err(err) = server.hello_exchanged(client_hello.clone()).await {
+        send_handshake_failure(&mut control, &err).await;
+        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+        return Err(err);
+    }
+    if let Err(err) = server.authenticate(client_hello.device_id).await {
+        send_handshake_failure(&mut control, &err).await;
+        let _ = server.close_session(client_hello.device_id, now_ns()).await;
+        return Err(err);
+    }
 
     let register_req = match control
         .recv()
@@ -3234,6 +3848,15 @@ async fn handle_quic_peer(
     {
         ControlMessage::RegisterRequest(req) => req,
         _ => {
+            send_fatal_handshake_message(
+                &mut control,
+                ControlMessage::Error {
+                    code: RejectCode::UnsupportedProtocol,
+                    reason: "expected RegisterRequest after ClientHello".into(),
+                },
+            )
+            .await;
+            let _ = server.close_session(client_hello.device_id, now_ns()).await;
             return Err(ServerError::Runtime(
                 "expected RegisterRequest after ClientHello".into(),
             ));
@@ -3249,17 +3872,13 @@ async fn handle_quic_peer(
                 .map_err(|err| ServerError::Runtime(err.to_string()))?;
             session_id
         }
-        Err(ServerError::RegisterRejected(rejected)) => {
-            control
-                .send(&ControlMessage::RegisterRejected(rejected))
-                .await
-                .map_err(|err| ServerError::Runtime(err.to_string()))?;
-            let _ = server.close_session(client_hello.device_id, now_ns()).await;
-            return Ok(());
-        }
         Err(err) => {
+            send_handshake_failure(&mut control, &err).await;
             let _ = server.close_session(client_hello.device_id, now_ns()).await;
-            return Err(err);
+            return match err {
+                ServerError::RegisterRejected(_) => Ok(()),
+                other => Err(other),
+            };
         }
     };
 
@@ -3363,6 +3982,29 @@ async fn handle_quic_peer(
                             ControlFlow::Continue(()) => {}
                         }
                     }
+                    Ok(msg @ (ControlMessage::CreateMapping { .. }
+                        | ControlMessage::UpdateMapping { .. }
+                        | ControlMessage::RemoveMapping { .. }
+                        | ControlMessage::SetMappingLock { .. })) => {
+                        match handle_mapping_ops(&mut control, &server, &client_hello, session_id, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
+                        }
+                    }
+                    Ok(msg @ (ControlMessage::StartTake | ControlMessage::StopTake)) => {
+                        match handle_take_control(&mut control, &server, &client_hello, session_id, msg).await? {
+                            ControlFlow::Break(()) => break,
+                            ControlFlow::Continue(()) => {}
+                        }
+                    }
+                    Ok(ControlMessage::GetSceneSnapshot) => {
+                        // On-demand world snapshot (target pickers, resync).
+                        let snapshot = server.scene_snapshot_payload().await;
+                        control
+                            .send(&ControlMessage::SceneSnapshot(snapshot))
+                            .await
+                            .map_err(|err| ServerError::Runtime(err.to_string()))?;
+                    }
                     Ok(msg @ (ControlMessage::CreateVideoOffer { .. }
                         | ControlMessage::GetVideoStreamStatus
                         | ControlMessage::VideoSignal(_)
@@ -3377,6 +4019,10 @@ async fn handle_quic_peer(
                     | Ok(ControlMessage::VideoStreamStatus(_))
                     | Ok(ControlMessage::ModeState(_))
                     | Ok(ControlMessage::BaselineActionApplied { .. })
+                    | Ok(ControlMessage::MappingCreateResult { .. })
+                    | Ok(ControlMessage::MappingOpResult { .. })
+                    | Ok(ControlMessage::TakeStartResult { .. })
+                    | Ok(ControlMessage::TakeStopResult { .. })
                     | Ok(ControlMessage::TakeList { .. })
                     | Ok(ControlMessage::TakeSelected { .. })
                     | Ok(ControlMessage::PlaybackState { .. })
@@ -3469,10 +4115,51 @@ async fn send_protocol_error(
         .map_err(|err| ServerError::Runtime(err.to_string()))
 }
 
+/// Send the typed failure for a pre-registration handshake error before the
+/// connection is dropped: `RegisterRejected` when the failure is
+/// register-shaped, `Error{code, reason}` otherwise. Best-effort — the peer
+/// may already be gone.
+async fn send_handshake_failure(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    err: &ServerError,
+) {
+    let message = match err {
+        ServerError::RegisterRejected(rejected) => {
+            ControlMessage::RegisterRejected(rejected.clone())
+        }
+        other => ControlMessage::Error {
+            code: map_server_error_to_reject(other),
+            reason: other.to_string(),
+        },
+    };
+    send_fatal_handshake_message(control, message).await;
+}
+
+/// Deliver a fatal handshake message before the peer task returns (which
+/// drops the QUIC connection). Send, FIN the control stream, then linger
+/// briefly draining the read side so the QUIC machinery can flush the
+/// message; without the linger the connection close races the delivery and
+/// the client sees a bare disconnect instead of the typed error.
+async fn send_fatal_handshake_message(
+    control: &mut motionstage_transport_quic::ControlChannel,
+    message: ControlMessage,
+) {
+    if control.send(&message).await.is_err() {
+        return;
+    }
+    let _ = control.finish();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        while control.recv().await.is_ok() {}
+    })
+    .await;
+}
+
 fn map_server_error_to_reject(err: &ServerError) -> RejectCode {
     match err {
         ServerError::Protocol(_) => RejectCode::VersionMismatch,
         ServerError::SessionNotFound(_) => RejectCode::RoleDenied,
+        ServerError::Denied(_) => RejectCode::RoleDenied,
+        ServerError::AlreadyRecording => RejectCode::ServerBusy,
         ServerError::RegisterRejected(rejected) => rejected.code,
         ServerError::Video(_) | ServerError::Signaling(_) => RejectCode::RoleDenied,
         ServerError::Core(_)
@@ -3640,6 +4327,17 @@ pub enum ServerError {
     SessionNotFound(Uuid),
     #[error("registration rejected: {0:?}")]
     RegisterRejected(RegisterRejected),
+    /// An operator-plane operation was refused by the permission model
+    /// (own-source vs [`ClientRole::Operator`]). Nothing was mutated and no
+    /// event was emitted.
+    #[error("denied: {0}")]
+    Denied(String),
+    /// A `StartTake`/`start_recording` was issued while a recording is already
+    /// active. The request mutates nothing and emits no event — the in-flight
+    /// take is never silently replaced. Answered on the wire with
+    /// [`RejectCode::ServerBusy`] inside [`ControlMessage::TakeStartResult`].
+    #[error("a recording is already active")]
+    AlreadyRecording,
     #[error("recording error: {0}")]
     Recording(String),
     #[error("take error: {0}")]
@@ -4466,7 +5164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_role_can_set_data_flow_over_control() {
+    async fn set_data_flow_acks_via_event_echo_and_ping_keeps_mode_state() {
         let device_id = Uuid::now_v7();
         let mut config = ServerConfig::default();
         config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
@@ -4482,45 +5180,56 @@ mod tests {
         )
         .await;
 
+        // Retired ack: SetDataFlow success sends no direct ModeState. The
+        // caller observes its own replicated event echo instead. Ping right
+        // after; the first non-event reply must be Pong, then the heartbeat
+        // ModeState (which is kept as a liveness+state probe).
         control
             .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
             .await
             .unwrap();
+        control.send(&ControlMessage::Ping).await.unwrap();
+
+        // No direct message may precede the Pong: a ModeState here would be
+        // the retired SetDataFlow ack. Event echoes may interleave freely
+        // (their delivery races the direct replies in the session loop).
+        let mut saw_mode_event = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), control.recv())
+                .await
+                .expect("control message within timeout")
+                .unwrap()
+            {
+                ControlMessage::StateEventMsg(envelope) => {
+                    if matches!(envelope.event, StateEvent::ModeChanged { mode: Mode::LIVE }) {
+                        saw_mode_event = true;
+                    }
+                }
+                ControlMessage::Pong => break,
+                other => panic!("expected event echo or Pong before anything else, got {other:?}"),
+            }
+        }
+        // The heartbeat ModeState follows the Pong.
         match recv_skipping_events(&mut control).await {
             ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
-            other => panic!("expected ModeState, got {other:?}"),
+            other => panic!("expected heartbeat ModeState after Pong, got {other:?}"),
+        }
+        // The mutation replicated as an event echo (possibly after the Pong).
+        if !saw_mode_event {
+            let echo = recv_until(&mut control, |message| {
+                matches!(
+                    message,
+                    ControlMessage::StateEventMsg(StateEventEnvelope {
+                        event: StateEvent::ModeChanged { mode: Mode::LIVE },
+                        ..
+                    })
+                )
+            })
+            .await;
+            assert!(matches!(echo, ControlMessage::StateEventMsg(_)));
         }
 
         drop(peer);
-        runtime.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn operator_role_can_set_data_flow_without_allowlist() {
-        let mut config = ServerConfig::default();
-        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.enable_discovery = false;
-        let server = ServerHandle::new(config);
-        let runtime = server.start_quic_runtime().await.unwrap();
-
-        let device_id = Uuid::now_v7();
-        let (_peer, mut control) = connect_active_quic_client(
-            runtime.local_addr,
-            device_id,
-            ClientRole::Operator,
-            Feature::Mapping,
-        )
-        .await;
-
-        control
-            .send(&ControlMessage::SetDataFlow(DataFlowState::Live))
-            .await
-            .unwrap();
-        match recv_skipping_events(&mut control).await {
-            ControlMessage::ModeState(mode) => assert_eq!(mode, Mode::LIVE),
-            other => panic!("expected ModeState, got {other:?}"),
-        }
-
         runtime.shutdown().await.unwrap();
     }
 
@@ -4552,8 +5261,18 @@ mod tests {
             .await
             .unwrap();
 
-        let ack = recv_skipping_events(&mut control_b).await;
-        assert!(matches!(ack, ControlMessage::ModeState(Mode::LIVE)));
+        // The mutating client observes its own echo (no direct ModeState ack).
+        let echo = recv_until(&mut control_b, |message| {
+            matches!(
+                message,
+                ControlMessage::StateEventMsg(StateEventEnvelope {
+                    event: StateEvent::ModeChanged { mode: Mode::LIVE },
+                    ..
+                })
+            )
+        })
+        .await;
+        assert!(matches!(echo, ControlMessage::StateEventMsg(_)));
 
         // The other active client observes the change as a replicated state
         // event carrying the originating session.
@@ -4607,15 +5326,48 @@ mod tests {
             })
             .await
             .unwrap();
-        match recv_skipping_events(&mut control).await {
-            ControlMessage::BaselineActionApplied {
-                action,
-                changed_attributes,
-            } => {
-                assert_eq!(action, BaselineAction::ResetScene);
-                assert_eq!(changed_attributes, 1);
+        // Retired ack: no direct BaselineActionApplied. The single
+        // acknowledgement is the caller's own replicated event echo, which
+        // carries the same change count. A Ping afterwards proves no direct
+        // ack sneaks in between.
+        control.send(&ControlMessage::Ping).await.unwrap();
+        let mut saw_baseline_event = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), control.recv())
+                .await
+                .expect("control message within timeout")
+                .unwrap()
+            {
+                ControlMessage::StateEventMsg(envelope) => {
+                    if let StateEvent::BaselineApplied {
+                        action,
+                        changed_attributes,
+                    } = envelope.event
+                    {
+                        assert_eq!(action, BaselineAction::ResetScene);
+                        assert_eq!(changed_attributes, 1);
+                        saw_baseline_event = true;
+                    }
+                }
+                // The first direct message must be the Pong — a
+                // BaselineActionApplied here would be the retired ack.
+                ControlMessage::Pong => break,
+                other => panic!("expected event echo or Pong, got {other:?}"),
             }
-            other => panic!("expected BaselineActionApplied, got {other:?}"),
+        }
+        // The echo may race past the Pong; wait for it if it hasn't landed.
+        if !saw_baseline_event {
+            let echo = recv_until(&mut control, |message| {
+                matches!(
+                    message,
+                    ControlMessage::StateEventMsg(StateEventEnvelope {
+                        event: StateEvent::BaselineApplied { .. },
+                        ..
+                    })
+                )
+            })
+            .await;
+            assert!(matches!(echo, ControlMessage::StateEventMsg(_)));
         }
 
         runtime.shutdown().await.unwrap();
@@ -5168,6 +5920,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_take_while_recording_active_rejects_and_preserves_in_progress_take() {
+        let (config, _temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let (scene, _scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+
+        // A take is in progress: it is the active recording.
+        let first = server
+            .start_take_from(1_000, None)
+            .await
+            .expect("first take starts");
+
+        // A second StartTake while a recording is already active (retry, or a
+        // second operator) must be rejected with the typed AlreadyRecording
+        // error, mutate nothing, and emit no event — the in-progress take is
+        // never silently replaced (finding: the first writer would be dropped
+        // unflushed).
+        let mut rx = server.subscribe_state_events();
+        let seq_before = server.current_event_seq().await;
+        let err = server
+            .start_take_from(2_000, None)
+            .await
+            .expect_err("second StartTake while recording must be rejected");
+        assert!(
+            matches!(err, ServerError::AlreadyRecording),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(super::map_server_error_to_reject(&err), RejectCode::ServerBusy);
+        assert!(
+            drain_events(&mut rx).is_empty(),
+            "rejected StartTake must emit no events"
+        );
+        assert_eq!(server.current_event_seq().await, seq_before);
+
+        // The original in-progress take survives intact: stopping it registers
+        // exactly the first take id, proving its writer was neither dropped nor
+        // replaced by the rejected second StartTake.
+        let take = server
+            .stop_take_from(None)
+            .await
+            .expect("first take stops cleanly");
+        assert_eq!(take.take_id, first);
+    }
+
+    #[tokio::test]
     async fn host_session_is_registered_at_startup() {
         let server = ServerHandle::new(ServerConfig::default());
         let sessions = server.sessions().await;
@@ -5674,11 +6471,8 @@ mod tests {
         assert!(payload.sessions[0].is_host);
     }
 
-    #[tokio::test]
-    async fn rediscovery_of_registered_session_emits_superseded_session_left() {
-        let server = ServerHandle::new(ServerConfig::default());
-        let device_id = Uuid::now_v7();
-
+    /// Register + activate a session for `device_id` and return its session id.
+    async fn register_and_activate(server: &ServerHandle, device_id: Uuid) -> Uuid {
         server.discovered(device_id, "ipad").await.unwrap();
         server.transport_connected(device_id).await.unwrap();
         server
@@ -5706,33 +6500,21 @@ mod tests {
             .unwrap();
         server.scene_synced(device_id).await.unwrap();
         server.activate(device_id).await.unwrap();
+        accepted.session_id
+    }
 
-        // Reconnect while the old registered session is still half-open:
-        // replacing its record must close it on the event stream first.
+    #[tokio::test]
+    async fn superseding_reconnect_emits_old_session_left_only_after_admission() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        let first_session = register_and_activate(&server, device_id).await;
+
+        // Reconnect while the old registered session is still half-open. The
+        // pre-admission steps of the new connection must NOT retire the old
+        // session on the event stream — a free takeover of a live session is
+        // exactly the attack we are closing.
         let mut rx = server.subscribe_state_events();
         server.discovered(device_id, "ipad").await.unwrap();
-        let events = drain_events(&mut rx);
-        assert_eq!(events.len(), 1, "events: {events:?}");
-        assert!(matches!(
-            &events[0].event,
-            StateEvent::SessionLeft { session_id, reason }
-                if *session_id == accepted.session_id
-                    && reason.as_deref() == Some("superseded by reconnect")
-        ));
-        assert_eq!(events[0].origin_session, Some(accepted.session_id));
-
-        // Re-discovering a session that never registered emits nothing: it
-        // never joined the event stream, so it has nothing to leave.
-        server.discovered(device_id, "ipad").await.unwrap();
-        assert!(drain_events(&mut rx).is_empty());
-
-        // Discovering a brand-new device emits nothing.
-        let fresh_device = Uuid::now_v7();
-        server.discovered(fresh_device, "fresh").await.unwrap();
-        assert!(drain_events(&mut rx).is_empty());
-
-        // A record already Closed had its SessionLeft emitted at close time;
-        // rediscovery must not emit a second one.
         server.transport_connected(device_id).await.unwrap();
         server
             .hello_exchanged(ClientHello {
@@ -5747,6 +6529,13 @@ mod tests {
             .await
             .unwrap();
         server.authenticate(device_id).await.unwrap();
+        assert!(
+            drain_events(&mut rx).is_empty(),
+            "old session must not be retired before the new one is admitted"
+        );
+
+        // Only once the superseding connection passes register() (admission)
+        // does the old session's SessionLeft fire.
         server
             .register(
                 device_id,
@@ -5757,6 +6546,123 @@ mod tests {
             )
             .await
             .unwrap();
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::SessionLeft { session_id, reason }
+                if *session_id == first_session
+                    && reason.as_deref() == Some("superseded by reconnect")
+        ));
+        assert_eq!(events[0].origin_session, Some(first_session));
+    }
+
+    #[tokio::test]
+    async fn failed_admission_reconnect_does_not_retire_live_session() {
+        // Credentialed mode: a reconnect that does NOT satisfy admission (wrong
+        // pairing token) must not evict the live session from the event stream.
+        let mut config = ServerConfig::default();
+        config.security_mode = SecurityMode::PairingRequired;
+        config.pairing_token = Some("secret".into());
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+
+        // Admit the victim with the correct credential.
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        let victim = server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: Some("secret".into()),
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.scene_synced(device_id).await.unwrap();
+        server.activate(device_id).await.unwrap();
+
+        // A reconnect claiming the same device_id but WITHOUT the credential.
+        let mut rx = server.subscribe_state_events();
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::Operator],
+                features: vec![Feature::Mapping],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        let rejected = server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: Some("wrong".into()),
+                    api_key: None,
+                },
+            )
+            .await;
+        match rejected {
+            Err(ServerError::RegisterRejected(rejected)) => {
+                assert_eq!(rejected.code, RejectCode::AuthFailed);
+            }
+            other => panic!("expected AuthFailed RegisterRejected, got {other:?}"),
+        }
+        // The victim's SessionLeft was never emitted: failed admission is not a
+        // takeover of the live session on the replicated stream.
+        let victim_session = victim.session_id;
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|envelope| matches!(
+                &envelope.event,
+                StateEvent::SessionLeft { session_id, .. } if *session_id == victim_session
+            )),
+            "failed-admission reconnect must not retire the live session: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rediscovery_of_closed_or_unregistered_session_emits_nothing() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        let mut rx = server.subscribe_state_events();
+
+        // Re-discovering a session that never registered emits nothing: it
+        // never joined the event stream, so it has nothing to leave.
+        server.discovered(device_id, "ipad").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+        server.discovered(device_id, "ipad").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+
+        // Discovering a brand-new device emits nothing.
+        let fresh_device = Uuid::now_v7();
+        server.discovered(fresh_device, "fresh").await.unwrap();
+        assert!(drain_events(&mut rx).is_empty());
+
+        // A record already Closed had its SessionLeft emitted at close time;
+        // rediscovery must not emit a second one.
+        let _session = register_and_activate(&server, device_id).await;
+        let _ = drain_events(&mut rx);
         server.close_session(device_id, now_ns()).await.unwrap();
         let closed_events = drain_events(&mut rx);
         assert_eq!(closed_events.len(), 1, "events: {closed_events:?}");
@@ -6212,5 +7118,660 @@ mod tests {
         }
 
         runtime.shutdown().await.unwrap();
+    }
+
+    /// Open a connection and drive the handshake up to (and including) the
+    /// hello with an explicit protocol minor; return the next server message
+    /// after sending RegisterRequest.
+    async fn handshake_with_hello(
+        addr: SocketAddr,
+        hello: ClientHello,
+    ) -> (QuicPeer, ControlChannel, ControlMessage) {
+        let client = QuicClient::new_insecure_for_local_dev().unwrap();
+        let peer = client.connect(addr).await.unwrap();
+        let mut control = peer.accept_control_stream().await.unwrap();
+        assert!(matches!(
+            control.recv().await.unwrap(),
+            ControlMessage::ServerHello(_)
+        ));
+        control
+            .send(&ControlMessage::ClientHello(hello))
+            .await
+            .unwrap();
+        control
+            .send(&ControlMessage::RegisterRequest(RegisterRequest {
+                pairing_token: None,
+                api_key: None,
+            }))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), control.recv())
+            .await
+            .expect("handshake reply within timeout")
+            .unwrap();
+        (peer, control, reply)
+    }
+
+    fn motion_hello(device_id: Uuid, minor: u16, roles: Vec<ClientRole>) -> ClientHello {
+        ClientHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: minor,
+            device_id,
+            device_name: format!("peer-{device_id}"),
+            roles,
+            features: vec![Feature::Motion],
+            advertised_attributes: vec![AttributeDescriptor {
+                path: "pose_pos".into(),
+                value_type: AttributeKind::Vec3f,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn register_accepted_echoes_server_minor_for_older_client() {
+        assert!(
+            PROTOCOL_MINOR >= 1,
+            "test requires a server minor an older client can undershoot"
+        );
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        // Truth-in-docs: an older-minor client registers, but is told the
+        // server's own minor — the server speaks exactly its own minor and
+        // does not downgrade behaviour for the lesser client.
+        let older = PROTOCOL_MINOR - 1;
+        let (_peer, _control, reply) = handshake_with_hello(
+            runtime.local_addr,
+            motion_hello(Uuid::now_v7(), older, vec![ClientRole::MotionSource]),
+        )
+        .await;
+        match reply {
+            ControlMessage::RegisterAccepted(accepted) => {
+                assert_eq!(accepted.negotiated_protocol_minor, PROTOCOL_MINOR);
+            }
+            other => panic!("expected RegisterAccepted, got {other:?}"),
+        }
+
+        // A current-minor client also gets the server's minor.
+        let (_peer2, _control2, reply2) = handshake_with_hello(
+            runtime.local_addr,
+            motion_hello(Uuid::now_v7(), PROTOCOL_MINOR, vec![ClientRole::MotionSource]),
+        )
+        .await;
+        match reply2 {
+            ControlMessage::RegisterAccepted(accepted) => {
+                assert_eq!(accepted.negotiated_protocol_minor, PROTOCOL_MINOR);
+            }
+            other => panic!("expected RegisterAccepted, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreign_major_gets_typed_register_rejected_before_handshake_drop() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        // The server requires its own major: a foreign major is rejected with
+        // a typed RegisterRejected{UnsupportedProtocol}, not a bare Error.
+        let mut hello = motion_hello(Uuid::now_v7(), 0, vec![ClientRole::MotionSource]);
+        hello.protocol_major = PROTOCOL_MAJOR + 1;
+        let (_peer, _control, reply) = handshake_with_hello(runtime.local_addr, hello).await;
+        match reply {
+            ControlMessage::RegisterRejected(rejected) => {
+                assert_eq!(rejected.code, RejectCode::UnsupportedProtocol);
+                assert!(
+                    rejected.reason.contains("unsupported major"),
+                    "reason: {}",
+                    rejected.reason
+                );
+            }
+            other => panic!("expected typed RegisterRejected before drop, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_roles_get_typed_reject_before_handshake_drop() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, _control, reply) = handshake_with_hello(
+            runtime.local_addr,
+            motion_hello(Uuid::now_v7(), PROTOCOL_MINOR, Vec::new()),
+        )
+        .await;
+        match reply {
+            ControlMessage::RegisterRejected(rejected) => {
+                assert_eq!(rejected.code, RejectCode::RoleDenied);
+                assert!(rejected.reason.contains("at least one role"));
+            }
+            other => panic!("expected typed RegisterRejected before drop, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_create_mapping_defaults_to_own_device_and_active_scene() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let device_id = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+        let (_peer_b, mut control_b) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::CreateMapping {
+                source_device: None,
+                source_output: "pose_pos".into(),
+                target_scene: None,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: Some(vec![0, 2]),
+            })
+            .await
+            .unwrap();
+
+        let mapping_id = match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Ok(summary) } => {
+                assert_eq!(summary.source_device, device_id, "None = own device");
+                assert_eq!(summary.target_scene, scene_id, "None = active scene");
+                assert_eq!(summary.target_object, object_id);
+                assert_eq!(summary.component_mask, Some(vec![0, 2]));
+                assert!(!summary.lock);
+                summary.mapping_id
+            }
+            other => panic!("expected MappingCreateResult Ok, got {other:?}"),
+        };
+
+        // The mutation replicates to the other session with the originating
+        // session stamped (the bus covers wire mapping ops).
+        let observed = recv_until(&mut control_b, |message| {
+            matches!(
+                message,
+                ControlMessage::StateEventMsg(StateEventEnvelope {
+                    event: StateEvent::MappingCreated { .. },
+                    ..
+                })
+            )
+        })
+        .await;
+        match observed {
+            ControlMessage::StateEventMsg(envelope) => {
+                assert!(envelope.origin_session.is_some());
+                assert_ne!(envelope.origin_session, Some(server.host_session_id()));
+                assert!(matches!(
+                    envelope.event,
+                    StateEvent::MappingCreated { mapping } if mapping.mapping_id == mapping_id
+                ));
+            }
+            other => panic!("expected MappingCreated event, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_create_mapping_for_foreign_device_is_denied_without_operator() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, _scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+
+        let seq_before = server.current_event_seq().await;
+        control
+            .send(&ControlMessage::CreateMapping {
+                source_device: Some(Uuid::now_v7()), // someone else's device
+                source_output: "pose_pos".into(),
+                target_scene: None,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Err(err) } => {
+                assert_eq!(err.code, RejectCode::RoleDenied);
+                assert!(err.reason.contains("own device"), "reason: {}", err.reason);
+            }
+            other => panic!("expected MappingCreateResult Err, got {other:?}"),
+        }
+
+        // Denied: nothing mutated, nothing emitted.
+        assert!(server.runtime_snapshot().await.mappings.is_empty());
+        assert_eq!(server.current_event_seq().await, seq_before);
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_manages_any_mapping_over_wire() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let foreign_device = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Mapping,
+        )
+        .await;
+
+        // Create for a foreign source device.
+        control
+            .send(&ControlMessage::CreateMapping {
+                source_device: Some(foreign_device),
+                source_output: "pose_pos".into(),
+                target_scene: Some(scene_id),
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            })
+            .await
+            .unwrap();
+        let mapping_id = match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Ok(summary) } => {
+                assert_eq!(summary.source_device, foreign_device);
+                summary.mapping_id
+            }
+            other => panic!("expected MappingCreateResult Ok, got {other:?}"),
+        };
+
+        // Update it (change the component mask).
+        control
+            .send(&ControlMessage::UpdateMapping {
+                mapping_id,
+                source_device: Some(foreign_device),
+                source_output: "pose_pos".into(),
+                target_scene: Some(scene_id),
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: Some(vec![1]),
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Ok(summary) } => {
+                assert_eq!(summary.mapping_id, mapping_id);
+                assert_eq!(summary.component_mask, Some(vec![1]));
+            }
+            other => panic!("expected MappingCreateResult Ok for update, got {other:?}"),
+        }
+
+        // Lock, unlock, remove.
+        control
+            .send(&ControlMessage::SetMappingLock {
+                mapping_id,
+                lock: true,
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult {
+                mapping_id: id,
+                result: Ok(()),
+            } => assert_eq!(id, mapping_id),
+            other => panic!("expected MappingOpResult Ok for lock, got {other:?}"),
+        }
+        control
+            .send(&ControlMessage::SetMappingLock {
+                mapping_id,
+                lock: false,
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult { result: Ok(()), .. } => {}
+            other => panic!("expected MappingOpResult Ok for unlock, got {other:?}"),
+        }
+        control
+            .send(&ControlMessage::RemoveMapping { mapping_id })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult { result: Ok(()), .. } => {}
+            other => panic!("expected MappingOpResult Ok for remove, got {other:?}"),
+        }
+        assert!(server.runtime_snapshot().await.mappings.is_empty());
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_manage_foreign_mapping_over_wire() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let foreign_device = Uuid::now_v7();
+        let mapping_id = server
+            .create_mapping(
+                MappingRequest {
+                    source_device: foreign_device,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+
+        let seq_before = server.current_event_seq().await;
+        control
+            .send(&ControlMessage::RemoveMapping { mapping_id })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult {
+                result: Err(err), ..
+            } => assert_eq!(err.code, RejectCode::RoleDenied),
+            other => panic!("expected denied MappingOpResult, got {other:?}"),
+        }
+
+        control
+            .send(&ControlMessage::SetMappingLock {
+                mapping_id,
+                lock: true,
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult {
+                result: Err(err), ..
+            } => assert_eq!(err.code, RejectCode::RoleDenied),
+            other => panic!("expected denied MappingOpResult, got {other:?}"),
+        }
+
+        control
+            .send(&ControlMessage::UpdateMapping {
+                mapping_id,
+                source_device: None,
+                source_output: "pose_pos".into(),
+                target_scene: Some(scene_id),
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: Some(vec![0]),
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Err(err) } => {
+                assert_eq!(err.code, RejectCode::RoleDenied)
+            }
+            other => panic!("expected denied MappingCreateResult, got {other:?}"),
+        }
+
+        // Nothing mutated, nothing emitted.
+        let snapshot = server.runtime_snapshot().await;
+        let mapping = snapshot.mappings.get(&mapping_id).expect("mapping intact");
+        assert_eq!(mapping.source_device, foreign_device);
+        assert!(!mapping.lock);
+        assert_eq!(mapping.component_mask, None);
+        assert_eq!(server.current_event_seq().await, seq_before);
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn own_source_session_manages_its_own_mapping_over_wire() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let device_id = Uuid::now_v7();
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            device_id,
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+
+        control
+            .send(&ControlMessage::CreateMapping {
+                source_device: None,
+                source_output: "pose_pos".into(),
+                target_scene: Some(scene_id),
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            })
+            .await
+            .unwrap();
+        let mapping_id = match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Ok(summary) } => summary.mapping_id,
+            other => panic!("expected MappingCreateResult Ok, got {other:?}"),
+        };
+
+        control
+            .send(&ControlMessage::UpdateMapping {
+                mapping_id,
+                source_device: None,
+                source_output: "pose_pos".into(),
+                target_scene: Some(scene_id),
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: Some(vec![0, 1]),
+            })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingCreateResult { result: Ok(summary) } => {
+                assert_eq!(summary.component_mask, Some(vec![0, 1]));
+            }
+            other => panic!("expected MappingCreateResult Ok, got {other:?}"),
+        }
+
+        control
+            .send(&ControlMessage::RemoveMapping { mapping_id })
+            .await
+            .unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::MappingOpResult { result: Ok(()), .. } => {}
+            other => panic!("expected MappingOpResult Ok, got {other:?}"),
+        }
+        assert!(server.runtime_snapshot().await.mappings.is_empty());
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_take_control_assigns_server_owned_identity() {
+        let (mut config, temp) = config_with_temp_catalog();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::Operator,
+            Feature::Recording,
+        )
+        .await;
+
+        control.send(&ControlMessage::StartTake).await.unwrap();
+        let take_id = match recv_skipping_events(&mut control).await {
+            ControlMessage::TakeStartResult { result: Ok(take_id) } => take_id,
+            other => panic!("expected TakeStartResult Ok, got {other:?}"),
+        };
+
+        control.send(&ControlMessage::StopTake).await.unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::TakeStopResult { result: Ok(take) } => {
+                assert_eq!(take.take_id, take_id);
+                assert_eq!(take.scene_id, scene_id);
+                assert_eq!(take.name, "Take 001");
+                // Server-assigned identity: the path lives in the take-catalog
+                // directory and was never supplied by the client.
+                let path = std::path::Path::new(&take.path);
+                assert_eq!(path.parent(), Some(temp.path()));
+                assert!(path.exists(), "recording file written at {path:?}");
+            }
+            other => panic!("expected TakeStopResult Ok, got {other:?}"),
+        }
+
+        // The take is in the catalog and the mode returned to Live.
+        let takes = server.list_takes(None).await;
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].take_id, take_id);
+        assert_eq!(server.mode().await, Mode::LIVE);
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn take_control_requires_operator_role() {
+        let (mut config, _temp) = config_with_temp_catalog();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, _scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+
+        let seq_before = server.current_event_seq().await;
+        control.send(&ControlMessage::StartTake).await.unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::TakeStartResult { result: Err(err) } => {
+                assert_eq!(err.code, RejectCode::RoleDenied);
+            }
+            other => panic!("expected denied TakeStartResult, got {other:?}"),
+        }
+        control.send(&ControlMessage::StopTake).await.unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::TakeStopResult { result: Err(err) } => {
+                assert_eq!(err.code, RejectCode::RoleDenied);
+            }
+            other => panic!("expected denied TakeStopResult, got {other:?}"),
+        }
+        assert_eq!(server.mode().await, Mode::IDLE);
+        assert_eq!(server.current_event_seq().await, seq_before);
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_scene_snapshot_returns_on_demand_world() {
+        let mut config = ServerConfig::default();
+        config.quic_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.enable_discovery = false;
+        let server = ServerHandle::new(config);
+        let (scene, scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+        let runtime = server.start_quic_runtime().await.unwrap();
+
+        let (_peer, mut control) = connect_active_quic_client(
+            runtime.local_addr,
+            Uuid::now_v7(),
+            ClientRole::MotionSource,
+            Feature::Motion,
+        )
+        .await;
+
+        control.send(&ControlMessage::GetSceneSnapshot).await.unwrap();
+        match recv_skipping_events(&mut control).await {
+            ControlMessage::SceneSnapshot(payload) => {
+                assert_eq!(payload.active_scene, Some(scene_id));
+                assert!(payload.scenes.iter().any(|s| s.scene_id == scene_id));
+                assert_eq!(payload.seq, server.current_event_seq().await);
+            }
+            other => panic!("expected SceneSnapshot, got {other:?}"),
+        }
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_api_start_take_uses_catalog_dir_identity() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let (scene, _scene_id, _object_id) = camera_scene();
+        server.load_scene(scene).await;
+
+        let take_id = server.start_take_from(now_ns(), None).await.unwrap();
+        let take = server.stop_take_from(None).await.unwrap();
+        assert_eq!(take.take_id, take_id);
+        assert_eq!(
+            std::path::Path::new(&take.path).parent(),
+            Some(temp.path())
+        );
+        assert!(std::path::Path::new(&take.path).exists());
     }
 }

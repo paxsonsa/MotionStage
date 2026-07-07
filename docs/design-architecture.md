@@ -165,3 +165,47 @@ Supported admission policies:
 - `api_key_plus_pairing`
 
 Admission and capacity checks happen during registration. Rejections emit explicit `RejectCode` outcomes.
+
+### Identity and the trust boundary
+
+The `ClientHello` is **self-asserted**: a peer chooses its own `device_id` and
+declares its own `roles` (including `Operator`). These claims are the *input*
+to admission, never the basis for later authorization. The trust boundary is:
+
+- **Identity is the authenticated session, not repeated self-claims.** At
+  registration the server records the session's `device_id` and *admitted*
+  `roles` in its `SessionInfo`. Every operator-plane permission check
+  (own-source mapping management, the `Operator` gate on mode/recording/take
+  control, baseline actions) reads that server-side record via
+  `resolve_wire_actor` / `session_is_operator`. Fields re-sent on the wire per
+  request — e.g. a `source_device` naming another device — are only honored
+  when they equal the session's own device or the session is `Operator`. A
+  peer therefore cannot escalate by re-declaring `roles:[Operator]` or by
+  naming a victim's `device_id` in a request.
+
+- **Roles are gated by admission policy, not merely declared.** `authorize_roles`
+  is the single choke point that turns declared roles into *granted* roles and
+  records the basis (`RoleGrant`). Under `trusted_lan`, every peer that reaches
+  the socket is trusted (the LAN is the security boundary) and all declared
+  roles — including `Operator` — are granted; run a credentialed mode if the
+  LAN is not trusted. Under credentialed modes the shared credential authorized
+  the connection; MotionStage does not yet carry a per-credential role map, so
+  declared roles are still granted, but `RoleGrant::Credential` is recorded and
+  `authorize_roles` is where a per-credential/identity role allow-list belongs
+  (see its `TODO(security)`).
+
+- **Reconnect does not freely supersede a live session.** Sessions are keyed by
+  the self-claimed `device_id`, so a reconnecting connection claiming a live
+  device's id could otherwise evict it. The old session's terminal
+  `SessionLeft` is therefore **deferred until the superseding connection is
+  itself admitted** (passes `register`): a pre-auth or failed-admission
+  reconnect never retires the live session from the replicated event stream.
+  Residual caveat: the new record overwrites the old one's mutable handshake
+  fields immediately (one map slot per `device_id`); deferring the
+  `SessionLeft` is what makes *admission*, not mere reconnection, the gate for
+  evicting a live session off the stream.
+
+Known limitation: `device_id` is not cryptographically bound to a credential.
+Under credentialed modes, spoofing another device's `device_id` still requires
+passing admission with a valid credential; binding identity to the credential
+is future work alongside the per-credential role ACL.

@@ -50,12 +50,6 @@ def test_register_delegate_wires_server_to_adapter(monkeypatch):
         def mode(self) -> str:
             return "idle"
 
-        def set_mode_control_allowlist(self, ids: list[str]) -> None:
-            return None
-
-        def mode_control_allowlist(self) -> list[str]:
-            return []
-
         def metrics(self) -> tuple[int, int, int, int, int, int, int]:
             return (1, 2, 3, 4, 5, 6, 7)
 

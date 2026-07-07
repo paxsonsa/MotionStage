@@ -21,7 +21,24 @@
 6. Server returns `RegisterAccepted` with a new `session_id` or `RegisterRejected`.
 7. Session syncs scene state and enters `Active`.
 
-Control and motion payloads are sent in versioned wire envelopes (`protocol_major`, `protocol_minor`) so minor-version gates are enforced at transport decode time.
+Control and motion payloads are sent in versioned wire envelopes (`protocol_major`, `protocol_minor`).
+
+### Version negotiation (truth-in-docs, clean break)
+
+There is no cross-major/minor compatibility shim — wire compat is a clean break.
+The server speaks exactly one dialect:
+
+- **Major must match the server's exactly.** Any other major is rejected at the
+  hello exchange with a typed `RegisterRejected{ code: UnsupportedProtocol }`
+  before the connection is dropped. The server never speaks a foreign major.
+- **The server speaks exactly its own minor.** A client whose minor is *greater*
+  than the server's is rejected with `RegisterRejected{ code: VersionMismatch }`
+  (it may depend on features the server lacks). A client whose minor is
+  *lesser-or-equal* is accepted with no behaviour change, and
+  `RegisterAccepted.negotiated_protocol_minor` reports the **server's own**
+  minor — the value honestly reflects the dialect the server speaks, not a
+  per-client downgrade. Clients must not assume the server will emulate an older
+  minor's message set.
 
 ## Control messages (v1.4)
 

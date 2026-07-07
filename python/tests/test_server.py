@@ -75,7 +75,6 @@ class _FakeNative:
     def __init__(self, name: str | None = None):
         self._name = name or "motionstage"
         self._mode = "idle"
-        self._allowlist: list[str] = []
         # Batches handed out one per drain_state_events call.
         self.event_batches: list[list[dict[str, object]]] = []
         self.snapshot: dict[str, object] = {
@@ -130,11 +129,13 @@ class _FakeNative:
     def mode(self) -> str:
         return self._mode
 
-    def set_mode_control_allowlist(self, ids: list[str]) -> None:
-        self._allowlist = list(ids)
+    def set_data_flow(self, live: bool) -> str:
+        self._mode = "live" if live else "idle"
+        return self._mode
 
-    def mode_control_allowlist(self) -> list[str]:
-        return list(self._allowlist)
+    def set_recording(self, recording: bool) -> str:
+        self._mode = "recording" if recording else "live"
+        return self._mode
 
     def metrics(self) -> tuple[int, int, int, int, int, int, int]:
         return (0, 0, 0, 0, 0, 0, 0)
@@ -151,7 +152,13 @@ class _FakeNative:
     def create_mapping(self, request: dict[str, object]) -> str:
         return "00000000-0000-0000-0000-000000000010"
 
+    def update_mapping(self, mapping_id: str, request: dict[str, object]) -> None:
+        return None
+
     def remove_mapping(self, mapping_id: str) -> None:
+        return None
+
+    def set_mapping_lock(self, mapping_id: str, lock: bool) -> None:
         return None
 
     def runtime_attribute_values(self):
@@ -185,8 +192,18 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
             assert request["target_object_id"] == "00000000-0000-0000-0000-000000000222"
             return "00000000-0000-0000-0000-000000000123"
 
+        def update_mapping(self, mapping_id: str, request: dict[str, object]) -> None:
+            assert mapping_id == "00000000-0000-0000-0000-000000000123"
+            assert request["source_device"] == "00000000-0000-0000-0000-000000000111"
+            assert request["target_object_id"] == "00000000-0000-0000-0000-000000000222"
+            assert request["component_mask"] == [0]
+
         def remove_mapping(self, mapping_id: str) -> None:
             assert mapping_id == "00000000-0000-0000-0000-000000000123"
+
+        def set_mapping_lock(self, mapping_id: str, lock: bool) -> None:
+            assert mapping_id == "00000000-0000-0000-0000-000000000123"
+            assert lock is True
 
         def reset_scene_to_baseline(self, scene_id: str | None) -> int:
             assert scene_id in {"00000000-0000-0000-0000-000000000000", None}
@@ -226,12 +243,10 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
     )
     server.set_active_scene(scene_id)
     assert server.set_mode("live") == "live"
-    server.set_mode_control_allowlist(
-        [server_module.UUID("00000000-0000-0000-0000-000000000999")]
-    )
-    assert server.mode_control_allowlist() == [
-        server_module.UUID("00000000-0000-0000-0000-000000000999")
-    ]
+    assert server.set_data_flow(True) == "live"
+    assert server.set_recording(True) == "recording"
+    assert server.set_recording(False) == "live"
+    assert server.set_data_flow(False) == "idle"
     metrics = server.metrics()
     assert isinstance(metrics, server_module.ServerMetrics)
     assert metrics.accepted_sessions == 1
@@ -248,6 +263,17 @@ def test_server_delegate_and_runtime_calls_with_native_bridge(monkeypatch):
             "component_mask": [0, 1, 2],
         }
     )
+    server.update_mapping(
+        mapping_id,
+        {
+            "source_device": server_module.UUID("00000000-0000-0000-0000-000000000111"),
+            "source_output": "demo.position",
+            "target_object_id": server_module.UUID("00000000-0000-0000-0000-000000000222"),
+            "target_attribute": "position",
+            "component_mask": [0],
+        },
+    )
+    server.set_mapping_lock(mapping_id, True)
     server.remove_mapping(mapping_id)
     assert (
         server.reset_scene_to_baseline(

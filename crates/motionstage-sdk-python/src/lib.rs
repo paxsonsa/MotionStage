@@ -353,22 +353,36 @@ impl PyMotionStageServer {
         Ok(mode_to_str(mode).to_owned())
     }
 
-    pub fn set_mode_control_allowlist(&self, device_ids: Vec<String>) -> PyResult<()> {
-        let mut parsed = Vec::with_capacity(device_ids.len());
-        for raw in device_ids {
-            let id = Uuid::parse_str(raw.trim()).map_err(|err| {
-                PyValueError::new_err(format!("invalid device id `{raw}`: {err}"))
-            })?;
-            parsed.push(id);
-        }
-        self.rt
-            .block_on(self.server.set_mode_control_allowlist(parsed));
-        Ok(())
+    /// Set the data-flow axis. Composite-mode-aware: disabling data flow
+    /// while recording/playback is active first stops the recording axis
+    /// (`recording=on` requires `data_flow=on`). Returns the resulting
+    /// composite mode string.
+    pub fn set_data_flow(&self, live: bool) -> PyResult<String> {
+        let result = if live {
+            self.rt
+                .block_on(self.server.set_data_flow(DataFlowState::Live))
+        } else {
+            // Walk both axes: stop recording/playback before going idle.
+            self.rt.block_on(self.server.set_mode(Mode::IDLE))
+        };
+        result.map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(mode_to_str(self.rt.block_on(self.server.mode())).to_owned())
     }
 
-    pub fn mode_control_allowlist(&self) -> PyResult<Vec<String>> {
-        let allowlist = self.rt.block_on(self.server.mode_control_allowlist());
-        Ok(allowlist.into_iter().map(|id| id.to_string()).collect())
+    /// Set the recording axis. Composite-mode-aware: enabling recording
+    /// auto-enables data flow first (`recording=on` requires `data_flow=on`);
+    /// disabling leaves the data-flow axis untouched. Returns the resulting
+    /// composite mode string.
+    pub fn set_recording(&self, recording: bool) -> PyResult<String> {
+        let result = if recording {
+            // Walk both axes: data flow on before the recording axis.
+            self.rt.block_on(self.server.set_mode(Mode::RECORDING))
+        } else {
+            self.rt
+                .block_on(self.server.set_recording(RecordingState::Inactive))
+        };
+        result.map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(mode_to_str(self.rt.block_on(self.server.mode())).to_owned())
     }
 
     pub fn metrics(&self) -> PyResult<(u64, u64, u64, u64, u64, u64, u64)> {
@@ -638,55 +652,23 @@ impl PyMotionStageServer {
     }
 
     pub fn create_mapping(&self, request: &Bound<'_, PyDict>) -> PyResult<String> {
-        let source_device = parse_uuid_from_request_item(request, "source_device")
-            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
-        let source_output = extract_request_string(request, "source_output")
-            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
-        let target_attribute = extract_request_string(request, "target_attribute")
-            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
-        let component_mask = match request.get_item("component_mask") {
-            Ok(Some(raw)) if !raw.is_none() => Some(
-                raw.extract::<Vec<usize>>()
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            ),
-            _ => None,
-        };
-
-        let snapshot = self.rt.block_on(self.server.runtime_snapshot());
-        let target_scene = match request.get_item("target_scene") {
-            Ok(Some(raw)) if !raw.is_none() => parse_uuid_from_any(&raw)?,
-            _ => snapshot
-                .active_scene
-                .ok_or_else(|| PyRuntimeError::new_err("no active scene"))?,
-        };
-        let scene = snapshot
-            .scenes
-            .get(&target_scene)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("scene not found: {target_scene}")))?;
-
-        let target_object = parse_uuid_from_request_item(request, "target_object_id")
-            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
-        if !scene.objects.contains_key(&target_object) {
-            return Err(PyRuntimeError::new_err(format!(
-                "target object id not found in scene: {target_object}"
-            )));
-        }
-
+        let req = self.parse_mapping_request(request)?;
         let mapping_id = self
             .rt
-            .block_on(self.server.create_mapping(
-                MappingRequest {
-                    source_device,
-                    source_output,
-                    target_scene,
-                    target_object,
-                    target_attribute,
-                    component_mask,
-                },
-                now_ns(),
-            ))
+            .block_on(self.server.create_mapping(req, now_ns()))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
         Ok(mapping_id.to_string())
+    }
+
+    /// Replace a mapping's full definition. `request` has the same shape as
+    /// `create_mapping`'s request dict.
+    pub fn update_mapping(&self, mapping_id: String, request: &Bound<'_, PyDict>) -> PyResult<()> {
+        let mapping_id = Uuid::parse_str(mapping_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let req = self.parse_mapping_request(request)?;
+        self.rt
+            .block_on(self.server.update_mapping(mapping_id, req, now_ns()))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
     pub fn remove_mapping(&self, mapping_id: String) -> PyResult<()> {
@@ -694,6 +676,15 @@ impl PyMotionStageServer {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         self.rt
             .block_on(self.server.remove_mapping(mapping_id))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+
+    /// Lock (`True`) or unlock (`False`) a mapping against reclaim/update.
+    pub fn set_mapping_lock(&self, mapping_id: String, lock: bool) -> PyResult<()> {
+        let mapping_id = Uuid::parse_str(mapping_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.rt
+            .block_on(self.server.set_mapping_lock(mapping_id, lock))
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 
@@ -828,6 +819,54 @@ impl PyMotionStageServer {
 }
 
 impl PyMotionStageServer {
+    /// Parse a mapping request dict (shared by `create_mapping` and
+    /// `update_mapping`): resolves `target_scene` (absent/None = the active
+    /// scene) and validates the target object exists in it.
+    fn parse_mapping_request(&self, request: &Bound<'_, PyDict>) -> PyResult<MappingRequest> {
+        let source_device = parse_uuid_from_request_item(request, "source_device")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let source_output = extract_request_string(request, "source_output")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let target_attribute = extract_request_string(request, "target_attribute")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        let component_mask = match request.get_item("component_mask") {
+            Ok(Some(raw)) if !raw.is_none() => Some(
+                raw.extract::<Vec<usize>>()
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            ),
+            _ => None,
+        };
+
+        let snapshot = self.rt.block_on(self.server.runtime_snapshot());
+        let target_scene = match request.get_item("target_scene") {
+            Ok(Some(raw)) if !raw.is_none() => parse_uuid_from_any(&raw)?,
+            _ => snapshot
+                .active_scene
+                .ok_or_else(|| PyRuntimeError::new_err("no active scene"))?,
+        };
+        let scene = snapshot
+            .scenes
+            .get(&target_scene)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("scene not found: {target_scene}")))?;
+
+        let target_object = parse_uuid_from_request_item(request, "target_object_id")
+            .map_err(|e| PyValueError::new_err(format!("mapping request: {e}")))?;
+        if !scene.objects.contains_key(&target_object) {
+            return Err(PyRuntimeError::new_err(format!(
+                "target object id not found in scene: {target_object}"
+            )));
+        }
+
+        Ok(MappingRequest {
+            source_device,
+            source_output,
+            target_scene,
+            target_object,
+            target_attribute,
+            component_mask,
+        })
+    }
+
     /// Hand a captured frame to the Tokio runtime for encode + WebRTC push,
     /// returning immediately so the caller's thread (Blender's main draw thread)
     /// is never blocked on encoding or network I/O.
@@ -1771,6 +1810,77 @@ mod tests {
                 .expect("playback lookup")
                 .expect("playback present")
                 .is_none());
+        });
+    }
+
+    #[test]
+    fn set_data_flow_and_set_recording_are_composite_mode_aware() {
+        let server = PyMotionStageServer::new(Some("py-mode-axes".into()), false, None)
+            .expect("py server should build");
+
+        assert_eq!(server.set_data_flow(true).unwrap(), "live");
+        // recording=on auto-enables data flow (already live here).
+        assert_eq!(server.set_recording(true).unwrap(), "recording");
+        // recording=off leaves the data-flow axis untouched.
+        assert_eq!(server.set_recording(false).unwrap(), "live");
+        // data_flow=off from recording walks both axes down.
+        assert_eq!(server.set_recording(true).unwrap(), "recording");
+        assert_eq!(server.set_data_flow(false).unwrap(), "idle");
+        // recording=on from idle auto-enables data flow first.
+        assert_eq!(server.set_recording(true).unwrap(), "recording");
+    }
+
+    #[test]
+    fn update_mapping_and_set_mapping_lock_round_trip() {
+        pyo3::prepare_freethreaded_python();
+        let server = PyMotionStageServer::new(Some("py-mapping-ops".into()), false, None)
+            .expect("py server should build");
+
+        Python::with_gil(|py| {
+            let object_id = uuid::Uuid::now_v7().to_string();
+            let spec = PyDict::new_bound(py);
+            spec.set_item("name", "shot").unwrap();
+            let object = PyDict::new_bound(py);
+            object.set_item("id", object_id.as_str()).unwrap();
+            object.set_item("name", "camera").unwrap();
+            let attribute = PyDict::new_bound(py);
+            attribute.set_item("name", "position").unwrap();
+            attribute.set_item("type", "vec3f").unwrap();
+            attribute
+                .set_item("default_value", vec![0.0f32, 0.0, 0.0])
+                .unwrap();
+            object.set_item("attributes", vec![attribute]).unwrap();
+            spec.set_item("objects", vec![object]).unwrap();
+            server.upsert_scene(&spec).expect("scene loads");
+
+            let device_id = uuid::Uuid::now_v7().to_string();
+            let request = PyDict::new_bound(py);
+            request.set_item("source_device", device_id.as_str()).unwrap();
+            request.set_item("source_output", "pose_pos").unwrap();
+            request
+                .set_item("target_object_id", object_id.as_str())
+                .unwrap();
+            request.set_item("target_attribute", "position").unwrap();
+            let mapping_id = server.create_mapping(&request).expect("mapping creates");
+
+            // Full-definition update: change the component mask.
+            request.set_item("component_mask", vec![0usize, 2]).unwrap();
+            server
+                .update_mapping(mapping_id.clone(), &request)
+                .expect("mapping updates");
+
+            server
+                .set_mapping_lock(mapping_id.clone(), true)
+                .expect("mapping locks");
+
+            // Locked mappings refuse updates (runtime rule surfaces as error).
+            let err = server.update_mapping(mapping_id.clone(), &request);
+            assert!(err.is_err(), "locked mapping must reject update");
+
+            server
+                .set_mapping_lock(mapping_id.clone(), false)
+                .expect("mapping unlocks");
+            server.remove_mapping(mapping_id).expect("mapping removes");
         });
     }
 

@@ -92,16 +92,19 @@ async fn event_plane_replicates_mutations_snapshots_and_resync_across_quic_clien
     assert_eq!(join_a.origin_session, Some(client_a.session_id));
     client_b.wait_for_own_join().await?;
     assert_eq!(
-        server.session_info(device_a).await.expect("session a").state,
+        server
+            .session_info(device_a)
+            .await
+            .expect("session a")
+            .state,
         SessionState::Active
     );
 
     // --- 1. Client A flips data_flow live; B observes it without pinging. ---
-    let reply = client_a.set_data_flow(DataFlowState::Live).await?;
-    assert_eq!(reply, Mode::LIVE);
-
-    // No echo suppression: A receives its own mutation as an event too.
-    let echo = client_a.next_event().await?;
+    // Retired ack (protocol 2.1): SetDataFlow success has no direct reply.
+    // The single acknowledgement is A's own replicated ModeChanged echo (no
+    // echo suppression), which the helper waits for and returns.
+    let echo = client_a.set_data_flow(DataFlowState::Live).await?;
     assert_eq!(echo.origin_session, Some(client_a.session_id));
     assert!(matches!(echo.event, StateEvent::ModeChanged { mode } if mode == Mode::LIVE));
 
@@ -149,7 +152,9 @@ async fn event_plane_replicates_mutations_snapshots_and_resync_across_quic_clien
     // --- 3. B leaves; the world moves on; rejoin replays the exact gap. ---
     let b_last_seq = client_b.last_seq;
     let old_b_session = client_b.session_id;
-    client_b.goodbye(Some("simulated disconnect".into())).await?;
+    client_b
+        .goodbye(Some("simulated disconnect".into()))
+        .await?;
     // Keep the connection alive until the server has processed the goodbye,
     // then tear it down.
     wait_for_session_closed(&server, device_b).await?;
@@ -186,7 +191,12 @@ async fn event_plane_replicates_mutations_snapshots_and_resync_across_quic_clien
     let seqs: Vec<u64> = replayed.iter().map(|envelope| envelope.seq).collect();
     assert_eq!(
         seqs,
-        vec![b_last_seq + 1, b_last_seq + 2, b_last_seq + 3, b_last_seq + 4]
+        vec![
+            b_last_seq + 1,
+            b_last_seq + 2,
+            b_last_seq + 3,
+            b_last_seq + 4
+        ]
     );
     assert!(matches!(
         &replayed[0].event,
@@ -248,7 +258,12 @@ async fn event_plane_replicates_mutations_snapshots_and_resync_across_quic_clien
     // itself (it registered before the snapshot); B's superseded session is
     // gone because its SessionLeft already fired.
     let session_ids: Vec<Uuid> = snapshot.sessions.iter().map(|s| s.session_id).collect();
-    assert_eq!(snapshot.sessions.len(), 4, "sessions: {:?}", snapshot.sessions);
+    assert_eq!(
+        snapshot.sessions.len(),
+        4,
+        "sessions: {:?}",
+        snapshot.sessions
+    );
     assert!(session_ids.contains(&server.host_session_id()));
     assert!(session_ids.contains(&client_a.session_id));
     assert!(session_ids.contains(&client_b2.session_id));

@@ -1601,6 +1601,7 @@ dependencies = [
 name = "motionstage-sdk-swift"
 version = "0.1.0"
 dependencies = [
+ "motionstage-core",
  "motionstage-protocol",
  "motionstage-server",
  "motionstage-transport-quic",
@@ -1645,6 +1646,7 @@ dependencies = [
  "motionstage-protocol",
  "motionstage-server",
  "motionstage-transport-quic",
+ "tempfile",
  "tokio",
  "uuid",
 ]

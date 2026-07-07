@@ -11,6 +11,11 @@ public enum MotionStageError: Error, LocalizedError, CustomStringConvertible {
     case protocolError(String)
     case transportError(String)
     case internalError(String)
+    /// The server processed an operator-plane request and rejected it with a
+    /// typed wire error (e.g. `.roleDenied` for a permission failure,
+    /// `.serverBusy` for a lease conflict or unknown mapping id). The
+    /// operation mutated nothing.
+    case operationRejected(code: RejectCode, reason: String)
 
     public var description: String {
         switch self {
@@ -20,6 +25,8 @@ public enum MotionStageError: Error, LocalizedError, CustomStringConvertible {
         case .protocolError(let msg): return "MotionStage protocol error: \(msg)"
         case .transportError(let msg): return "MotionStage transport error: \(msg)"
         case .internalError(let msg): return "MotionStage internal error: \(msg)"
+        case .operationRejected(let code, let reason):
+            return "MotionStage operation rejected (\(code.wireName)): \(reason)"
         }
     }
 
@@ -209,10 +216,16 @@ private final class EventContinuationBox: @unchecked Sendable {
     init(_ cont: AsyncStream<ConnectionEvent>.Continuation) { self.cont = cont }
 }
 
+/// Wraps the state-event `AsyncStream.Continuation` for the C state-event callback.
+private final class StateEventContinuationBox: @unchecked Sendable {
+    let cont: AsyncStream<StateEventUpdate>.Continuation
+    init(_ cont: AsyncStream<StateEventUpdate>.Continuation) { self.cont = cont }
+}
+
 // MARK: - MotionStageClient
 
 public final class MotionStageClient: @unchecked Sendable {
-    private let rawClient: UnsafeMutableRawPointer
+    let rawClient: UnsafeMutableRawPointer
 
     // MARK: Connection events (5.3 + 4.2)
 
@@ -220,6 +233,20 @@ public final class MotionStageClient: @unchecked Sendable {
     public let events: AsyncStream<ConnectionEvent>
     /// Retained box so the C callback can reference the continuation without captures.
     private let eventBox: Unmanaged<EventContinuationBox>
+
+    // MARK: State-event stream (operator plane, protocol 2.1)
+
+    private let stateEventContinuation: AsyncStream<StateEventUpdate>.Continuation
+    /// Replicated server state, decoded from the FFI's JSON stream:
+    /// `.event` carries every `StateEvent` fanned out by the server —
+    /// including echoes of this client's own mutations (`originSession` equals
+    /// this session's id; there is no echo suppression) — and `.snapshot`
+    /// carries unsolicited full-world `SceneSnapshot`s (handshake, resync,
+    /// lag recovery). Events with `seq <= snapshot.seq` are already folded
+    /// into that snapshot.
+    public let stateEvents: AsyncStream<StateEventUpdate>
+    /// Retained box so the C callback can reference the continuation without captures.
+    private let stateEventBox: Unmanaged<StateEventContinuationBox>
 
     // MARK: - Init: legacy single-attribute
 
@@ -246,8 +273,17 @@ public final class MotionStageClient: @unchecked Sendable {
             bufferingPolicy: .bufferingNewest(16)
         )
         self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        (self.stateEvents, self.stateEventContinuation) = AsyncStream<StateEventUpdate>.makeStream(
+            bufferingPolicy: .bufferingNewest(512)
+        )
+        self.stateEventBox = Unmanaged.passRetained(StateEventContinuationBox(self.stateEventContinuation))
+        // All stored properties are initialized above; only now is it safe to
+        // hand callback contexts to the FFI.
         motionstage_swift_client_set_connection_event_callback(
             raw, connectionEventCallback, self.eventBox.toOpaque()
+        )
+        motionstage_swift_client_set_state_event_callback(
+            raw, stateEventCallback, self.stateEventBox.toOpaque()
         )
     }
 
@@ -267,8 +303,17 @@ public final class MotionStageClient: @unchecked Sendable {
             bufferingPolicy: .bufferingNewest(16)
         )
         self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        (self.stateEvents, self.stateEventContinuation) = AsyncStream<StateEventUpdate>.makeStream(
+            bufferingPolicy: .bufferingNewest(512)
+        )
+        self.stateEventBox = Unmanaged.passRetained(StateEventContinuationBox(self.stateEventContinuation))
+        // All stored properties are initialized above; only now is it safe to
+        // hand callback contexts to the FFI.
         motionstage_swift_client_set_connection_event_callback(
             raw, connectionEventCallback, self.eventBox.toOpaque()
+        )
+        motionstage_swift_client_set_state_event_callback(
+            raw, stateEventCallback, self.stateEventBox.toOpaque()
         )
     }
 
@@ -289,18 +334,31 @@ public final class MotionStageClient: @unchecked Sendable {
             bufferingPolicy: .bufferingNewest(16)
         )
         self.eventBox = Unmanaged.passRetained(EventContinuationBox(self.eventContinuation))
+        (self.stateEvents, self.stateEventContinuation) = AsyncStream<StateEventUpdate>.makeStream(
+            bufferingPolicy: .bufferingNewest(512)
+        )
+        self.stateEventBox = Unmanaged.passRetained(StateEventContinuationBox(self.stateEventContinuation))
+        // All stored properties are initialized above; only now is it safe to
+        // hand callback contexts to the FFI.
         motionstage_swift_client_set_connection_event_callback(
             raw, connectionEventCallback, self.eventBox.toOpaque()
+        )
+        motionstage_swift_client_set_state_event_callback(
+            raw, stateEventCallback, self.stateEventBox.toOpaque()
         )
     }
 
     deinit {
-        // Clear the event callback before freeing so no stale pointer is called.
+        // Clear callbacks before freeing so no stale pointer is called
+        // (free also joins the state-event pump thread).
         motionstage_swift_client_set_connection_event_callback(rawClient, nil, nil)
+        motionstage_swift_client_set_state_event_callback(rawClient, nil, nil)
         _ = motionstage_swift_client_disconnect(rawClient)
         motionstage_swift_client_free(rawClient)
         eventContinuation.finish()
+        stateEventContinuation.finish()
         eventBox.release()
+        stateEventBox.release()
     }
 
     // MARK: - Connection
@@ -855,6 +913,18 @@ private let connectionEventCallback: MotionStageConnectionEventCallback = { even
     box.cont.yield(connectionEvent)
 }
 
+/// Top-level callback for the state-event stream (operator plane).
+/// Uses `ctx` as a non-retained `StateEventContinuationBox`. Messages that
+/// fail to decode are dropped (forward-compat: unknown event variants decode
+/// to `StateEvent.unknown` instead of failing).
+private let stateEventCallback: MotionStageStateEventCallback = { messagePtr, ctx in
+    guard let ctx, let messagePtr else { return }
+    let box = Unmanaged<StateEventContinuationBox>.fromOpaque(ctx).takeUnretainedValue()
+    let json = String(cString: messagePtr)
+    guard let update = StateEventUpdate(streamJSON: json) else { return }
+    box.cont.yield(update)
+}
+
 private struct VideoSignalEnvelope: Decodable {
     enum Kind: String, Decodable {
         case sdp
@@ -882,9 +952,9 @@ private struct VideoSignalEnvelope: Decodable {
     }
 }
 
-// MARK: - Free helpers
+// MARK: - Free helpers (internal so operator-plane extensions can reuse them)
 
-private func makeError(status: Int32, message: String) -> MotionStageError {
+func makeError(status: Int32, message: String) -> MotionStageError {
     switch status {
     case MOTIONSTAGE_SWIFT_STATUS_INVALID_ARGUMENT: return .invalidArgument(message)
     case MOTIONSTAGE_SWIFT_STATUS_NOT_CONNECTED:    return .notConnected
@@ -895,13 +965,13 @@ private func makeError(status: Int32, message: String) -> MotionStageError {
     }
 }
 
-private func takeRustString(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
+func takeRustString(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
     guard let pointer else { return nil }
     defer { motionstage_swift_string_free(pointer) }
     return String(cString: pointer)
 }
 
-private func withOptionalCString<T>(
+func withOptionalCString<T>(
     _ value: String?,
     body: (UnsafePointer<CChar>?) throws -> T
 ) rethrows -> T {
