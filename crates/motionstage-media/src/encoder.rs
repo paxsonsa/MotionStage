@@ -50,6 +50,18 @@ fn scan_nal_units(data: &[u8]) -> Vec<(u8, usize)> {
     result
 }
 
+/// Annex B NAL unit types present in `data`, sorted and deduplicated.
+///
+/// H.264 NAL type numbers of interest: `5` = IDR slice, `7` = SPS, `8` = PPS.
+/// Integration tests use this to assert a forced-keyframe access unit is a
+/// complete, independently-decodable unit (SPS + PPS + IDR).
+pub fn annexb_nal_types(data: &[u8]) -> Vec<u8> {
+    let mut types: Vec<u8> = scan_nal_units(data).into_iter().map(|(t, _)| t).collect();
+    types.sort_unstable();
+    types.dedup();
+    types
+}
+
 /// H.264 encoder wrapping Cisco OpenH264.
 ///
 /// Accepts raw RGBA pixel data and produces H.264 NAL unit bitstream
@@ -270,6 +282,60 @@ mod tests {
         types.sort();
         types.dedup();
         types
+    }
+
+    #[test]
+    fn first_frame_from_fresh_encoder_is_idr_access_unit() {
+        // Contract: the very first frame a fresh encoder emits must be a
+        // decodable access unit — SPS + PPS + IDR — so a peer that joins at any
+        // time can start decoding from the first sample it receives.
+        let mut enc = H264Encoder::new(320, 240, 30.0, 1_000_000).unwrap();
+        let pixels = 320 * 240;
+        let rgba: Vec<u8> = (0..pixels).flat_map(|_| [10u8, 200, 30, 255]).collect();
+        let encoded = enc.encode_rgba(&rgba).unwrap();
+        let nal_types = find_nal_types(&encoded);
+        assert!(nal_types.contains(&7), "first frame missing SPS: {nal_types:?}");
+        assert!(nal_types.contains(&8), "first frame missing PPS: {nal_types:?}");
+        assert!(nal_types.contains(&5), "first frame missing IDR: {nal_types:?}");
+    }
+
+    /// Timed throughput probe (not a hard gate): encodes N 1280x720 frames and
+    /// prints avg ms/frame. Run with `--nocapture` to see the number. The
+    /// recorded baseline lives in docs/hardening.md under "Video pipeline".
+    #[test]
+    fn encode_throughput_1280x720() {
+        let width = 1280u32;
+        let height = 720u32;
+        let mut enc = H264Encoder::new(width, height, 30.0, 4_000_000).unwrap();
+        let pixels = (width * height) as usize;
+        // A mildly varying frame so the encoder does real work each iteration.
+        let make_frame = |t: u8| -> Vec<u8> {
+            (0..pixels)
+                .flat_map(|p| {
+                    let v = ((p as u8).wrapping_add(t)) | 1;
+                    [v, v.wrapping_mul(3), v.wrapping_mul(7), 255]
+                })
+                .collect()
+        };
+
+        const N: usize = 60;
+        // Warm up (allocates internal buffers, first frame is a forced IDR).
+        let _ = enc.encode_rgba(&make_frame(0)).unwrap();
+
+        let start = std::time::Instant::now();
+        for i in 0..N {
+            let frame = make_frame((i % 251) as u8 + 1);
+            let encoded = enc.encode_rgba(&frame).unwrap();
+            assert!(!encoded.is_empty());
+        }
+        let elapsed = start.elapsed();
+        let avg_ms = elapsed.as_secs_f64() * 1000.0 / N as f64;
+        println!(
+            "encode_throughput_1280x720: {N} frames in {:.1} ms => {:.3} ms/frame ({:.0} fps)",
+            elapsed.as_secs_f64() * 1000.0,
+            avg_ms,
+            1000.0 / avg_ms
+        );
     }
 
     #[test]

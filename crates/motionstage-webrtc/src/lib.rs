@@ -8,12 +8,15 @@ use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
     },
-    ice_transport::ice_candidate::RTCIceCandidateInit,
+    ice_transport::{
+        ice_candidate::RTCIceCandidateInit, ice_gathering_state::RTCIceGatheringState,
+    },
     interceptor::registry::Registry,
     media::Sample,
     peer_connection::{
         configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
-        sdp::session_description::RTCSessionDescription, RTCPeerConnection,
+        sdp::sdp_type::RTCSdpType, sdp::session_description::RTCSessionDescription,
+        RTCPeerConnection,
     },
     rtp_transceiver::{rtp_codec::RTCRtpCodecCapability, RTCPFeedback},
     track::track_local::track_local_static_sample::TrackLocalStaticSample,
@@ -182,6 +185,41 @@ impl WebRtcSession {
 
     pub async fn has_track(&self) -> bool {
         self.track.lock().await.is_some()
+    }
+
+    /// Block until ICE candidate gathering has completed for this peer.
+    ///
+    /// After this resolves, [`Self::local_description`] returns an SDP with all
+    /// gathered host/srflx candidates embedded ("vanilla"/non-trickle ICE),
+    /// which lets a caller complete an offer/answer exchange without a separate
+    /// candidate-trickling channel. Production signaling trickles candidates
+    /// incrementally; this is the batched variant used by in-process/loopback
+    /// setups. Returns immediately if gathering is already complete.
+    pub async fn wait_ice_gathering_complete(&self) {
+        if self.peer.ice_gathering_state() == RTCIceGatheringState::Complete {
+            return;
+        }
+        let mut gather_complete = self.peer.gathering_complete_promise().await;
+        let _ = gather_complete.recv().await;
+    }
+
+    /// The peer's current local description, if one has been set. When called
+    /// after [`Self::wait_ice_gathering_complete`], the SDP carries the full
+    /// candidate set.
+    pub async fn local_description(&self) -> Option<SdpMessage> {
+        let desc = self.peer.local_description().await?;
+        let ty = match desc.sdp_type {
+            RTCSdpType::Offer => SdpType::Offer,
+            RTCSdpType::Answer => SdpType::Answer,
+            _ => return None,
+        };
+        Some(SdpMessage { ty, sdp: desc.sdp })
+    }
+
+    /// `true` once the peer-connection (ICE + DTLS) has reached `Connected`.
+    /// Callers can poll this before relying on media delivery.
+    pub fn is_connected(&self) -> bool {
+        self.peer.connection_state() == RTCPeerConnectionState::Connected
     }
 }
 

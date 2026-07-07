@@ -4,7 +4,10 @@ use std::{
     net::SocketAddr,
     ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -236,6 +239,11 @@ struct TakeBakeCursor {
 struct VideoPeerSession {
     peer: Arc<WebRtcSession>,
     track_added: bool,
+    /// Count of encoded frames successfully handed to this peer's WebRTC track
+    /// via [`WebRtcSession::write_sample`]. This is the observable seam that
+    /// proves the DCC push -> encode -> server relay -> track path end-to-end;
+    /// integration tests assert `frames_written > 0` after a push.
+    frames_written: Arc<AtomicU64>,
 }
 
 struct RuntimeResources {
@@ -3019,23 +3027,75 @@ impl ServerHandle {
         data: Bytes,
         duration: Duration,
     ) -> Result<(), ServerError> {
-        let peers_with_tracks: Vec<Arc<WebRtcSession>> = {
+        let peers_with_tracks: Vec<(Arc<WebRtcSession>, Arc<AtomicU64>)> = {
             let mut state = self.state.write().await;
+            // Descriptor precondition: the DCC must publish a master descriptor
+            // before any encoded frame is accepted for relay. This mirrors the
+            // gate in `ensure_video_session_ready` and keeps the ingest path from
+            // shipping frames the negotiation layer never sanctioned.
+            if state.master_video_descriptor.is_none() {
+                return Err(ServerError::Video(
+                    "master video descriptor not set".into(),
+                ));
+            }
             state.last_video_frame_ns = Some(now_ns());
             state
                 .video_peers
                 .values()
                 .filter(|entry| entry.track_added)
-                .map(|entry| Arc::clone(&entry.peer))
+                .map(|entry| (Arc::clone(&entry.peer), Arc::clone(&entry.frames_written)))
                 .collect()
         };
 
-        for peer in peers_with_tracks {
-            if let Err(err) = peer.write_sample(data.clone(), duration).await {
-                tracing::warn!("failed to write video sample to peer: {err}");
+        // No peers (or none with a negotiated track) is a valid no-op: the DCC
+        // may push frames before any client has joined.
+        for (peer, frames_written) in peers_with_tracks {
+            match peer.write_sample(data.clone(), duration).await {
+                Ok(()) => {
+                    frames_written.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    tracing::warn!("failed to write video sample to peer: {err}");
+                }
             }
         }
         Ok(())
+    }
+
+    /// Number of encoded frames handed to `device_id`'s WebRTC track so far.
+    /// This is the observable end of the video relay path used by tests to
+    /// prove frames reach `WebRtcSession::write_sample`.
+    pub async fn video_frames_written(&self, device_id: Uuid) -> u64 {
+        let state = self.state.read().await;
+        state
+            .video_peers
+            .get(&device_id)
+            .map(|entry| entry.frames_written.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Wait for `device_id`'s server-side video peer to finish ICE gathering,
+    /// then return its local description with every candidate embedded. This
+    /// lets an in-process/loopback peer complete a non-trickle offer/answer
+    /// exchange against the real server peer without a separate ICE-trickling
+    /// channel. Returns `None` if no local description has been set yet.
+    pub async fn video_gathered_local_description(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Option<SdpMessage>, ServerError> {
+        let peer = self.video_peer(device_id).await?;
+        peer.wait_ice_gathering_complete().await;
+        Ok(peer.local_description().await)
+    }
+
+    /// `true` once `device_id`'s server-side video peer connection has reached
+    /// `Connected` (ICE + DTLS established). Used by delivery tests to wait for
+    /// the transport before asserting media flow. `false` if the peer is absent.
+    pub async fn video_peer_connected(&self, device_id: Uuid) -> bool {
+        match self.video_peer(device_id).await {
+            Ok(peer) => peer.is_connected(),
+            Err(_) => false,
+        }
     }
 
     /// Returns `true` (once) if a new video peer was added since the last call.
@@ -3215,6 +3275,7 @@ impl ServerHandle {
             .or_insert_with(|| VideoPeerSession {
                 peer: Arc::clone(&created),
                 track_added: false,
+                frames_written: Arc::new(AtomicU64::new(0)),
             });
         Ok(Arc::clone(&entry.peer))
     }
@@ -4648,10 +4709,11 @@ mod tests {
     use motionstage_core::{
         AttributeUpdate, AttributeValue, MappingRequest, Scene, SceneAttribute, SceneObject,
     };
+    use bytes::Bytes;
     use motionstage_media::{
-        ColorPrimaries, DynamicRange, IceCandidate, SdpMessage, SdpType, SignalMessage,
-        SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability, VideoCodec,
-        VideoStreamDescriptor,
+        encoder::H264Encoder, ColorPrimaries, DynamicRange, IceCandidate, SdpMessage, SdpType,
+        SignalMessage, SignalPayload, ToneMapMode, TransferFunction, VideoClientCapability,
+        VideoCodec, VideoStreamDescriptor,
     };
     use motionstage_protocol::{
         AttributeDescriptor, AttributeKind, BakeAttributeValue, BaselineAction, ClientHello,
@@ -5096,6 +5158,333 @@ mod tests {
         assert_eq!(offer.ty, SdpType::Offer);
         assert!(!offer.sdp.is_empty());
         assert!(server.has_video_session(device_id).await);
+    }
+
+    /// SDR H.264 master descriptor used by the video relay proof tests.
+    fn sdr_h264_master_descriptor() -> VideoStreamDescriptor {
+        VideoStreamDescriptor {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            dynamic_range: DynamicRange::Sdr,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            bit_depth: 8,
+            codec: VideoCodec::H264,
+        }
+    }
+
+    /// Drive a device to `Active` as a `VideoSink` with the `Video` feature.
+    async fn activate_video_sink(server: &ServerHandle, device_id: Uuid) {
+        server.discovered(device_id, "ipad").await.unwrap();
+        server.transport_connected(device_id).await.unwrap();
+        server
+            .hello_exchanged(ClientHello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                device_id,
+                device_name: "ipad".into(),
+                roles: vec![ClientRole::VideoSink],
+                features: vec![Feature::Video],
+                advertised_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        server.authenticate(device_id).await.unwrap();
+        server
+            .register(
+                device_id,
+                RegisterRequest {
+                    pairing_token: None,
+                    api_key: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.scene_synced(device_id).await.unwrap();
+        server.activate(device_id).await.unwrap();
+    }
+
+    /// Relay-side proof of the video path through the *real* server method up to
+    /// (and including) `WebRtcSession::write_sample`:
+    /// set descriptor -> activate a VideoSink -> negotiate a track ->
+    /// push encoded frames -> assert each frame is handed to the peer track
+    /// writer, and that a newly-joined peer arms the IDR keyframe latch.
+    ///
+    /// This proves the *relay* seam (`frames_written` increments once per
+    /// `write_sample`), NOT wire delivery: no remote answer/ICE is applied, so
+    /// `TrackLocalStaticSample::write_sample` returns `Ok` against an unbound
+    /// track. Actual RTP delivery over a connected transport is proven
+    /// separately by `push_video_frame_delivers_rtp_to_loopback_peer`.
+    #[tokio::test]
+    async fn push_video_frame_relays_to_track_writer_and_arms_keyframe_on_join() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+
+        server
+            .set_master_video_descriptor(sdr_h264_master_descriptor())
+            .await
+            .unwrap();
+        activate_video_sink(&server, device_id).await;
+
+        // Negotiate: this is the join that adds an H.264 track to the peer and
+        // arms the keyframe-on-join latch.
+        let offer = server
+            .create_video_offer(device_id, "motionstage", "video")
+            .await
+            .unwrap();
+        assert_eq!(offer.ty, SdpType::Offer);
+
+        // A freshly-joined peer must force an IDR so it can start decoding.
+        // The latch is one-shot: consumed true, then false.
+        assert!(
+            server.take_keyframe_needed().await,
+            "newly-joined peer must request a keyframe/IDR"
+        );
+        assert!(
+            !server.take_keyframe_needed().await,
+            "keyframe latch must be one-shot"
+        );
+
+        // No frames have reached the track yet.
+        assert_eq!(server.video_frames_written(device_id).await, 0);
+
+        // Encode real frames and drive them through the *actual* server relay
+        // that ends at write_sample — mirroring the pyo3 off-thread path.
+        let mut encoder = H264Encoder::new(1280, 720, 30.0, 2_000_000).unwrap();
+        let pixels = 1280 * 720;
+        for i in 0..3u8 {
+            let rgba: Vec<u8> = (0..pixels)
+                .flat_map(|_| [i.wrapping_mul(40), 20, 200, 255])
+                .collect();
+            let encoded = encoder.encode_rgba(&rgba).unwrap();
+            assert!(!encoded.is_empty());
+            server
+                .push_video_frame(encoded, Duration::from_millis(33))
+                .await
+                .unwrap();
+        }
+
+        // Every pushed frame was handed to the peer's track writer.
+        assert_eq!(
+            server.video_frames_written(device_id).await,
+            3,
+            "all pushed frames must be relayed to the peer track via write_sample"
+        );
+
+        // Status surface reflects a live, descriptor-backed stream with one peer.
+        let status = server.video_stream_status().await;
+        assert!(status.descriptor_set);
+        assert!(status.available);
+        assert_eq!(status.peer_count, 1);
+    }
+
+    /// Descriptor precondition: pushing a frame with no master descriptor set is
+    /// rejected — the ingest path must not ship frames the negotiation layer
+    /// never sanctioned.
+    #[tokio::test]
+    async fn push_video_frame_rejected_without_master_descriptor() {
+        let server = ServerHandle::new(ServerConfig::default());
+        let err = server
+            .push_video_frame(Bytes::from_static(b"frame"), Duration::from_millis(33))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("master video descriptor not set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pushing with a descriptor set but no peers joined is a valid no-op:
+    /// the DCC may render before any client connects. Must not panic or error.
+    #[tokio::test]
+    async fn push_video_frame_with_no_peers_is_noop() {
+        let server = ServerHandle::new(ServerConfig::default());
+        server
+            .set_master_video_descriptor(sdr_h264_master_descriptor())
+            .await
+            .unwrap();
+
+        server
+            .push_video_frame(Bytes::from_static(b"frame"), Duration::from_millis(33))
+            .await
+            .expect("push with no peers must be a no-op");
+
+        assert_eq!(server.video_peer_count().await, 0);
+        // The frame timestamp is still recorded so status can report liveness.
+        let status = server.video_stream_status().await;
+        assert!(status.descriptor_set);
+        assert_eq!(status.peer_count, 0);
+    }
+
+    /// Real end-to-end **delivery** proof (not just relay): run a full
+    /// offer/answer exchange between the server's real video peer and an
+    /// in-process webrtc-rs answering peer, connect ICE/DTLS over host loopback,
+    /// push encoder-produced frames through the actual `push_video_frame` relay,
+    /// and assert RTP genuinely arrives at the answering peer's `on_track`.
+    ///
+    /// This also strengthens the keyframe-on-join claim: the first access unit
+    /// is produced the way the pyo3 pipeline does it — consume the one-shot
+    /// latch with `take_keyframe_needed`, then `force_keyframe` before encoding —
+    /// and is asserted to be a complete SPS+PPS+IDR unit before it is pushed and
+    /// delivered.
+    ///
+    /// Non-trickle ICE: both sides embed their gathered host candidates in the
+    /// SDP, so no separate candidate-trickling channel is needed. If your
+    /// sandbox cannot open loopback UDP this test will fail at the ICE-connect
+    /// wait; run it on a host that permits loopback UDP.
+    #[tokio::test]
+    async fn push_video_frame_delivers_rtp_to_loopback_peer() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        use webrtc::api::interceptor_registry::register_default_interceptors;
+        use webrtc::api::media_engine::MediaEngine;
+        use webrtc::api::APIBuilder;
+        use webrtc::interceptor::registry::Registry;
+        use webrtc::peer_connection::configuration::RTCConfiguration;
+        use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+        let server = ServerHandle::new(ServerConfig::default());
+        let device_id = Uuid::now_v7();
+        server
+            .set_master_video_descriptor(sdr_h264_master_descriptor())
+            .await
+            .unwrap();
+        activate_video_sink(&server, device_id).await;
+
+        // Server side: negotiate an H.264 track and produce the offer. This is
+        // the join that arms the keyframe-on-join latch.
+        let offer = server
+            .create_video_offer(device_id, "motionstage", "video")
+            .await
+            .unwrap();
+        assert_eq!(offer.ty, SdpType::Offer);
+
+        // In-process answering peer (raw webrtc-rs) with an on_track handler that
+        // reads RTP and reports each packet's payload size over a channel.
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let registry =
+            register_default_interceptors(Registry::new(), &mut media_engine).unwrap();
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
+        let answerer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+
+        let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::channel::<usize>(16);
+        answerer.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let rtp_tx = rtp_tx.clone();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    while let Ok((pkt, _)) = track.read_rtp().await {
+                        if rtp_tx.send(pkt.payload.len()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            })
+        }));
+
+        // Complete the exchange over the *real* signaling entry points:
+        // take the server's gathered offer (host candidates embedded), answer
+        // it, gather the answer's candidates, and feed the full answer back
+        // through `handle_video_signal`.
+        let gathered_offer = server
+            .video_gathered_local_description(device_id)
+            .await
+            .unwrap()
+            .expect("server peer must have produced a local offer");
+        answerer
+            .set_remote_description(RTCSessionDescription::offer(gathered_offer.sdp).unwrap())
+            .await
+            .unwrap();
+        let answer = answerer.create_answer(None).await.unwrap();
+        let mut gather = answerer.gathering_complete_promise().await;
+        answerer.set_local_description(answer).await.unwrap();
+        let _ = gather.recv().await;
+        let full_answer = answerer
+            .local_description()
+            .await
+            .expect("answering peer must have a local answer");
+        server
+            .handle_video_signal(
+                device_id,
+                SignalPayload::Sdp(SdpMessage {
+                    ty: SdpType::Answer,
+                    sdp: full_answer.sdp,
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Wait for ICE/DTLS to establish over loopback. Generous budget; poll.
+        let connect_deadline = Instant::now() + Duration::from_secs(20);
+        while !server.video_peer_connected(device_id).await {
+            assert!(
+                Instant::now() < connect_deadline,
+                "server video peer did not reach Connected over loopback within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Keyframe-on-join, driven exactly like the pyo3 pipeline: consume the
+        // one-shot latch, force an IDR, then encode. Assert the first access
+        // unit is a complete SPS+PPS+IDR before pushing it.
+        assert!(
+            server.take_keyframe_needed().await,
+            "newly-joined peer must arm the keyframe/IDR latch"
+        );
+        let mut encoder = H264Encoder::new(1280, 720, 30.0, 2_000_000).unwrap();
+        encoder.force_keyframe();
+        let make_frame = |i: u8| -> Vec<u8> {
+            (0..1280 * 720)
+                .flat_map(|_| [i.wrapping_mul(37).wrapping_add(3), 40, 180, 255])
+                .collect()
+        };
+        let first = encoder.encode_rgba(&make_frame(0)).unwrap();
+        let nal_types = motionstage_media::encoder::annexb_nal_types(&first);
+        assert!(nal_types.contains(&7), "first AU missing SPS: {nal_types:?}");
+        assert!(nal_types.contains(&8), "first AU missing PPS: {nal_types:?}");
+        assert!(nal_types.contains(&5), "first AU missing IDR: {nal_types:?}");
+        server
+            .push_video_frame(first, Duration::from_millis(33))
+            .await
+            .unwrap();
+
+        // Keep pushing frames until RTP is observed at the answering peer, or the
+        // budget expires. Continuous flow is required for on_track to fire and
+        // for read_rtp to return a packet.
+        let deliver_deadline = Instant::now() + Duration::from_secs(20);
+        let mut delivered = false;
+        let mut i = 1u8;
+        while Instant::now() < deliver_deadline {
+            let frame = encoder.encode_rgba(&make_frame(i)).unwrap();
+            i = i.wrapping_add(1);
+            server
+                .push_video_frame(frame, Duration::from_millis(33))
+                .await
+                .unwrap();
+            if let Ok(Some(_len)) =
+                tokio::time::timeout(Duration::from_millis(150), rtp_rx.recv()).await
+            {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(
+            delivered,
+            "no RTP packet reached the answering peer's on_track over loopback"
+        );
+
+        // The relay seam also advanced: frames were handed to the track writer.
+        assert!(server.video_frames_written(device_id).await > 0);
+
+        let _ = answerer.close().await;
     }
 
     #[tokio::test]

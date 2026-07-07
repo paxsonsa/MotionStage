@@ -33,3 +33,4 @@ tempfile = "3.14"
 motionstage-transport-quic = { workspace = true, features = ["insecure"] }
 tokio-tungstenite = "0.29"
 serde_json.workspace = true
+webrtc.workspace = true

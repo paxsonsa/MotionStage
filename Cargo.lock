@@ -1638,6 +1638,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "webrtc",
 ]
 
 [[package]]
