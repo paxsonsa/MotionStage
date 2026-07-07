@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand};
 use motionstage_server::{ServerConfig, ServerHandle};
 mod export;
 mod simulate;
+mod take_export;
 use export::ExportArgs;
 use simulate::SimulateArgs;
+use take_export::TakeExportArgs;
 
 #[derive(Parser)]
 #[command(author, version, about = "MotionStage command line interface")]
@@ -18,6 +20,8 @@ enum Command {
     Serve,
     Simulate(SimulateArgs),
     Export(ExportArgs),
+    /// Materialize Level B USD (per-take layers + stage.usda) from a catalog.
+    TakeExport(TakeExportArgs),
     Version,
 }
 
@@ -45,6 +49,9 @@ async fn main() -> Result<()> {
         }
         Command::Export(args) => {
             export::run(&args)?;
+        }
+        Command::TakeExport(args) => {
+            take_export::run(&args)?;
         }
         Command::Version => {
             println!("motionstage-cli {}", env!("CARGO_PKG_VERSION"));

@@ -16,6 +16,7 @@ motionstage-protocol.workspace = true
 motionstage-core.workspace = true
 motionstage-media.workspace = true
 motionstage-recording.workspace = true
+motionstage-export-usd.workspace = true
 motionstage-discovery.workspace = true
 motionstage-transport-quic.workspace = true
 motionstage-webrtc.workspace = true

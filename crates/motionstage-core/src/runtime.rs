@@ -451,9 +451,12 @@ impl RuntimeCore {
         now_ns: u64,
     ) -> Result<BTreeMap<String, AttributeValue>, CoreError> {
         self.heartbeat(device_id, now_ns);
-        if self.mode.data_flow == DataFlowState::Idle
-            || self.mode.recording == RecordingState::Playback
-        {
+        // Idle data flow drops all ingest. Playback does NOT: arbitration is
+        // per-attribute via the lease model below (`is_playback_owned`), so a
+        // live mapping on an attribute the active take does not own keeps
+        // driving it (design §3 — "replay the rest, drive one live"), and a
+        // released/blocked target is reclaimable the instant its lease frees.
+        if self.mode.data_flow == DataFlowState::Idle {
             return Ok(BTreeMap::new());
         }
 

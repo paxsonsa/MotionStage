@@ -486,10 +486,15 @@ impl ServerState {
         if let Some(frame) = Self::frame_for_playhead(&playback.recording, playback.playhead_ns) {
             self.apply_playback_frame(&frame, scene_id, now_ns);
         }
-        // A take that just ran to its end releases its playback leases so live
-        // mappings can reclaim their target attributes normally (design §3).
+        // A take that just ran to its end releases its playback leases and
+        // returns the runtime to Inactive recording, mirroring an explicit
+        // stop, so live mappings reclaim their targets and the runtime no
+        // longer reports a Playback recording state with nothing playing
+        // (design §3).
         if stopped {
             self.runtime.release_playback(PLAYBACK_DEVICE_ID);
+            let _ = self.runtime.set_recording(RecordingState::Inactive);
+            self.active_playback = None;
         }
         transition
     }
@@ -2339,6 +2344,14 @@ impl ServerHandle {
             },
         );
 
+        // Best-effort Level B USD materialization (design §4.3): write the
+        // take's self-contained `.usda` layer next to its `.cmtrk` and refresh
+        // `stage.usda`. Any filesystem failure is logged and swallowed inside
+        // the helper so it can never fail take registration.
+        let take_dir = take_library_dir(&state.config.take_catalog_path);
+        let live_takes = state.take_catalog.list(None);
+        materialize_take_library(&take_dir, Some(&take_info), &live_takes);
+
         state
             .runtime
             .set_recording(RecordingState::Inactive)
@@ -2847,6 +2860,25 @@ impl ServerHandle {
                 .purge_take(take_id)
                 .map_err(ServerError::Take)?;
         }
+
+        // Best-effort Level B USD cleanup (design §4.3): remove the take's
+        // orphaned `.usda` layer and refresh `stage.usda` so it no longer
+        // subLayers the deleted take. Both are best-effort — a filesystem
+        // error here is logged and swallowed, never failing the deletion.
+        let take_dir = take_library_dir(&state.config.take_catalog_path);
+        let orphan_layer = take_dir.join(motionstage_export_usd::take_layer_file_name(&take_id));
+        if let Err(err) = fs::remove_file(&orphan_layer) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    take_id = %take_id,
+                    error = %err,
+                    "failed to remove take USD layer (non-fatal)"
+                );
+            }
+        }
+        let live_takes = state.take_catalog.list(None);
+        materialize_take_library(&take_dir, None, &live_takes);
+
         Ok(())
     }
 
@@ -4439,6 +4471,72 @@ fn attribute_value_to_bake(value: &AttributeValue) -> BakeAttributeValue {
     }
 }
 
+/// Directory holding the take catalog's `.cmtrk` captures, per-take `.usda`
+/// layers, and the `stage.usda` root layer — the catalog file's parent.
+fn take_library_dir(take_catalog_path: &Path) -> PathBuf {
+    match take_catalog_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Best-effort Level B USD materialization (design §4.3): author `new_take`'s
+/// self-contained `.usda` layer next to its `.cmtrk` (when given) and re-author
+/// the `stage.usda` root layer subLayering every live (non-deleted) take.
+///
+/// **This never fails its caller.** A recording that cannot be re-read, or a
+/// layer that cannot be written, is logged and swallowed — take registration
+/// and deletion must never depend on the USD projection succeeding, and USD is
+/// never on the recording hot path.
+fn materialize_take_library(dir: &Path, new_take: Option<&TakeInfo>, live_takes: &[TakeInfo]) {
+    if let Some(take) = new_take {
+        if let Err(err) = write_take_layer_file(dir, take) {
+            warn!(
+                take_id = %take.take_id,
+                error = %err,
+                "failed to materialize take USD layer (non-fatal)"
+            );
+        }
+    }
+    if let Err(err) = write_stage_layer_file(dir, live_takes) {
+        warn!(error = %err, "failed to author stage.usda (non-fatal)");
+    }
+}
+
+fn write_take_layer_file(dir: &Path, take: &TakeInfo) -> std::io::Result<()> {
+    let recording = read_recording(&take.path).map_err(|err| std::io::Error::other(err.to_string()))?;
+    let options = motionstage_export_usd::UsdExportOptions::default();
+    let text = match &take.scene_snapshot {
+        Some(snapshot) => motionstage_export_usd::export_take_layer(&recording, snapshot, &options),
+        // Legacy takes captured before snapshots existed still get a Level A
+        // layer so the stage can subLayer them; it simply lacks the
+        // snapshot-sourced prim structure.
+        None => motionstage_export_usd::export_with_options(&recording, &options),
+    };
+    fs::create_dir_all(dir)?;
+    fs::write(
+        dir.join(motionstage_export_usd::take_layer_file_name(&take.take_id)),
+        text,
+    )
+}
+
+fn write_stage_layer_file(dir: &Path, live_takes: &[TakeInfo]) -> std::io::Result<()> {
+    let entries: Vec<motionstage_export_usd::StageEntry> = live_takes
+        .iter()
+        .map(|take| motionstage_export_usd::StageEntry {
+            scene_id: take.scene_id,
+            scene_name: take.scene_snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
+            layer_path: motionstage_export_usd::take_layer_file_name(&take.take_id),
+        })
+        .collect();
+    let text = motionstage_export_usd::author_stage_layer(
+        &entries,
+        &motionstage_export_usd::UsdExportOptions::default(),
+    );
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join("stage.usda"), text)
+}
+
 fn mapping_to_summary(mapping: &motionstage_core::Mapping) -> MappingSummary {
     MappingSummary {
         mapping_id: mapping.id,
@@ -5936,7 +6034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_mode_blocks_ingest_and_supports_bake_cursor() {
+    async fn playback_blocked_track_keeps_live_owner_and_supports_bake_cursor() {
         let temp = tempdir().unwrap();
         let recording_path = temp.path().join("take-001.cmtrk");
         let catalog_path = temp.path().join("takes.json");
@@ -5989,15 +6087,12 @@ mod tests {
             .unwrap();
         assert_eq!(server.mode().await, Mode::PLAYBACK);
 
-        let before = server.runtime_snapshot().await;
-        let before_value = before
-            .scenes
-            .get(&scene_id)
-            .and_then(|scene| scene.objects.get(&object_id))
-            .and_then(|object| object.attributes.get("position"))
-            .map(|attr| attr.current_value.clone())
-            .unwrap();
-
+        // This is a non-override playback whose only track targets `position`,
+        // which the live device mapping already owns. Playback is therefore
+        // BLOCKED on that attribute (it acquires no lease), so the live mapping
+        // keeps driving it (design §3 — a blocked track keeps its live owner).
+        // Live ingest must still apply, rather than being globally suppressed
+        // by the playback mode.
         server
             .ingest_motion_samples(
                 device_id,
@@ -6017,7 +6112,7 @@ mod tests {
             .and_then(|object| object.attributes.get("position"))
             .map(|attr| attr.current_value.clone())
             .unwrap();
-        assert_eq!(before_value, after_value);
+        assert_eq!(after_value, AttributeValue::Vec3f([9.0, 9.0, 9.0]));
 
         let (cursor_id, total_frames) = server
             .open_take_bake_cursor(manifest.recording_id, SamplingMode::Captured)
@@ -6181,6 +6276,103 @@ mod tests {
             .await
             .unwrap();
         server.stop_recording().await.unwrap().recording_id
+    }
+
+    #[tokio::test]
+    async fn stop_take_materializes_usd_layer_and_stage() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [1.0, 2.0, 3.0],
+            "t1",
+        )
+        .await;
+
+        // A self-contained per-take layer lands next to the .cmtrk.
+        let layer = temp.path().join(format!("take-{take_id}.usda"));
+        assert!(layer.exists(), "per-take USD layer should be materialized");
+        let layer_text = std::fs::read_to_string(&layer).unwrap();
+        assert!(layer_text.starts_with("#usda 1.0\n"));
+        assert!(layer_text.contains(&format!("string motionstage_take_id = \"{take_id}\"")));
+        assert!(layer_text.contains(&format!(
+            "def Xform \"{}\"",
+            motionstage_export_usd::prim_name_for_object(&object_id)
+        )));
+        assert!(layer_text.contains("xformOp:translate"));
+
+        // stage.usda subLayers the new take.
+        let stage = temp.path().join("stage.usda");
+        assert!(stage.exists(), "stage.usda should be authored");
+        let stage_text = std::fs::read_to_string(&stage).unwrap();
+        assert!(stage_text.contains("subLayers = ["));
+        assert!(stage_text.contains(&format!("@take-{take_id}.usda@")));
+    }
+
+    #[tokio::test]
+    async fn take_registration_survives_usd_materialization_fs_error() {
+        let (config, temp) = config_with_temp_catalog();
+        // Force stage.usda authoring to fail: a directory cannot be overwritten
+        // by `fs::write`. The materialize hook must log-and-swallow the error,
+        // never failing take registration (design §4.3).
+        std::fs::create_dir(temp.path().join("stage.usda")).unwrap();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+
+        // `record_position_take` unwraps `stop_recording`, so reaching an id at
+        // all proves registration succeeded despite the materialization error.
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [1.0, 2.0, 3.0],
+            "t1",
+        )
+        .await;
+        let takes = server.list_takes(Some(scene_id)).await;
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].take_id, take_id);
+        // The blocking directory is untouched (the swallowed write never ran).
+        assert!(temp.path().join("stage.usda").is_dir());
+    }
+
+    #[tokio::test]
+    async fn delete_take_drops_layer_from_stage_and_removes_orphan() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server, &temp, device_id, scene_id, object_id, [2.0, 2.0, 2.0], "t1",
+        )
+        .await;
+
+        // Stop materialized the layer and referenced it from the stage.
+        let layer = temp.path().join(format!("take-{take_id}.usda"));
+        assert!(layer.exists());
+        let stage_before = std::fs::read_to_string(temp.path().join("stage.usda")).unwrap();
+        assert!(stage_before.contains(&format!("@take-{take_id}.usda@")));
+
+        server.delete_take(take_id).await.unwrap();
+
+        // Delete removes the orphan layer and refreshes stage.usda so it no
+        // longer references the take (now an empty library).
+        assert!(!layer.exists(), "orphan take layer should be removed");
+        let stage_after = std::fs::read_to_string(temp.path().join("stage.usda")).unwrap();
+        assert!(!stage_after.contains(&format!("@take-{take_id}.usda@")));
+        assert!(stage_after.contains("int motionstage_take_count = 0"));
     }
 
     #[tokio::test]
