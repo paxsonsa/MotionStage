@@ -184,11 +184,19 @@ class MotionStageServer:
         self._attribute_poll_interval_idle_s = 0.25
         self._event_thread: Optional[threading.Thread] = None
         self._event_stop = threading.Event()
+        # Monotonic timestamp (time.monotonic()) of the most recent state event
+        # the pump drained and dispatched, or None if none seen since the pump
+        # last started. Public health hook: last_event_monotonic().
+        self._last_event_monotonic: Optional[float] = None
         # Diff cache for the attribute-value poll (data plane only).
         self._known_attribute_values: dict[tuple[str, str], str] = {}
         # Mode as last reported by the event stream / snapshot; drives the
         # attribute poll cadence.
         self._current_mode: Optional[str] = None
+        # seq of the most recent snapshot fetched from native, used to stamp
+        # the synthetic initial mode event so every delegate event carries a
+        # seq consistent with the snapshot it followed.
+        self._last_snapshot_seq: Optional[int] = None
         # session_id -> (device_id, device_name), learned from session_joined
         # events so session_left can carry the device identity too.
         self._session_devices: dict[str, tuple[str, str]] = {}
@@ -226,6 +234,21 @@ class MotionStageServer:
         self._running = False
         self._stop_event_pump()
         self._native.stop()
+
+    def pump_alive(self) -> bool:
+        """True while the background state-event drain thread is alive and
+        running; False before ``start()``, after ``stop()``, or if the thread
+        died. This is the public, supported way to observe pump health (the
+        ``_event_thread`` attribute is private and must not be reached into)."""
+        thread = self._event_thread
+        return thread is not None and thread.is_alive()
+
+    def last_event_monotonic(self) -> Optional[float]:
+        """``time.monotonic()`` timestamp of the most recent state event the
+        pump drained and dispatched, or None if no event has been seen since
+        the pump last started. Useful together with :meth:`pump_alive` to spot
+        a pump that is alive but no longer receiving events."""
+        return self._last_event_monotonic
 
     def upsert_scene(self, scene: dict[str, Any]) -> UUID:
         scene_id = self._native.upsert_scene(scene)
@@ -570,6 +593,8 @@ class MotionStageServer:
         self._known_attribute_values.clear()
         self._session_devices.clear()
         self._current_mode = None
+        self._last_event_monotonic = None
+        self._last_snapshot_seq = None
 
     def _event_pump(self) -> None:
         """Single background loop: replicated state events drive the control
@@ -579,9 +604,20 @@ class MotionStageServer:
         try:
             self._emit_scene_snapshot_from_native()
             if self._current_mode:
-                self.emit_mode_event(
-                    {"type": "mode_changed", "mode": self._current_mode, "initial": True}
-                )
+                initial_mode_event: dict[str, Any] = {
+                    "type": "mode_changed",
+                    "mode": self._current_mode,
+                    "initial": True,
+                    # The initial mode is derived from the snapshot, so it
+                    # carries the snapshot's seq (and a None origin like any
+                    # server-derived event) to stay orderable with envelope
+                    # events on the same monotonic seq axis.
+                    "origin_session": None,
+                    "timestamp_ns": 0,
+                }
+                if self._last_snapshot_seq is not None:
+                    initial_mode_event["seq"] = self._last_snapshot_seq
+                self.emit_mode_event(initial_mode_event)
         except Exception:
             LOGGER.exception("initial scene snapshot failed")
         if drain is None:
@@ -606,6 +642,8 @@ class MotionStageServer:
                     LOGGER.exception("state event drain failed")
                     events = []
                     self._event_stop.wait(0.1)
+                if events:
+                    self._last_event_monotonic = time.monotonic()
                 for event in events:
                     if self._event_stop.is_set():
                         break
@@ -727,6 +765,9 @@ class MotionStageServer:
         mode = str(snapshot.get("mode") or "").strip().lower()
         if mode:
             self._current_mode = mode
+        snapshot_seq = snapshot.get("seq")
+        if isinstance(snapshot_seq, int):
+            self._last_snapshot_seq = snapshot_seq
         self.emit_scene_snapshot(dict(snapshot))
 
     def _current_attribute_poll_interval_s(self) -> float:

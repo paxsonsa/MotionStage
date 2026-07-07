@@ -1696,13 +1696,22 @@ fn describe_state_event(event: &StateEvent) -> String {
         }
         StateEvent::TakeSelected { take_id, .. } => format!("take selected {take_id}"),
         StateEvent::TakeDeleted { take_id } => format!("take deleted {take_id}"),
+        StateEvent::TakeUpdated { take } => {
+            format!(
+                "take updated {} \"{}\" rating={:?}",
+                take.take_id, take.name, take.rating
+            )
+        }
         StateEvent::PlaybackChanged {
             state,
             take_id,
             playhead_ns,
             looping,
+            blocked_attributes,
         } => {
-            format!("playback {state:?} take={take_id} playhead_ns={playhead_ns} looping={looping}")
+            format!(
+                "playback {state:?} take={take_id} playhead_ns={playhead_ns} looping={looping} blocked={blocked_attributes}"
+            )
         }
     }
 }

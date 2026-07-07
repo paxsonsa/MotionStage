@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     net::SocketAddr,
     ops::ControlFlow,
@@ -26,8 +26,8 @@ use motionstage_protocol::{
     RegisterAccepted, RegisterRejected, RegisterRequest, RejectCode, SamplingMode,
     SceneSnapshotPayload, SdpMessage, SdpType, ServerHello, SessionState, SessionSummary,
     SignalMessage, SignalPayload, SnapshotAttribute, SnapshotObject, SnapshotScene, StateEvent,
-    StateEventEnvelope, TakeBakeAttribute, TakeInfo, VideoStreamStatus, WireError, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    StateEventEnvelope, TakeBakeAttribute, TakeInfo, TakeRating, VideoStreamStatus, WireError,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use motionstage_recording::{
     read_recording, RecordedAttribute, RecordedFrame, RecordingFile, RecordingManifest,
@@ -197,9 +197,18 @@ pub struct SessionInfo {
     pub is_host: bool,
 }
 
+/// Reserved synthetic device identity for the playback "virtual player"
+/// (design §3). Playback acquires target-attribute leases under this id through
+/// the same lease model live mappings use, so live motion and replay arbitrate
+/// over a shared one-owner-per-attribute invariant.
+const PLAYBACK_DEVICE_ID: Uuid = Uuid::from_u128(0x506c6179_6261_636b_5f73_726300000001);
+
 struct ActiveRecording {
     path: PathBuf,
     writer: RecordingWriter,
+    /// Scene graph captured at record start (design §2.1), attached to the take
+    /// at stop so it replays correctly after later scene edits.
+    scene_snapshot: Option<SnapshotScene>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +220,8 @@ struct ActivePlayback {
     playhead_ns: u64,
     started_wall_ns: Option<u64>,
     started_playhead_ns: u64,
+    /// Count of tracks blocked by live mappings at acquisition (design §3).
+    blocked_attributes: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -368,14 +379,42 @@ impl ServerState {
         Ok(())
     }
 
-    fn apply_playback_frame(&mut self, frame: &RecordedFrame, scene_id: SceneId) {
+    /// Apply a recorded frame's already-resolved values back into the scene,
+    /// but **only** for attributes the playback source owns — recorded values
+    /// are written verbatim (never recomposed) and blocked tracks are skipped
+    /// (design §3). If a recording is active (record-during-playback, design
+    /// §5), the replayed-through values are captured into the new take at
+    /// `now_ns`, so a layered-mocap take reflects the composed scene.
+    fn apply_playback_frame(&mut self, frame: &RecordedFrame, scene_id: SceneId, now_ns: u64) {
+        let mut applied = Vec::new();
         for attr in &frame.attributes {
-            let _ = self.runtime.set_scene_attribute_value(
+            match self.runtime.set_owned_scene_attribute_value(
+                PLAYBACK_DEVICE_ID,
                 scene_id,
                 attr.object_id,
                 &attr.attribute,
                 attr.value.clone(),
-            );
+            ) {
+                Ok(true) => applied.push(RecordedAttribute {
+                    object_id: attr.object_id,
+                    attribute: attr.attribute.clone(),
+                    value: attr.value.clone(),
+                }),
+                Ok(false) => {}
+                Err(_) => {}
+            }
+        }
+
+        if applied.is_empty() {
+            return;
+        }
+        let mode = self.runtime.mode();
+        if let Some(recording) = self.active_recording.as_mut() {
+            recording.writer.push_frame(RecordedFrame {
+                timestamp_ns: now_ns,
+                mode,
+                attributes: applied,
+            });
         }
     }
 
@@ -435,14 +474,22 @@ impl ServerState {
                     take_id: playback.take_id,
                     playhead_ns: playhead,
                     looping: playback.looping,
+                    // Ownership is released on stop below; no tracks remain owned.
+                    blocked_attributes: 0,
                 });
             }
         }
 
         playback.playhead_ns = playhead;
         let scene_id = playback.recording.manifest.scene_id;
+        let stopped = playback.state == PlaybackRuntimeState::Stopped;
         if let Some(frame) = Self::frame_for_playhead(&playback.recording, playback.playhead_ns) {
-            self.apply_playback_frame(&frame, scene_id);
+            self.apply_playback_frame(&frame, scene_id, now_ns);
+        }
+        // A take that just ran to its end releases its playback leases so live
+        // mappings can reclaim their target attributes normally (design §3).
+        if stopped {
+            self.runtime.release_playback(PLAYBACK_DEVICE_ID);
         }
         transition
     }
@@ -497,6 +544,8 @@ pub struct PlaybackStatus {
     pub position_ns: u64,
     pub duration_ns: u64,
     pub looping: bool,
+    /// Tracks blocked by a live mapping (design §3).
+    pub blocked_attributes: u32,
 }
 
 /// Capacity of the state-event broadcast channel; a receiver that falls more
@@ -720,6 +769,7 @@ impl ServerHandle {
             take_id: playback.take_id,
             playhead_ns: playback.playhead_ns,
             looping: playback.looping,
+            blocked_attributes: playback.blocked_attributes,
         });
         SceneSnapshotPayload {
             scenes: snapshot.scenes.values().map(scene_to_snapshot).collect(),
@@ -1399,6 +1449,7 @@ impl ServerHandle {
         let to = state.runtime.mode();
         if to.recording != RecordingState::Playback {
             state.active_playback = None;
+            state.runtime.release_playback(PLAYBACK_DEVICE_ID);
         }
         if let Some(recording) = state.active_recording.as_mut() {
             recording
@@ -1433,6 +1484,7 @@ impl ServerHandle {
         let to = state.runtime.mode();
         if to.recording != RecordingState::Playback {
             state.active_playback = None;
+            state.runtime.release_playback(PLAYBACK_DEVICE_ID);
         }
         if let Some(rec) = state.active_recording.as_mut() {
             rec.writer.push_marker(RecordingMarker::ModeTransition {
@@ -1480,6 +1532,7 @@ impl ServerHandle {
             position_ns: playback.playhead_ns,
             duration_ns: ServerState::playback_duration_ns(&playback.recording),
             looping: playback.looping,
+            blocked_attributes: playback.blocked_attributes,
         })
     }
 
@@ -2139,20 +2192,10 @@ impl ServerHandle {
             .ok_or_else(|| ServerError::Recording("no active scene".into()))?;
 
         let initial_mode = state.runtime.mode();
-        // Recording replaces any loaded playback; that discard is a
-        // replicated mutation like every other playback-terminating path.
-        if let Some(playback) = state.active_playback.take() {
-            self.emit_event(
-                &mut state,
-                origin,
-                StateEvent::PlaybackChanged {
-                    state: PlaybackRuntimeState::Stopped,
-                    take_id: playback.take_id,
-                    playhead_ns: playback.playhead_ns,
-                    looping: playback.looping,
-                },
-            );
-        }
+        // Recording during playback is allowed (layered mocap, design §5):
+        // playback keeps running and its replayed-through values are captured
+        // into the new take alongside live device motion. We do NOT discard the
+        // active playback here.
         let mut from_mode = state.runtime.mode();
         if from_mode.data_flow == DataFlowState::Idle {
             state
@@ -2169,9 +2212,13 @@ impl ServerHandle {
         let writer = RecordingWriter::start(active_scene, now_ns);
         let recording_id = writer.recording_id();
         let snapshot = state.runtime.snapshot();
+        // Capture the scene graph at record start; it is attached to the take
+        // on stop so it replays correctly after later scene edits (design §2.1).
+        let scene_snapshot = snapshot.scenes.get(&active_scene).map(scene_to_snapshot);
         state.active_recording = Some(ActiveRecording {
             path: path.as_ref().to_path_buf(),
             writer,
+            scene_snapshot,
         });
 
         if let Some(recording) = state.active_recording.as_mut() {
@@ -2257,6 +2304,7 @@ impl ServerHandle {
                 to: Mode::LIVE,
             });
 
+        let scene_snapshot = recording.scene_snapshot.clone();
         let manifest = recording
             .writer
             .finish(&recording_path)
@@ -2270,6 +2318,7 @@ impl ServerHandle {
                 recording_path,
                 manifest.started_ns,
                 manifest.frame_count,
+                scene_snapshot,
             )
             .map_err(ServerError::Take)?;
         let take_info = entry.to_take_info();
@@ -2294,6 +2343,20 @@ impl ServerHandle {
             .runtime
             .set_recording(RecordingState::Inactive)
             .map_err(ServerError::Core)?;
+        // Record-during-playback (design §5): if a take was still replaying,
+        // recording layered over it. Stopping the recording returns the
+        // recording axis to Playback (not Idle) so the take keeps playing.
+        let playback_still_active = state
+            .active_playback
+            .as_ref()
+            .map(|p| p.state != PlaybackRuntimeState::Stopped)
+            .unwrap_or(false);
+        if playback_still_active {
+            state
+                .runtime
+                .set_recording(RecordingState::Playback)
+                .map_err(ServerError::Core)?;
+        }
         let mode = state.runtime.mode();
         self.emit_event(&mut state, origin, StateEvent::ModeChanged { mode });
 
@@ -2331,19 +2394,79 @@ impl ServerHandle {
         Ok(info)
     }
 
+    pub async fn rename_take(&self, take_id: Uuid, name: String) -> Result<TakeInfo, ServerError> {
+        self.rename_take_from(take_id, name, Some(self.host_session_id))
+            .await
+    }
+
+    /// Rename a take's editable slate and replicate [`StateEvent::TakeUpdated`].
+    pub async fn rename_take_from(
+        &self,
+        take_id: Uuid,
+        name: String,
+        origin: Option<Uuid>,
+    ) -> Result<TakeInfo, ServerError> {
+        let mut state = self.state.write().await;
+        let info = state
+            .take_catalog
+            .rename_take(take_id, name)
+            .map_err(ServerError::Take)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::TakeUpdated { take: info.clone() },
+        );
+        Ok(info)
+    }
+
+    pub async fn rate_take(
+        &self,
+        take_id: Uuid,
+        rating: TakeRating,
+    ) -> Result<TakeInfo, ServerError> {
+        self.rate_take_from(take_id, rating, Some(self.host_session_id))
+            .await
+    }
+
+    /// Set a take's circle-take rating and replicate [`StateEvent::TakeUpdated`].
+    pub async fn rate_take_from(
+        &self,
+        take_id: Uuid,
+        rating: TakeRating,
+        origin: Option<Uuid>,
+    ) -> Result<TakeInfo, ServerError> {
+        let mut state = self.state.write().await;
+        let info = state
+            .take_catalog
+            .rate_take(take_id, rating)
+            .map_err(ServerError::Take)?;
+        self.emit_event(
+            &mut state,
+            origin,
+            StateEvent::TakeUpdated { take: info.clone() },
+        );
+        Ok(info)
+    }
+
     pub async fn playback_play(
         &self,
         take_id: Uuid,
         looping: bool,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
-        self.playback_play_from(take_id, looping, Some(self.host_session_id))
+        self.playback_play_from(take_id, looping, false, Some(self.host_session_id))
             .await
     }
 
+    /// Start (or restart) playback of a take as an owned virtual source
+    /// (design §3). Playback acquires target-attribute leases through the lease
+    /// model: tracks whose target is owned by a live mapping are **blocked**
+    /// unless `override_live` is set, in which case playback reclaims them. The
+    /// blocked-track count is surfaced on [`StateEvent::PlaybackChanged`].
     pub async fn playback_play_from(
         &self,
         take_id: Uuid,
         looping: bool,
+        override_live: bool,
         origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
@@ -2354,11 +2477,12 @@ impl ServerHandle {
             .ok_or_else(|| ServerError::Take(format!("take not found: {take_id}")))?;
         let recording =
             read_recording(&take.path).map_err(|err| ServerError::Take(err.to_string()))?;
+        let scene_id = recording.manifest.scene_id;
         let previous_scene = state.runtime.active_scene();
         let previous_mode = state.runtime.mode();
         state
             .runtime
-            .set_active_scene(recording.manifest.scene_id)
+            .set_active_scene(scene_id)
             .map_err(ServerError::Core)?;
         state
             .runtime
@@ -2368,6 +2492,25 @@ impl ServerHandle {
             .runtime
             .set_recording(RecordingState::Playback)
             .map_err(ServerError::Core)?;
+
+        // Acquire ownership of the take's target attributes through the lease
+        // model. Any target a live mapping owns is blocked (unless override).
+        let mut targets: BTreeSet<(ObjectId, String)> = BTreeSet::new();
+        for frame in &recording.frames {
+            for attr in &frame.attributes {
+                targets.insert((attr.object_id, attr.attribute.clone()));
+            }
+        }
+        // Release any prior playback lease before reacquiring for this take.
+        state.runtime.release_playback(PLAYBACK_DEVICE_ID);
+        let acquisition = state.runtime.acquire_playback_targets(
+            PLAYBACK_DEVICE_ID,
+            scene_id,
+            targets,
+            override_live,
+        );
+        let blocked_attributes = acquisition.blocked.len() as u32;
+
         let playback = ActivePlayback {
             take_id,
             recording,
@@ -2376,11 +2519,11 @@ impl ServerHandle {
             playhead_ns: 0,
             started_wall_ns: Some(now_ns()),
             started_playhead_ns: 0,
+            blocked_attributes,
         };
         if let Some(frame) = ServerState::frame_for_playhead(&playback.recording, 0) {
-            state.apply_playback_frame(&frame, playback.recording.manifest.scene_id);
+            state.apply_playback_frame(&frame, scene_id, now_ns());
         }
-        let scene_id = playback.recording.manifest.scene_id;
         let playhead_ns = playback.playhead_ns;
         let looping = playback.looping;
         state.active_playback = Some(playback);
@@ -2400,6 +2543,7 @@ impl ServerHandle {
                 take_id,
                 playhead_ns,
                 looping,
+                blocked_attributes,
             },
         );
         Ok((PlaybackRuntimeState::Playing, playhead_ns, looping))
@@ -2435,8 +2579,12 @@ impl ServerHandle {
         playback.state = PlaybackRuntimeState::Paused;
         playback.started_wall_ns = None;
         playback.started_playhead_ns = playback.playhead_ns;
-        let (playback_state, playhead_ns, looping) =
-            (playback.state, playback.playhead_ns, playback.looping);
+        let (playback_state, playhead_ns, looping, blocked_attributes) = (
+            playback.state,
+            playback.playhead_ns,
+            playback.looping,
+            playback.blocked_attributes,
+        );
         self.emit_event(
             &mut state,
             origin,
@@ -2445,6 +2593,7 @@ impl ServerHandle {
                 take_id,
                 playhead_ns,
                 looping,
+                blocked_attributes,
             },
         );
         Ok((playback_state, playhead_ns, looping))
@@ -2468,7 +2617,7 @@ impl ServerHandle {
         origin: Option<Uuid>,
     ) -> Result<(PlaybackRuntimeState, u64, bool), ServerError> {
         let mut state = self.state.write().await;
-        let (status, playhead, loop_state, scene_id, frame) = {
+        let (status, playhead, loop_state, scene_id, frame, blocked_attributes) = {
             let Some(playback) = state.active_playback.as_mut() else {
                 return Err(ServerError::Take("no active playback".into()));
             };
@@ -2497,10 +2646,11 @@ impl ServerHandle {
                 playback.looping,
                 scene_id,
                 frame,
+                playback.blocked_attributes,
             )
         };
         if let Some(frame) = frame {
-            state.apply_playback_frame(&frame, scene_id);
+            state.apply_playback_frame(&frame, scene_id, now_ns());
         }
         self.emit_event(
             &mut state,
@@ -2510,6 +2660,7 @@ impl ServerHandle {
                 take_id,
                 playhead_ns: playhead,
                 looping: loop_state,
+                blocked_attributes,
             },
         );
         Ok((status, playhead, loop_state))
@@ -2538,6 +2689,8 @@ impl ServerHandle {
                 "active playback is not take {take_id}"
             )));
         }
+        // Release playback leases so live mappings can reclaim normally.
+        state.runtime.release_playback(PLAYBACK_DEVICE_ID);
         state
             .runtime
             .set_recording(RecordingState::Inactive)
@@ -2552,6 +2705,7 @@ impl ServerHandle {
                 take_id,
                 playhead_ns: playback.playhead_ns,
                 looping: playback.looping,
+                blocked_attributes: 0,
             },
         );
         Ok((
@@ -2654,6 +2808,7 @@ impl ServerHandle {
         if let Some(active) =
             state.active_playback.take_if(|active| active.take_id == take_id)
         {
+            state.runtime.release_playback(PLAYBACK_DEVICE_ID);
             state
                 .runtime
                 .set_recording(RecordingState::Inactive)
@@ -2668,6 +2823,7 @@ impl ServerHandle {
                     take_id,
                     playhead_ns: active.playhead_ns,
                     looping: active.looping,
+                    blocked_attributes: 0,
                 },
             );
         }
@@ -3344,6 +3500,30 @@ async fn handle_take_control(
                 result: result.map_err(|err| wire_error_from(&err)),
             }
         }
+        ControlMessage::RenameTake { take_id, name } => {
+            let result = if is_operator {
+                server.rename_take_from(take_id, name, Some(session_id)).await
+            } else {
+                Err(ServerError::Denied(
+                    "operator role is required to rename a take".into(),
+                ))
+            };
+            ControlMessage::TakeUpdateResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
+        ControlMessage::RateTake { take_id, rating } => {
+            let result = if is_operator {
+                server.rate_take_from(take_id, rating, Some(session_id)).await
+            } else {
+                Err(ServerError::Denied(
+                    "operator role is required to rate a take".into(),
+                ))
+            };
+            ControlMessage::TakeUpdateResult {
+                result: result.map_err(|err| wire_error_from(&err)),
+            }
+        }
         _ => unreachable!(),
     };
     if control.send(&reply).await.is_err() {
@@ -3442,6 +3622,7 @@ async fn handle_playback_control(
     action: PlaybackAction,
     seek_ns: Option<u64>,
     looping: bool,
+    override_live: bool,
 ) -> Result<HandlerOutcome, ServerError> {
     // Operator gate from the server session record, not self-declared roles.
     if !server.session_is_operator(client_hello.device_id).await {
@@ -3460,7 +3641,11 @@ async fn handle_playback_control(
     }
     let origin = Some(session_id);
     let result = match action {
-        PlaybackAction::Play => server.playback_play_from(take_id, looping, origin).await,
+        PlaybackAction::Play => {
+            server
+                .playback_play_from(take_id, looping, override_live, origin)
+                .await
+        }
         PlaybackAction::Pause => server.playback_pause_from(take_id, origin).await,
         PlaybackAction::Stop => server.playback_stop_from(take_id, origin).await,
         PlaybackAction::Seek => {
@@ -3967,8 +4152,8 @@ async fn handle_quic_peer(
                             ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(ControlMessage::PlaybackControl { take_id, action, seek_ns, looping }) => {
-                        match handle_playback_control(&mut control, &server, &client_hello, session_id, take_id, action, seek_ns, looping).await? {
+                    Ok(ControlMessage::PlaybackControl { take_id, action, seek_ns, looping, override_live }) => {
+                        match handle_playback_control(&mut control, &server, &client_hello, session_id, take_id, action, seek_ns, looping, override_live).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
                         }
@@ -3991,7 +4176,10 @@ async fn handle_quic_peer(
                             ControlFlow::Continue(()) => {}
                         }
                     }
-                    Ok(msg @ (ControlMessage::StartTake | ControlMessage::StopTake)) => {
+                    Ok(msg @ (ControlMessage::StartTake
+                        | ControlMessage::StopTake
+                        | ControlMessage::RenameTake { .. }
+                        | ControlMessage::RateTake { .. })) => {
                         match handle_take_control(&mut control, &server, &client_hello, session_id, msg).await? {
                             ControlFlow::Break(()) => break,
                             ControlFlow::Continue(()) => {}
@@ -4025,6 +4213,7 @@ async fn handle_quic_peer(
                     | Ok(ControlMessage::TakeStopResult { .. })
                     | Ok(ControlMessage::TakeList { .. })
                     | Ok(ControlMessage::TakeSelected { .. })
+                    | Ok(ControlMessage::TakeUpdateResult { .. })
                     | Ok(ControlMessage::PlaybackState { .. })
                     | Ok(ControlMessage::TakeDeleted { .. })
                     | Ok(ControlMessage::TakeBakeCursorOpened { .. })
@@ -4370,7 +4559,7 @@ mod tests {
         AttributeDescriptor, AttributeKind, BakeAttributeValue, BaselineAction, ClientHello,
         ClientRole, ControlMessage, DataFlowState, Feature, Mode, PlaybackRuntimeState,
         RecordingState, RegisterRequest, RejectCode, SamplingMode, SessionState, StateEvent,
-        StateEventEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        StateEventEnvelope, TakeRating, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use tempfile::{tempdir, NamedTempFile};
     use uuid::Uuid;
@@ -5919,6 +6108,343 @@ mod tests {
         (scene, scene_id, object_id)
     }
 
+    /// Scene whose baseline is the origin, so mapped values pass through
+    /// relative composition unchanged (recorded value == ingested value).
+    fn origin_camera_scene() -> (Scene, Uuid, Uuid) {
+        let object = SceneObject::new("camera").with_attribute(SceneAttribute::new(
+            "position",
+            AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+        ));
+        let object_id = object.id;
+        let scene = Scene::new("shot").with_object(object);
+        let scene_id = scene.id;
+        (scene, scene_id, object_id)
+    }
+
+    /// Read an object's `position` current value out of a full snapshot.
+    async fn snapshot_position(server: &ServerHandle, object_id: Uuid) -> [f32; 3] {
+        let snapshot = server.scene_snapshot_payload().await;
+        for scene in &snapshot.scenes {
+            for object in &scene.objects {
+                if object.object_id == object_id {
+                    for attr in &object.attributes {
+                        if attr.name == "position" {
+                            if let BakeAttributeValue::Vec3f(v) = attr.current_value {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("position not found in snapshot");
+    }
+
+    /// Record a one-frame take of `position` driven by `device_id` and return
+    /// the registered take id. Leaves the mapping in place and mode Live.
+    async fn record_position_take(
+        server: &ServerHandle,
+        temp: &tempfile::TempDir,
+        device_id: Uuid,
+        scene_id: Uuid,
+        object_id: Uuid,
+        value: [f32; 3],
+        label: &str,
+    ) -> Uuid {
+        server
+            .create_mapping(
+                MappingRequest {
+                    source_device: device_id,
+                    source_output: "pose_pos".into(),
+                    target_scene: scene_id,
+                    target_object: object_id,
+                    target_attribute: "position".into(),
+                    component_mask: None,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        server
+            .start_recording(temp.path().join(format!("{label}.cmtrk")), 101)
+            .await
+            .unwrap();
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f(value),
+                }],
+                102,
+            )
+            .await
+            .unwrap();
+        server.stop_recording().await.unwrap().recording_id
+    }
+
+    #[tokio::test]
+    async fn rename_and_rate_emit_take_updated_and_persist() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id =
+            record_position_take(&server, &temp, device_id, scene_id, object_id, [5.0, 5.0, 5.0], "t1")
+                .await;
+
+        let mut rx = server.subscribe_state_events();
+        let renamed = server.rename_take(take_id, "sc04_setupB".into()).await.unwrap();
+        assert_eq!(renamed.name, "sc04_setupB");
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::TakeUpdated { take } if take.name == "sc04_setupB" && take.take_id == take_id
+        ));
+
+        let rated = server.rate_take(take_id, TakeRating::Circle).await.unwrap();
+        assert_eq!(rated.rating, TakeRating::Circle);
+        let events = drain_events(&mut rx);
+        assert!(matches!(
+            &events[0].event,
+            StateEvent::TakeUpdated { take } if take.rating == TakeRating::Circle
+        ));
+
+        // Persisted: a fresh catalog load over the same path keeps both edits.
+        let takes = server.list_takes(Some(scene_id)).await;
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].name, "sc04_setupB");
+        assert_eq!(takes[0].rating, TakeRating::Circle);
+        assert!(takes[0].number >= 1);
+    }
+
+    #[tokio::test]
+    async fn take_embeds_scene_snapshot_captured_at_record_start() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id =
+            record_position_take(&server, &temp, device_id, scene_id, object_id, [5.0, 5.0, 5.0], "t1")
+                .await;
+
+        let take = server
+            .list_takes(Some(scene_id))
+            .await
+            .into_iter()
+            .find(|t| t.take_id == take_id)
+            .unwrap();
+        let snapshot = take.scene_snapshot.expect("take embeds a scene snapshot");
+        assert_eq!(snapshot.scene_id, scene_id);
+        assert!(snapshot
+            .objects
+            .iter()
+            .any(|o| o.object_id == object_id && o.attributes.iter().any(|a| a.name == "position")));
+    }
+
+    #[tokio::test]
+    async fn replay_blocked_by_live_mapping_keeps_live_value_and_surfaces_blocked() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [5.0, 5.0, 5.0],
+            "blocked",
+        )
+        .await;
+
+        // A live mapping still owns "position"; drive it to a distinct value.
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([9.0, 9.0, 9.0]),
+                }],
+                200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot_position(&server, object_id).await, [9.0, 9.0, 9.0]);
+
+        // Playback without override: the position track is blocked, so the
+        // attribute keeps its live value and the blocked count is surfaced.
+        let mut rx = server.subscribe_state_events();
+        server.playback_play(take_id, false).await.unwrap();
+        assert_eq!(snapshot_position(&server, object_id).await, [9.0, 9.0, 9.0]);
+        let events = drain_events(&mut rx);
+        let blocked = events.iter().find_map(|e| match &e.event {
+            StateEvent::PlaybackChanged {
+                blocked_attributes, ..
+            } => Some(*blocked_attributes),
+            _ => None,
+        });
+        assert_eq!(blocked, Some(1), "one track blocked by the live mapping");
+        let status = server.playback_status().await.unwrap();
+        assert_eq!(status.blocked_attributes, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_operator_override_reclaims_and_supersedes_live() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [5.0, 5.0, 5.0],
+            "override",
+        )
+        .await;
+
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([9.0, 9.0, 9.0]),
+                }],
+                200,
+            )
+            .await
+            .unwrap();
+
+        // Override: playback reclaims "position" and replays the recorded value.
+        let mut rx = server.subscribe_state_events();
+        server
+            .playback_play_from(take_id, false, true, None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_position(&server, object_id).await, [5.0, 5.0, 5.0]);
+        let blocked = drain_events(&mut rx).iter().find_map(|e| match &e.event {
+            StateEvent::PlaybackChanged {
+                blocked_attributes, ..
+            } => Some(*blocked_attributes),
+            _ => None,
+        });
+        assert_eq!(blocked, Some(0), "override reclaims: nothing blocked");
+
+        // A live device update to the reclaimed attribute is superseded.
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([50.0, 50.0, 50.0]),
+                }],
+                300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot_position(&server, object_id).await,
+            [5.0, 5.0, 5.0],
+            "playback-owned attribute ignores live ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_stop_releases_leases_so_live_mappings_reclaim() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [5.0, 5.0, 5.0],
+            "release",
+        )
+        .await;
+
+        // Override so playback owns the attribute, then stop.
+        server
+            .playback_play_from(take_id, false, true, None)
+            .await
+            .unwrap();
+        server.playback_stop(take_id).await.unwrap();
+
+        // Leases released: live ingest drives the attribute again.
+        server
+            .ingest_motion_samples(
+                device_id,
+                vec![AttributeUpdate {
+                    output_attribute: "pose_pos".into(),
+                    value: AttributeValue::Vec3f([7.0, 7.0, 7.0]),
+                }],
+                400,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot_position(&server, object_id).await, [7.0, 7.0, 7.0]);
+    }
+
+    #[tokio::test]
+    async fn record_during_playback_captures_composed_replayed_values() {
+        let (config, temp) = config_with_temp_catalog();
+        let server = ServerHandle::new(config);
+        let device_id = Uuid::now_v7();
+        let (scene, scene_id, object_id) = origin_camera_scene();
+        server.load_scene(scene).await;
+        let take_id = record_position_take(
+            &server,
+            &temp,
+            device_id,
+            scene_id,
+            object_id,
+            [5.0, 5.0, 5.0],
+            "layer-src",
+        )
+        .await;
+
+        // Override so playback owns "position" outright (supersedes the live
+        // mapping without needing its id).
+        let new_take_path = temp.path().join("layered.cmtrk");
+        server
+            .playback_play_from(take_id, false, true, None)
+            .await
+            .unwrap();
+
+        // Record a layered take while the source take replays. A seek forces a
+        // replayed frame to be applied and captured into the new recording (the
+        // same apply path the scheduler tick uses).
+        server.start_recording(&new_take_path, 500).await.unwrap();
+        server.playback_seek(take_id, 0, false).await.unwrap();
+        let layered = server.stop_recording().await.unwrap();
+
+        // The layered recording captured the replayed-through value.
+        let recording = read_recording(&new_take_path).unwrap();
+        assert!(
+            recording
+                .frames
+                .iter()
+                .any(|f| f.attributes.iter().any(|a| a.object_id == object_id
+                    && a.value == AttributeValue::Vec3f([5.0, 5.0, 5.0]))),
+            "layered take must contain the replayed value; frames={:?}",
+            recording.frames
+        );
+        assert!(layered.frame_count >= 1);
+    }
+
     #[tokio::test]
     async fn start_take_while_recording_active_rejects_and_preserves_in_progress_take() {
         let (config, _temp) = config_with_temp_catalog();
@@ -6322,27 +6848,24 @@ mod tests {
             .await
             .unwrap();
 
-        // Discarding the loaded playback is replicated like every other
-        // playback-terminating path, before the mode flips to recording.
+        // Record-during-playback (design §5): starting a recording while a take
+        // is replaying does NOT discard the playback — they coexist for layered
+        // mocap. Only the mode flip + recording start are emitted.
         let events = drain_events(&mut rx);
-        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert_eq!(events.len(), 2, "events: {events:?}");
         assert!(matches!(
             &events[0].event,
-            StateEvent::PlaybackChanged {
-                state: PlaybackRuntimeState::Stopped,
-                take_id,
-                looping: true,
-                ..
-            } if *take_id == manifest.recording_id
-        ));
-        assert!(matches!(
-            &events[1].event,
             StateEvent::ModeChanged {
                 mode: Mode::RECORDING
             }
         ));
-        assert!(matches!(&events[2].event, StateEvent::RecordingStarted { .. }));
-        assert!(server.playback_status().await.is_none());
+        assert!(matches!(&events[1].event, StateEvent::RecordingStarted { .. }));
+        // Playback is still loaded and running.
+        let status = server
+            .playback_status()
+            .await
+            .expect("playback survives start_recording");
+        assert_eq!(status.take_id, manifest.recording_id);
 
         server.stop_recording().await.unwrap();
     }

@@ -279,9 +279,11 @@ struct UiSnapshot {
 struct UiTake {
     take_id: Uuid,
     scene_id: Uuid,
+    number: u32,
     name: String,
     frame_count: u64,
     created_ns: u64,
+    rating: &'static str,
     selected: bool,
 }
 
@@ -293,6 +295,7 @@ struct UiPlayback {
     position_ns: u64,
     duration_ns: u64,
     looping: bool,
+    blocked_attributes: u32,
 }
 
 fn ser_playback_state<S: serde::Serializer>(
@@ -442,11 +445,23 @@ impl From<&TakeInfo> for UiTake {
         UiTake {
             take_id: t.take_id,
             scene_id: t.scene_id,
+            number: t.number,
             name: t.name.clone(),
             frame_count: t.frame_count,
             created_ns: t.created_ns,
+            rating: take_rating_str(t.rating),
             selected: t.selected,
         }
+    }
+}
+
+fn take_rating_str(rating: motionstage_protocol::TakeRating) -> &'static str {
+    use motionstage_protocol::TakeRating;
+    match rating {
+        TakeRating::Unrated => "unrated",
+        TakeRating::Ng => "ng",
+        TakeRating::Keep => "keep",
+        TakeRating::Circle => "circle",
     }
 }
 
@@ -458,6 +473,7 @@ impl From<PlaybackStatus> for UiPlayback {
             position_ns: p.position_ns,
             duration_ns: p.duration_ns,
             looping: p.looping,
+            blocked_attributes: p.blocked_attributes,
         }
     }
 }
@@ -812,6 +828,7 @@ async fn apply_event(
         | StateEvent::TakeRegistered { .. }
         | StateEvent::TakeSelected { .. }
         | StateEvent::TakeDeleted { .. }
+        | StateEvent::TakeUpdated { .. }
         | StateEvent::PlaybackChanged { .. } => {
             refresh_takes(server, sender, st).await?;
         }
@@ -961,8 +978,8 @@ async fn dispatch_control_message(server: &ServerHandle, msg: ControlMessage) ->
         ControlMessage::DeleteTake { take_id } => {
             server.delete_take(take_id).await.map_err(stringify)
         }
-        ControlMessage::PlaybackControl { take_id, action, seek_ns, looping } => {
-            dispatch_playback(server, take_id, action, seek_ns, looping).await
+        ControlMessage::PlaybackControl { take_id, action, seek_ns, looping, override_live } => {
+            dispatch_playback(server, take_id, action, seek_ns, looping, override_live).await
         }
         other => Err(format!("command not supported over companion UI: {other:?}")),
     }
@@ -974,9 +991,13 @@ async fn dispatch_playback(
     action: PlaybackAction,
     seek_ns: Option<u64>,
     looping: bool,
+    override_live: bool,
 ) -> Result<(), String> {
     match action {
-        PlaybackAction::Play => server.playback_play(take_id, looping).await.map(|_| ()),
+        PlaybackAction::Play => server
+            .playback_play_from(take_id, looping, override_live, Some(server.host_session_id()))
+            .await
+            .map(|_| ()),
         PlaybackAction::Pause => server.playback_pause(take_id).await.map(|_| ()),
         PlaybackAction::Stop => server.playback_stop(take_id).await.map(|_| ()),
         PlaybackAction::Seek => server

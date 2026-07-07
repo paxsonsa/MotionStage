@@ -421,6 +421,118 @@ def test_event_pump_fires_all_six_delegate_callbacks(monkeypatch):
     ]
 
 
+def test_pump_alive_transitions_with_start_and_stop(monkeypatch):
+    """pump_alive() is the public health hook: False before start, True while
+    the drain thread runs, False again after stop() joins it."""
+    monkeypatch.setattr(server_module, "_NativeMotionStageServer", _FakeNative)
+    server = server_module.MotionStageServer(name="unit")
+
+    assert server.pump_alive() is False
+    assert server.last_event_monotonic() is None
+
+    server.start()
+    try:
+        assert server.pump_alive() is True
+    finally:
+        server.stop()
+
+    assert server.pump_alive() is False
+    # stop() joins and resets the pump; the last-event clock resets too.
+    assert server.last_event_monotonic() is None
+
+
+def test_delegate_event_dicts_carry_monotonic_seq(monkeypatch):
+    """Every event dict handed to the on_*_event delegate callbacks carries the
+    envelope's monotonic seq (plus origin_session/timestamp_ns), so a consumer
+    can guard against stale snapshots reordering registrations."""
+
+    class _Native(_FakeNative):
+        def __init__(self, name: str | None = None):
+            super().__init__(name)
+            self.event_batches = [
+                [
+                    {
+                        "seq": 1,
+                        "origin_session": "00000000-0000-0000-0000-000000000aaa",
+                        "timestamp_ns": 10,
+                        "type": "mode_changed",
+                        "mode": "live",
+                    },
+                    {
+                        "seq": 2,
+                        "origin_session": "00000000-0000-0000-0000-000000000aaa",
+                        "timestamp_ns": 20,
+                        "type": "mapping_created",
+                        "mapping": {"mapping_id": "00000000-0000-0000-0000-000000000123"},
+                    },
+                ],
+                [
+                    {
+                        "seq": 3,
+                        "origin_session": None,
+                        "timestamp_ns": 30,
+                        "type": "session_joined",
+                        "session_id": "00000000-0000-0000-0000-000000000bbb",
+                        "device_id": "00000000-0000-0000-0000-000000000ccc",
+                        "device_name": "iPad Pro",
+                    },
+                    {
+                        "seq": 4,
+                        "origin_session": None,
+                        "timestamp_ns": 40,
+                        "type": "recording_started",
+                        "take_id": "00000000-0000-0000-0000-000000000ddd",
+                        "scene_id": "00000000-0000-0000-0000-000000000000",
+                    },
+                ],
+            ]
+
+    class _SeqDelegate(_CapturingDelegate):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saw_recording = threading.Event()
+
+        def on_recording_event(self, event: dict[str, object]) -> None:
+            super().on_recording_event(event)
+            self.saw_recording.set()
+
+    monkeypatch.setattr(server_module, "_NativeMotionStageServer", _Native)
+    server = server_module.MotionStageServer(name="unit")
+    delegate = _SeqDelegate()
+    server.bind_delegate(delegate)
+
+    server.start()
+    try:
+        assert delegate.saw_recording.wait(timeout=5.0), "recording event never delivered"
+    finally:
+        server.stop()
+
+    # Collect every event dict delivered to the control-plane callbacks, in
+    # delivery order (mode -> mapping -> client -> recording).
+    delivered = (
+        delegate.by_kind["mode"]
+        + delegate.by_kind["mapping"]
+        + delegate.by_kind["client"]
+        + delegate.by_kind["record"]
+    )
+    assert delivered, "no control-plane events were delivered"
+    for event in delivered:
+        assert "seq" in event, f"event missing seq: {event}"
+        assert "timestamp_ns" in event
+        assert "origin_session" in event
+
+    # In the order the pump dispatched them, seq is strictly increasing.
+    seqs = [
+        int(delegate.by_kind["mode"][0]["seq"]),
+        int(delegate.by_kind["mapping"][0]["seq"]),
+        int(delegate.by_kind["client"][0]["seq"]),
+        int(delegate.by_kind["record"][0]["seq"]),
+    ]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+    assert server.last_event_monotonic() is None  # reset by stop()
+
+
 def test_sessions_catalog_excludes_host_and_unregistered_rows(monkeypatch):
     """server.sessions() is the client catalog: the in-process host session and
     sessions that never registered (no session_id) or already closed must not

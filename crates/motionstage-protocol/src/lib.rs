@@ -112,14 +112,39 @@ impl Mode {
     };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Circle-take rating flag (design §2.1). Survives into editorial as the
+/// take's disposition: `Ng` (no-good), `Keep`, `Circle` (the selected/"circle"
+/// take). Mutable post-record via [`ControlMessage::RateTake`]. Defaults to
+/// `Unrated`, which is also the serde default so legacy catalogs without a
+/// rating field deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TakeRating {
+    #[default]
+    Unrated,
+    Ng,
+    Keep,
+    Circle,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TakeInfo {
     pub take_id: Uuid,
     pub scene_id: Uuid,
+    /// Server-assigned, monotonic-per-scene take number. Stable: it is never
+    /// re-derived from the display name and survives deletion of earlier
+    /// takes (the per-scene counter only advances).
+    pub number: u32,
+    /// Editable slate. Defaults to `"Take {number:03}"` but is renameable via
+    /// [`ControlMessage::RenameTake`].
     pub name: String,
     pub path: String,
     pub created_ns: u64,
     pub frame_count: u64,
+    pub rating: TakeRating,
+    /// The scene graph captured at record start, so the take replays correctly
+    /// after later scene edits and is exportable standalone. `None` for legacy
+    /// takes recorded before snapshots were captured.
+    pub scene_snapshot: Option<SnapshotScene>,
     pub selected: bool,
     pub deleted: bool,
 }
@@ -382,11 +407,19 @@ pub enum StateEvent {
     TakeRegistered { take: TakeInfo },
     TakeSelected { take_id: Uuid, scene_id: Uuid },
     TakeDeleted { take_id: Uuid },
+    /// A take's editable metadata (slate or rating) changed. Carries the full
+    /// updated [`TakeInfo`] so browsers can replace their row wholesale.
+    TakeUpdated { take: TakeInfo },
     PlaybackChanged {
         state: PlaybackRuntimeState,
         take_id: Uuid,
         playhead_ns: u64,
         looping: bool,
+        /// Number of the take's tracks whose target attribute is currently
+        /// owned by a live mapping and therefore not being replayed (design
+        /// §3 arbitration). Clients render this as "N tracks blocked by live
+        /// mappings". Zero when playback owns every track.
+        blocked_attributes: u32,
     },
 }
 
@@ -454,6 +487,8 @@ pub struct PlaybackSummary {
     pub take_id: Uuid,
     pub playhead_ns: u64,
     pub looping: bool,
+    /// Tracks blocked by a live mapping (see [`StateEvent::PlaybackChanged`]).
+    pub blocked_attributes: u32,
 }
 
 /// Full world snapshot sent at the `SceneSynced` handshake step, on resync
@@ -517,6 +552,13 @@ pub enum ControlMessage {
         action: PlaybackAction,
         seek_ns: Option<u64>,
         looping: bool,
+        /// Operator override (design §3): when true and `action` is
+        /// [`PlaybackAction::Play`], playback reclaims target attributes even
+        /// if a live mapping currently owns them. Ignored for other actions.
+        /// `#[serde(default)]` so the JSON companion-UI transport may omit it
+        /// (defaults to no override); the bincode wire always encodes it.
+        #[serde(default)]
+        override_live: bool,
     },
     PlaybackState {
         take_id: Uuid,
@@ -529,6 +571,25 @@ pub enum ControlMessage {
     },
     TakeDeleted {
         take_id: Uuid,
+    },
+    /// Client → server: rename a take's slate (Operator-gated). Replies
+    /// [`ControlMessage::TakeUpdateResult`]; success replicates as
+    /// [`StateEvent::TakeUpdated`].
+    RenameTake {
+        take_id: Uuid,
+        name: String,
+    },
+    /// Client → server: set a take's circle-take rating (Operator-gated).
+    /// Replies [`ControlMessage::TakeUpdateResult`]; success replicates as
+    /// [`StateEvent::TakeUpdated`].
+    RateTake {
+        take_id: Uuid,
+        rating: TakeRating,
+    },
+    /// Server → client: direct reply to [`ControlMessage::RenameTake`] and
+    /// [`ControlMessage::RateTake`]. `Ok` carries the updated catalog entry.
+    TakeUpdateResult {
+        result: Result<TakeInfo, WireError>,
     },
     OpenTakeBakeCursor {
         take_id: Uuid,
@@ -847,6 +908,7 @@ mod tests {
             action: PlaybackAction::Seek,
             seek_ns: Some(1_000),
             looping: true,
+            override_live: false,
         };
         let encoded = bincode::serialize(&message).expect("control message serializes");
         let decoded: ControlMessage =
@@ -899,6 +961,38 @@ mod tests {
             },
         }));
         round_trip(&ControlMessage::ResyncRequest { last_seq: 42 });
+        round_trip(&ControlMessage::StateEventMsg(StateEventEnvelope {
+            seq: 10,
+            origin_session: Some(session),
+            timestamp_ns: 126,
+            event: StateEvent::TakeUpdated {
+                take: TakeInfo {
+                    take_id: Uuid::now_v7(),
+                    scene_id: Uuid::now_v7(),
+                    number: 3,
+                    name: "sc04_setupB".into(),
+                    path: "/tmp/take-003.cmtrk".into(),
+                    created_ns: 5,
+                    frame_count: 12,
+                    rating: TakeRating::Circle,
+                    scene_snapshot: None,
+                    selected: true,
+                    deleted: false,
+                },
+            },
+        }));
+        round_trip(&ControlMessage::StateEventMsg(StateEventEnvelope {
+            seq: 11,
+            origin_session: None,
+            timestamp_ns: 127,
+            event: StateEvent::PlaybackChanged {
+                state: PlaybackRuntimeState::Playing,
+                take_id: Uuid::now_v7(),
+                playhead_ns: 42,
+                looping: false,
+                blocked_attributes: 1,
+            },
+        }));
     }
 
     #[test]
@@ -975,15 +1069,47 @@ mod tests {
             result: Ok(TakeInfo {
                 take_id: Uuid::now_v7(),
                 scene_id: Uuid::now_v7(),
+                number: 1,
                 name: "Take 001".into(),
                 path: "/tmp/take-001.cmtrk".into(),
                 created_ns: 1,
                 frame_count: 2,
+                rating: TakeRating::Unrated,
+                scene_snapshot: None,
                 selected: true,
                 deleted: false,
             }),
         });
         round_trip(&ControlMessage::GetSceneSnapshot);
+        round_trip(&ControlMessage::RenameTake {
+            take_id: Uuid::now_v7(),
+            name: "sc04_setupB".into(),
+        });
+        round_trip(&ControlMessage::RateTake {
+            take_id: Uuid::now_v7(),
+            rating: TakeRating::Circle,
+        });
+        round_trip(&ControlMessage::TakeUpdateResult {
+            result: Ok(TakeInfo {
+                take_id: Uuid::now_v7(),
+                scene_id: Uuid::now_v7(),
+                number: 7,
+                name: "sc04_setupB".into(),
+                path: "/tmp/take-007.cmtrk".into(),
+                created_ns: 9,
+                frame_count: 42,
+                rating: TakeRating::Circle,
+                scene_snapshot: None,
+                selected: true,
+                deleted: false,
+            }),
+        });
+        round_trip(&ControlMessage::TakeUpdateResult {
+            result: Err(WireError {
+                code: RejectCode::RoleDenied,
+                reason: "operator role is required".into(),
+            }),
+        });
     }
 
     #[test]
@@ -1045,10 +1171,13 @@ mod tests {
             takes: vec![TakeInfo {
                 take_id: Uuid::now_v7(),
                 scene_id: Uuid::now_v7(),
+                number: 1,
                 name: "Take 001".into(),
                 path: "/tmp/take-001.cmtrk".into(),
                 created_ns: 123,
                 frame_count: 42,
+                rating: TakeRating::Keep,
+                scene_snapshot: None,
                 selected: true,
                 deleted: false,
             }],
@@ -1057,6 +1186,7 @@ mod tests {
                 take_id: Uuid::now_v7(),
                 playhead_ns: 1_000,
                 looping: true,
+                blocked_attributes: 2,
             }),
             seq: 17,
         });

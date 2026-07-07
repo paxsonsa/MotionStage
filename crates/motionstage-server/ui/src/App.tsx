@@ -14,8 +14,8 @@ const cmd = {
   disconnectClient: (device_id: string) => ({ cmd: "disconnect_client", device_id }),
   selectTake: (take_id: string) => ({ SelectTake: { take_id } }),
   deleteTake: (take_id: string) => ({ DeleteTake: { take_id } }),
-  playback: (take_id: string, action: "Play" | "Pause" | "Stop" | "Seek", seek_ns: number | null, looping: boolean) =>
-    ({ PlaybackControl: { take_id, action, seek_ns, looping } }),
+  playback: (take_id: string, action: "Play" | "Pause" | "Stop" | "Seek", seek_ns: number | null, looping: boolean, override_live = false) =>
+    ({ PlaybackControl: { take_id, action, seek_ns, looping, override_live } }),
   resync: () => ({ cmd: "resync_scene" }),
   startVideo: (width: number, height: number, fps: number, source: string | null) =>
     ({ cmd: "start_video", width, height, fps, source }),

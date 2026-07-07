@@ -43,6 +43,18 @@ pub struct RuntimeSnapshot {
     pub mappings: IndexMap<MappingId, Mapping>,
 }
 
+/// Result of a playback source acquiring ownership of a take's target
+/// attributes through the lease model (design §3). Each entry is a
+/// `(object, attribute)` pair on the playback's target scene.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackAcquisition {
+    /// Targets the playback source now owns and may replay into.
+    pub owned: Vec<(ObjectId, String)>,
+    /// Targets kept by a live mapping owner — playback of these tracks is
+    /// blocked (no override), and their live value is untouched.
+    pub blocked: Vec<(ObjectId, String)>,
+}
+
 #[derive(Debug)]
 pub struct RuntimeCore {
     tick_count: u64,
@@ -53,6 +65,13 @@ pub struct RuntimeCore {
     mapping_index: HashMap<(Uuid, String), MappingId>,
     lease: LeaseConfig,
     connected_devices: BTreeSet<Uuid>,
+    /// The synthetic playback source that currently holds playback leases
+    /// (design §3 "virtual player"). `None` when no take is loaded.
+    playback_owner: Option<Uuid>,
+    /// Target attributes the playback source exclusively owns. Replay writes
+    /// only to these; live mapping ingest skips them. Shares the
+    /// one-owner-per-target-attribute invariant with `mappings`.
+    playback_owned: BTreeSet<(SceneId, ObjectId, String)>,
 }
 
 impl Default for RuntimeCore {
@@ -72,7 +91,87 @@ impl RuntimeCore {
             mapping_index: HashMap::new(),
             lease,
             connected_devices: BTreeSet::new(),
+            playback_owner: None,
+            playback_owned: BTreeSet::new(),
         }
+    }
+
+    /// The playback source device id currently holding playback leases, if any.
+    pub fn playback_owner(&self) -> Option<Uuid> {
+        self.playback_owner
+    }
+
+    /// True when a playback source owns `(scene, object, attribute)`.
+    pub fn is_playback_owned(&self, scene_id: SceneId, object_id: ObjectId, attribute: &str) -> bool {
+        self.playback_owned
+            .contains(&(scene_id, object_id, attribute.to_owned()))
+    }
+
+    /// Acquire playback ownership of a take's target attributes through the
+    /// lease model (design §3). For each `(object, attribute)` on `scene_id`:
+    /// if a live mapping already owns it and `override_live` is false, the
+    /// track is **blocked** (the live owner keeps it); otherwise the playback
+    /// source `owner` takes ownership. With `override_live` the playback source
+    /// reclaims the attribute — the live mapping is left in place but is
+    /// superseded (its ingest is skipped) until playback releases the lease.
+    /// Acquiring resets any prior playback ownership held by a different owner.
+    pub fn acquire_playback_targets(
+        &mut self,
+        owner: Uuid,
+        scene_id: SceneId,
+        targets: impl IntoIterator<Item = (ObjectId, String)>,
+        override_live: bool,
+    ) -> PlaybackAcquisition {
+        // A fresh acquisition supersedes any stale playback ownership.
+        self.playback_owned.clear();
+        self.playback_owner = Some(owner);
+        let mut acquisition = PlaybackAcquisition::default();
+        for (object_id, attribute) in targets {
+            let live_owned = self
+                .find_mapping_for_target(scene_id, object_id, &attribute)
+                .is_some();
+            if live_owned && !override_live {
+                acquisition.blocked.push((object_id, attribute));
+            } else {
+                self.playback_owned
+                    .insert((scene_id, object_id, attribute.clone()));
+                acquisition.owned.push((object_id, attribute));
+            }
+        }
+        acquisition
+    }
+
+    /// Release all playback leases held by `owner` so live mappings can reclaim
+    /// their target attributes normally. A no-op if `owner` is not the current
+    /// playback source.
+    pub fn release_playback(&mut self, owner: Uuid) {
+        if self.playback_owner == Some(owner) {
+            self.playback_owner = None;
+            self.playback_owned.clear();
+        }
+    }
+
+    /// Write a replayed (already-resolved) value, but **only** if `owner` holds
+    /// the playback lease on `(scene, object, attribute)`. Returns `Ok(true)`
+    /// when the value was written, `Ok(false)` when the attribute is not owned
+    /// (playback of that track is blocked and must be skipped — never
+    /// recomposed). Recorded values are applied verbatim; the transform
+    /// pipeline is intentionally bypassed.
+    pub fn set_owned_scene_attribute_value(
+        &mut self,
+        owner: Uuid,
+        scene_id: SceneId,
+        object_id: ObjectId,
+        attribute_name: &str,
+        value: AttributeValue,
+    ) -> Result<bool, CoreError> {
+        if self.playback_owner != Some(owner)
+            || !self.is_playback_owned(scene_id, object_id, attribute_name)
+        {
+            return Ok(false);
+        }
+        self.set_scene_attribute_value(scene_id, object_id, attribute_name, value)?;
+        Ok(true)
     }
 
     pub fn mode(&self) -> Mode {
@@ -211,6 +310,14 @@ impl RuntimeCore {
             &req.target_attribute,
             req.component_mask.as_deref(),
         )?;
+
+        // A playback source owning this target is an exclusive owner too: a new
+        // mapping cannot claim an attribute an active take is replaying into.
+        if self.is_playback_owned(req.target_scene, req.target_object, &req.target_attribute) {
+            return Err(CoreError::MappingDenied(
+                "target attribute owned by active playback".into(),
+            ));
+        }
 
         if let Some(existing_id) =
             self.find_mapping_for_target(req.target_scene, req.target_object, &req.target_attribute)
@@ -387,6 +494,17 @@ impl RuntimeCore {
                     })?
                     .clone(),
             };
+
+            // Arbitration (design §3): a playback source that owns this target
+            // (Operator override reclaim) supersedes live ingest. Skip the
+            // update so the two owners never fight over one attribute.
+            if self.is_playback_owned(
+                mapping.target_scene,
+                mapping.target_object,
+                &mapping.target_attribute,
+            ) {
+                continue;
+            }
 
             let scene = self
                 .scenes
@@ -1971,6 +2089,158 @@ mod tests {
             .current_value
             .clone();
         assert_eq!(current, AttributeValue::Bool(true));
+    }
+
+    #[test]
+    fn playback_acquires_free_targets_and_is_blocked_by_live_mappings() {
+        let (mut core, device_id, scene_id, object_id) = build_core();
+        // A live mapping owns "position".
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+
+        let playback = Uuid::now_v7();
+        let acq = core.acquire_playback_targets(
+            playback,
+            scene_id,
+            [(object_id, "position".to_string())],
+            false,
+        );
+        assert!(acq.owned.is_empty());
+        assert_eq!(acq.blocked, vec![(object_id, "position".to_string())]);
+        assert!(!core.is_playback_owned(scene_id, object_id, "position"));
+
+        // Override reclaims it.
+        let acq = core.acquire_playback_targets(
+            playback,
+            scene_id,
+            [(object_id, "position".to_string())],
+            true,
+        );
+        assert_eq!(acq.owned, vec![(object_id, "position".to_string())]);
+        assert!(acq.blocked.is_empty());
+        assert!(core.is_playback_owned(scene_id, object_id, "position"));
+    }
+
+    #[test]
+    fn owned_setter_writes_only_owned_targets_and_release_frees_them() {
+        let (mut core, _device_id, scene_id, object_id) = build_core();
+        let playback = Uuid::now_v7();
+        core.acquire_playback_targets(
+            playback,
+            scene_id,
+            [(object_id, "position".to_string())],
+            false,
+        );
+
+        // Owned write lands.
+        let wrote = core
+            .set_owned_scene_attribute_value(
+                playback,
+                scene_id,
+                object_id,
+                "position",
+                AttributeValue::Vec3f([7.0, 8.0, 9.0]),
+            )
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(
+            core.scenes
+                .get(&scene_id)
+                .unwrap()
+                .objects
+                .get(&object_id)
+                .unwrap()
+                .attributes
+                .get("position")
+                .unwrap()
+                .current_value,
+            AttributeValue::Vec3f([7.0, 8.0, 9.0])
+        );
+
+        // A non-owner (or unowned attribute) writes nothing.
+        let other = Uuid::now_v7();
+        let wrote = core
+            .set_owned_scene_attribute_value(
+                other,
+                scene_id,
+                object_id,
+                "position",
+                AttributeValue::Vec3f([0.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        assert!(!wrote);
+
+        core.release_playback(playback);
+        assert!(core.playback_owner().is_none());
+        assert!(!core.is_playback_owned(scene_id, object_id, "position"));
+    }
+
+    #[test]
+    fn playback_owned_target_supersedes_live_ingest() {
+        let (mut core, device_id, scene_id, object_id) = build_core();
+        core.create_mapping(
+            MappingRequest {
+                source_device: device_id,
+                source_output: "pose_pos".into(),
+                target_scene: scene_id,
+                target_object: object_id,
+                target_attribute: "position".into(),
+                component_mask: None,
+            },
+            1,
+        )
+        .unwrap();
+        core.set_mode(Mode::LIVE).unwrap();
+
+        let playback = Uuid::now_v7();
+        core.acquire_playback_targets(
+            playback,
+            scene_id,
+            [(object_id, "position".to_string())],
+            true,
+        );
+        core.set_owned_scene_attribute_value(
+            playback,
+            scene_id,
+            object_id,
+            "position",
+            AttributeValue::Vec3f([1.0, 1.0, 1.0]),
+        )
+        .unwrap();
+
+        // Live device ingest is skipped for the reclaimed attribute.
+        core.apply_updates(
+            device_id,
+            &[AttributeUpdate {
+                output_attribute: "pose_pos".into(),
+                value: AttributeValue::Vec3f([50.0, 50.0, 50.0]),
+            }],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            core.scenes
+                .get(&scene_id)
+                .unwrap()
+                .objects
+                .get(&object_id)
+                .unwrap()
+                .attributes
+                .get("position")
+                .unwrap()
+                .current_value,
+            AttributeValue::Vec3f([1.0, 1.0, 1.0])
+        );
     }
 
     #[test]

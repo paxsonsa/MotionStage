@@ -47,7 +47,9 @@ class MotionStageServer:
     def drain_state_events(self, timeout_ms: int = 0) -> list[dict[str, Any]]:
         """Block up to timeout_ms for the next state event, then batch everything
         currently queued (timeout_ms == 0 is a non-blocking drain). Each dict has
-        seq, origin_session (str | None), timestamp_ns, a snake_case "type"
+        seq (strictly monotonically increasing across the whole stream, so
+        consumers can guard against stale/reordered snapshots), origin_session
+        (str | None), timestamp_ns, a snake_case "type"
         discriminator (mode_changed, scene_loaded, scene_activated,
         mapping_created/updated/removed/lock_changed/released, baseline_applied,
         session_joined, session_left, recording_started/stopped, take_registered,

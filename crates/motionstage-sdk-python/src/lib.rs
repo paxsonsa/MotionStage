@@ -8,7 +8,7 @@ use motionstage_core::{AttributeValue, MappingRequest, Scene, SceneAttribute, Sc
 use motionstage_protocol::{
     BakeAttributeValue, BaselineAction, ClientRole, DataFlowState, Feature, MappingSummary, Mode,
     PlaybackRuntimeState, RecordingState, SamplingMode, SceneSnapshotPayload, StateEvent,
-    StateEventEnvelope, TakeInfo,
+    StateEventEnvelope, TakeInfo, TakeRating,
 };
 use motionstage_server::{ServerConfig, ServerHandle};
 use pyo3::{
@@ -47,7 +47,9 @@ pub struct PyMotionStageServer {
 /// One item pulled off the broadcast receiver: either a real envelope or a
 /// lag marker (the receiver fell behind and `skipped` events were dropped).
 enum DrainedItem {
-    Event(StateEventEnvelope),
+    // Boxed: `StateEventEnvelope` embeds a full `TakeInfo` (with an optional
+    // scene snapshot), so keeping it inline would bloat every `Lagged` marker.
+    Event(Box<StateEventEnvelope>),
     Lagged(u64),
 }
 
@@ -160,7 +162,7 @@ impl PyMotionStageServer {
                 if timeout_ms > 0 {
                     match tokio::time::timeout(Duration::from_millis(timeout_ms), rx.recv()).await
                     {
-                        Ok(Ok(envelope)) => items.push(DrainedItem::Event(envelope)),
+                        Ok(Ok(envelope)) => items.push(DrainedItem::Event(Box::new(envelope))),
                         Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                             items.push(DrainedItem::Lagged(skipped))
                         }
@@ -170,7 +172,7 @@ impl PyMotionStageServer {
                 }
                 loop {
                     match rx.try_recv() {
-                        Ok(envelope) => items.push(DrainedItem::Event(envelope)),
+                        Ok(envelope) => items.push(DrainedItem::Event(Box::new(envelope))),
                         Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                             items.push(DrainedItem::Lagged(skipped))
                         }
@@ -417,7 +419,7 @@ impl PyMotionStageServer {
     pub fn list_takes(
         &self,
         scene_id: Option<String>,
-    ) -> PyResult<Vec<(String, String, String, String, u64, u64, bool, bool)>> {
+    ) -> PyResult<Vec<(String, String, u32, String, String, u64, u64, String, bool, bool)>> {
         let parsed_scene = parse_optional_uuid(scene_id)?;
         let takes = self.rt.block_on(self.server.list_takes(parsed_scene));
         Ok(takes
@@ -426,10 +428,12 @@ impl PyMotionStageServer {
                 (
                     take.take_id.to_string(),
                     take.scene_id.to_string(),
+                    take.number,
                     take.name,
                     take.path,
                     take.created_ns,
                     take.frame_count,
+                    take_rating_to_str(take.rating).to_owned(),
                     take.selected,
                     take.deleted,
                 )
@@ -447,13 +451,44 @@ impl PyMotionStageServer {
         Ok(selected.take_id.to_string())
     }
 
-    #[pyo3(signature = (take_id, looping=false))]
-    pub fn playback_play(&self, take_id: String, looping: bool) -> PyResult<(String, u64, bool)> {
+    /// Rename a take's editable slate. Returns the take id.
+    pub fn rename_take(&self, take_id: String, name: String) -> PyResult<String> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let updated = self
+            .rt
+            .block_on(self.server.rename_take(take_id, name))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(updated.take_id.to_string())
+    }
+
+    /// Set a take's circle-take rating (`unrated`|`ng`|`keep`|`circle`).
+    pub fn rate_take(&self, take_id: String, rating: String) -> PyResult<String> {
+        let take_id = Uuid::parse_str(take_id.trim())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let rating = take_rating_from_str(&rating).map_err(PyValueError::new_err)?;
+        let updated = self
+            .rt
+            .block_on(self.server.rate_take(take_id, rating))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(updated.take_id.to_string())
+    }
+
+    #[pyo3(signature = (take_id, looping=false, override_live=false))]
+    pub fn playback_play(
+        &self,
+        take_id: String,
+        looping: bool,
+        override_live: bool,
+    ) -> PyResult<(String, u64, bool)> {
         let take_id = Uuid::parse_str(take_id.trim())
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let (state, playhead_ns, looping) = self
             .rt
-            .block_on(self.server.playback_play(take_id, looping))
+            .block_on(
+                self.server
+                    .playback_play_from(take_id, looping, override_live, Some(self.server.host_session_id())),
+            )
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
         Ok((
             playback_state_to_str(state).to_owned(),
@@ -1086,13 +1121,36 @@ fn take_info_to_dict<'py>(py: Python<'py>, take: &TakeInfo) -> PyResult<Bound<'p
     let d = PyDict::new_bound(py);
     d.set_item("take_id", take.take_id.to_string())?;
     d.set_item("scene_id", take.scene_id.to_string())?;
+    d.set_item("number", take.number)?;
     d.set_item("name", take.name.as_str())?;
     d.set_item("path", take.path.as_str())?;
     d.set_item("created_ns", take.created_ns)?;
     d.set_item("frame_count", take.frame_count)?;
+    d.set_item("rating", take_rating_to_str(take.rating))?;
     d.set_item("selected", take.selected)?;
     d.set_item("deleted", take.deleted)?;
     Ok(d)
+}
+
+fn take_rating_to_str(rating: TakeRating) -> &'static str {
+    match rating {
+        TakeRating::Unrated => "unrated",
+        TakeRating::Ng => "ng",
+        TakeRating::Keep => "keep",
+        TakeRating::Circle => "circle",
+    }
+}
+
+fn take_rating_from_str(rating: &str) -> Result<TakeRating, String> {
+    match rating.trim().to_ascii_lowercase().as_str() {
+        "unrated" => Ok(TakeRating::Unrated),
+        "ng" => Ok(TakeRating::Ng),
+        "keep" => Ok(TakeRating::Keep),
+        "circle" => Ok(TakeRating::Circle),
+        other => Err(format!(
+            "unknown take rating '{other}' (expected unrated|ng|keep|circle)"
+        )),
+    }
 }
 
 fn state_event_envelope_to_dict<'py>(
@@ -1196,17 +1254,23 @@ fn state_event_envelope_to_dict<'py>(
             d.set_item("type", "take_deleted")?;
             d.set_item("take_id", take_id.to_string())?;
         }
+        StateEvent::TakeUpdated { take } => {
+            d.set_item("type", "take_updated")?;
+            d.set_item("take", take_info_to_dict(py, take)?)?;
+        }
         StateEvent::PlaybackChanged {
             state,
             take_id,
             playhead_ns,
             looping,
+            blocked_attributes,
         } => {
             d.set_item("type", "playback_changed")?;
             d.set_item("state", playback_state_to_str(*state))?;
             d.set_item("take_id", take_id.to_string())?;
             d.set_item("playhead_ns", *playhead_ns)?;
             d.set_item("looping", *looping)?;
+            d.set_item("blocked_attributes", *blocked_attributes)?;
         }
     }
     Ok(d)
