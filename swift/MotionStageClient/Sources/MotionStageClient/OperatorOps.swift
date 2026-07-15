@@ -210,16 +210,20 @@ private func wireResultJSON(
     return json
 }
 
+/// `{"ok":<T>}` / `{"err":{"code","reason"}}` wire-result envelope. Lives at
+/// file scope because Swift does not allow type declarations inside generic
+/// functions.
+private struct WireResultEnvelope<Value: Decodable>: Decodable {
+    let ok: Value?
+    let err: WireErrorPayload?
+}
+
 /// Decode a `{"ok":<T>}` / `{"err":{"code","reason"}}` envelope, throwing
 /// `MotionStageError.operationRejected` for typed wire errors.
 private func decodeWireResult<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
-    struct Envelope<Value: Decodable>: Decodable {
-        let ok: Value?
-        let err: WireErrorPayload?
-    }
-    let envelope: Envelope<T>
+    let envelope: WireResultEnvelope<T>
     do {
-        envelope = try JSONDecoder().decode(Envelope<T>.self, from: Data(json.utf8))
+        envelope = try JSONDecoder().decode(WireResultEnvelope<T>.self, from: Data(json.utf8))
     } catch {
         throw MotionStageError.protocolError("failed to decode wire result JSON: \(error)")
     }
