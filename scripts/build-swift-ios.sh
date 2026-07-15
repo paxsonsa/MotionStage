@@ -28,6 +28,20 @@ for cmd in cargo rustup xcodebuild lipo; do
   fi
 done
 
+# `rustup target add` installs the iOS std libs into rustup's toolchain, but
+# if a different Rust (Homebrew, a devtools install) shadows rustup's cargo on
+# PATH, the build below uses THAT one and dies mid-compile with E0463
+# ("can't find crate for `core`"). Catch the mismatch up front: the sysroot of
+# the `rustc` cargo will invoke must live under a rustup toolchains directory.
+ACTIVE_SYSROOT="$(rustc --print sysroot)"
+if [[ "$ACTIVE_SYSROOT" != *"/toolchains/"* ]]; then
+  echo "error: 'rustc' on PATH is not rustup-managed (sysroot: $ACTIVE_SYSROOT)."
+  echo "       Cross-compiling to iOS needs rustup's toolchain. Fix with e.g.:"
+  echo "         PATH=\"\$HOME/.cargo/bin:\$PATH\" $0"
+  echo "       or 'brew unlink rust' if Homebrew's rust is shadowing rustup."
+  exit 1
+fi
+
 rustup target add "${IOS_TARGETS[@]}"
 
 for target in "${IOS_TARGETS[@]}"; do
