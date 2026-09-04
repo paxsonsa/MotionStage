@@ -1508,7 +1508,7 @@ dependencies = [
  "bytes",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rtcp",
  "rtp",
  "thiserror 1.0.69",
@@ -2358,9 +2358,9 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha",
@@ -2507,7 +2507,7 @@ checksum = "6870f09b5db96f8b9e7290324673259fd15519ebb7d55acf8e7eb044a9ead6af"
 dependencies = [
  "bytes",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "thiserror 1.0.69",
  "webrtc-util",
@@ -2660,7 +2660,7 @@ version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13254db766b17451aced321e7397ebf0a446ef0c8d2942b6e67a95815421093f"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.8.8",
  "substring",
  "thiserror 1.0.69",
  "url",
@@ -2931,7 +2931,7 @@ dependencies = [
  "crc",
  "lazy_static",
  "md-5",
- "rand 0.8.5",
+ "rand 0.8.8",
  "ring",
  "subtle",
  "thiserror 1.0.69",
@@ -3269,7 +3269,7 @@ dependencies = [
  "log",
  "md-5",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "ring",
  "stun",
  "thiserror 1.0.69",
@@ -3569,7 +3569,7 @@ dependencies = [
  "lazy_static",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rcgen",
  "regex",
  "ring",
@@ -3633,7 +3633,7 @@ dependencies = [
  "p256",
  "p384",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rand_core 0.6.4",
  "rcgen",
  "ring",
@@ -3661,7 +3661,7 @@ dependencies = [
  "crc",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "stun",
@@ -3696,7 +3696,7 @@ checksum = "1c15b20e98167b22949abc1c20eca7c6d814307d187068fe7a48f0b87a4f6d46"
 dependencies = [
  "byteorder",
  "bytes",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rtp",
  "thiserror 1.0.69",
 ]
@@ -3713,7 +3713,7 @@ dependencies = [
  "crc",
  "log",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "thiserror 1.0.69",
  "tokio",
  "webrtc-util",
@@ -3757,7 +3757,7 @@ dependencies = [
  "log",
  "nix",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.8",
  "thiserror 1.0.69",
  "tokio",
  "winapi",
